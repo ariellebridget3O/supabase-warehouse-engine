@@ -1,4 +1,4 @@
-.PHONY: test lint-templates seed-wave check
+.PHONY: test lint-templates seed-wave check migrate-dry ci
 
 # The offline battery (pinned verbatim repo-root cwd command; zero network).
 # scripts/run-tests.mjs is a LOUD deno detector (a node-run wrapper — a .mjs
@@ -29,3 +29,12 @@ check:
 	else \
 	  echo "ERROR: deno not found on PATH — install Deno 2.x: curl -fsSL https://deno.land/x/install/install.sh | sh" >&2; exit 1; \
 	fi
+
+# Dry-run the migration runner (zero network, zero env — lists the migration
+# files + statement counts; the runner's own exit code propagates, so a broken
+# splitter or a missing tree FAILS the target — fail-never-skip).
+migrate-dry:
+	bash scripts/migrate.sh --dry-run
+
+# Full offline CI gate: type-check + battery + template lint + migrate dry-run.
+ci: check test lint-templates migrate-dry
