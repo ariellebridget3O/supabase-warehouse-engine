@@ -1,45 +1,74 @@
 // =============================================================================
-// _shared/wh_directory_reader.ts — v_warehouse_directory reader + version probe
+// _shared/wh_directory_reader.ts — directory reader (atomic RPC read + version probe)
 // =============================================================================
 // r40 (wiring review maxxing-r40-wiring-review): extracted from the r39
-// warehouse-engine/index.ts readDirectory() so the pagination loop, truncation
-// guard, version double-probe and row mapping are offline-testable with
-// injected low-level fetchers (deploy.ts pattern: the entrypoint wires real
+// warehouse-engine/index.ts readDirectory() so the row mapping, version
+// coercion and the impure fetch edges are offline-testable with injected
+// low-level fetchers (deploy.ts pattern: the entrypoint wires real
 // supabase-js calls, the factory owns ALL the logic).
+//
+// r120 (OPT-1 atomic directory read): the fresh-path directory chain is ONE
+// atomic jsonb payload from the single-statement language-sql RPC
+// wh_directory_atomic_read (fm db/migrations/0026) — version + rows arrive
+// consistent under ONE Postgres snapshot BY CONSTRUCTION. This SUPERSEDES
+// the r40 pagination loop + P2-4 version double-probe (the pair only
+// bounded the mixed-read flap window; the one-snapshot RPC makes it
+// structural). probeDirectoryVersion (config GET) is KEPT UNCHANGED: the
+// replay path + /health still need the standalone probe.
 //
 // Review fixes carried here:
 //   * P0-2: the view exposes `pr.ref as project_ref` — there is NO `shard`
 //     column. Rows are mapped through toWhDirectoryRow() (project_ref -> shard)
 //     with loud failures on missing/mistyped required fields (view drift is an
-//     internal error, never a silently-undefined shard).
-//   * P2-4: the directory version is probed BEFORE and AFTER the row read; a
-//     change between probes retries the whole read ONCE (concurrent catalog
-//     mutation otherwise stamps mixed rows with a wrong version, §4.6).
+//     internal error, never a silently-undefined shard). STILL APPLIES r120:
+//     the atomic payload's rows ride the same mapping.
+//   * P2-4 (SUPERSEDED r120): the directory version was probed BEFORE and
+//     AFTER the row read; a change between probes retried the whole read ONCE
+//     (concurrent catalog mutation otherwise stamped mixed rows with a wrong
+//     version, §4.6). History: the single-statement RPC's one-snapshot body
+//     removes the flap window the pair bounded — the double-probe is retired.
 //   * P2-5: the config value is accepted only when `typeof === 'number'` —
 //     Number(null)/Number(false)/Number('') all coerce to 0 and defeat the
 //     guard (r38 SCALAR-encoding law protects the writer; this probe
-//     re-validates the reader).
+//     re-validates the reader). STILL APPLIES r120: the RPC passes the RAW
+//     jsonb scalar through (F1, no SQL cast) precisely so this law
+//     re-validates it.
 //   * P0-3 design note: the read is a FULL embed (all tables) because §4.6
 //     snapshot mode attaches the full directory for the client to cache; the
 //     per-table projection for query execution happens in the entrypoint
 //     (one read serves both needs).
+//
+// F3 law (every arm of every reader here, incl. readDirectoryAtomic): throw
+// PLAIN Errors ONLY — never WhEngineError. Raw DB/PostgREST text must never
+// reach the wire: the entrypoint's WhEngineError branch relays e.message
+// raw, whereas plain Errors hit the P3-4 scrub.
 // =============================================================================
 
 import type { WhDirectoryRow, WhGeoDirectoryRow } from './wh_engine_core.ts';
 
 export const DIRECTORY_PAGE = 1000;
 
-/** Low-level page fetch over v_warehouse_directory (index.ts wires supabase-js). */
-export type DirectoryPageFetcher = (
-  from: number,
-  to: number,
-) => Promise<{ data: unknown[] | null; count: number | null; error: { message: string } | null }>;
-
 /** Low-level config probe for warehouse_directory_version (index.ts wires supabase-js). */
 export type DirectoryVersionFetcher = () => Promise<{
   value: unknown;
   error: { message: string } | null;
 } | null>;
+
+/** r120 OPT-1: low-level atomic {version, rows} fetch (index.ts wires
+ *  supabase-js client.rpc('wh_directory_atomic_read') — ONE POST; the
+ *  single-statement language-sql RPC returns the whole payload under one
+ *  Postgres snapshot). */
+export type DirectoryAtomicFetcher = () => Promise<{ data: unknown; error: { message: string } | null }>;
+
+/**
+ * r120 F2: the loud fleet-shape bound on the directory embed — the successor
+ * to the retired count:'exact' truncation guard. The atomic RPC cannot
+ * over-return against a count (there is no pagination anymore), so the bound
+ * is the fleet shape itself: a fetch above DIRECTORY_PAGE (1000) rows is a
+ * law breakage thrown LOUDLY by readDirectoryAtomic — never silently
+ * truncated, never a silent LIMIT inside the RPC.
+ */
+export const DIRECTORY_EMBED_BOUND = DIRECTORY_PAGE;
 
 export interface DirectoryReader {
   probeDirectoryVersion(): Promise<number>;
@@ -111,14 +140,68 @@ export function toWhDirectoryRow(raw: unknown): WhDirectoryRow {
 }
 
 /**
- * Build the directory reader. fetchPage/fetchVersion are the ONLY impure
+ * r120 OPT-1: atomic directory read — ONE jsonb payload {version, rows} from
+ * the single-statement language-sql RPC wh_directory_atomic_read (fm
+ * db/migrations/0026_wh_directory_atomic_read.sql). Module-level (NOT inside
+ * the factory) mirroring coerceDirectoryVersion/toWhDirectoryRow: the
+ * mapping+coercion logic stays offline-testable against a fake fetcher.
+ *
+ * F3 LAW: throws PLAIN Errors ONLY — never WhEngineError. Raw DB/PostgREST
+ * text must never reach the wire: the entrypoint's WhEngineError branch
+ * relays e.message raw, whereas plain Errors hit the P3-4 scrub.
+ *
+ * Snapshot semantics: version + rows arrive under ONE Postgres snapshot by
+ * construction (language-sql single-statement body under READ COMMITTED) —
+ * superseding the P2-4 before/after double-probe, which only bounded the
+ * mixed-read flap window (marked superseded r120).
+ *
+ * F1: 'version' arrives as the RAW jsonb scalar from config (the RPC does
+ * NOT cast) so the P2-5 coercion law re-validates it here:
+ * coerceDirectoryVersion judges typeof number / integer / >= 0. A missing
+ * config row surfaces as jsonb null => the explicit F7 arm below throws
+ * loudly (never coerced to 0).
+ *
+ * F2: rows above DIRECTORY_EMBED_BOUND throw — the loud fleet-shape bound
+ * successor to the retired truncation guard. Row mapping rides
+ * toWhDirectoryRow — loud on view drift (P0-2 class).
+ */
+export async function readDirectoryAtomic(
+  deps: { fetchAtomic: DirectoryAtomicFetcher },
+): Promise<{ rows: WhDirectoryRow[]; version: number }> {
+  const { data, error } = await deps.fetchAtomic();
+  if (error) throw new Error(`atomic directory read failed: ${error.message}`);
+  if (!isPlainObject(data)) {
+    throw new Error(`atomic directory read returned a non-object payload: ${JSON.stringify(data)?.slice(0, 200)}`);
+  }
+  if (data.version === null) throw new Error('directory version probe failed: config row missing'); // F7
+  const version = coerceDirectoryVersion(data.version); // F1: raw scalar judged by the SAME law as today
+  if (!Array.isArray(data.rows)) {
+    throw new Error(`atomic directory read returned non-array rows: ${JSON.stringify(data.rows)?.slice(0, 200)}`);
+  }
+  if (data.rows.length > DIRECTORY_EMBED_BOUND) {
+    // F2: loud fleet-shape bound — the retired truncation guard's successor.
+    throw new Error(`directory embed fetched ${data.rows.length} rows > bound ${DIRECTORY_EMBED_BOUND} — fleet-shape law breakage`);
+  }
+  return { version, rows: data.rows.map(toWhDirectoryRow) }; // loud on row drift (P0-2 class)
+}
+
+/**
+ * Build the directory reader. fetchVersion/fetchAtomic are the ONLY impure
  * edges (injected by index.ts with real supabase-js calls; tests inject
  * call-counting fakes).
+ *
+ * r120 OPT-1: readDirectory delegates to readDirectoryAtomic — ONE rpc POST,
+ * version+rows under one snapshot. The r40 signature took a paginated row
+ * fetcher plus the version probe, and readDirectory ran the pagination loop
+ * plus the P2-4 double-probe; the pagination fetcher is retired (replaced by
+ * fetchAtomic) and the returned shape
+ * { probeDirectoryVersion, readDirectory } is UNCHANGED for every caller.
  */
 export function makeDirectoryReader(deps: {
-  fetchPage: DirectoryPageFetcher;
   fetchVersion: DirectoryVersionFetcher;
+  fetchAtomic: DirectoryAtomicFetcher;
 }): DirectoryReader {
+  // UNCHANGED r40 logic (the replay path + /health depend on the standalone probe).
   async function probeDirectoryVersion(): Promise<number> {
     const row = await deps.fetchVersion();
     if (row === null) throw new Error('directory version probe failed: config row missing');
@@ -126,37 +209,15 @@ export function makeDirectoryReader(deps: {
     return coerceDirectoryVersion(row.value);
   }
 
-  async function readRowsOnce(): Promise<WhDirectoryRow[]> {
-    const rows: WhDirectoryRow[] = [];
-    let from = 0;
-    for (;;) {
-      const { data, count, error } = await deps.fetchPage(from, from + DIRECTORY_PAGE - 1);
-      if (error) throw new Error(`directory read failed: ${error.message}`);
-      const page = data ?? [];
-      rows.push(...page.map(toWhDirectoryRow));
-      if (count !== null) {
-        if (rows.length > count) {
-          throw new Error(`directory embed fetched ${rows.length} rows > count ${count} — refusing (truncation guard)`);
-        }
-        if (rows.length >= count) break;
-      } else if (page.length < DIRECTORY_PAGE) break;
-      from += DIRECTORY_PAGE;
-    }
-    return rows;
-  }
-
-  async function readDirectory(): Promise<{ rows: WhDirectoryRow[]; version: number }> {
-    // P2-4: version probed BEFORE and AFTER the row read; the read is valid
-    // only when the pair agrees (the rows were read under ONE version). One
-    // retry on flap; a second flap refuses to stamp a mixed read.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const versionBefore = await probeDirectoryVersion();
-      const rows = await readRowsOnce();
-      const versionAfter = await probeDirectoryVersion();
-      if (versionAfter === versionBefore) return { rows, version: versionBefore };
-    }
-    throw new Error('directory version flapped during read across two attempts — refusing to stamp a mixed read');
-  }
+  // P2-4 HISTORY (superseded r120): readDirectory used to probe the version
+  // BEFORE and AFTER a paginated row read and retry ONCE on a flap — the
+  // probe pair only BOUNDED the mixed-read window under concurrent catalog
+  // mutation (a second flap refused to stamp a mixed read). The
+  // single-statement language-sql wh_directory_atomic_read RPC returns
+  // version+rows under ONE Postgres snapshot (READ COMMITTED: one statement
+  // = one snapshot), so consistency is structural: the double-probe AND the
+  // paginated row loop are retired.
+  const readDirectory = () => readDirectoryAtomic({ fetchAtomic: deps.fetchAtomic });
 
   return { probeDirectoryVersion, readDirectory };
 }

@@ -4,8 +4,14 @@
 // The handler lives in _shared/wh_entrypoint.ts (injected-deps, offline-
 // testable — r40 wiring review: three P0s survived because the r39 monolith
 // had zero direct coverage). This shell wires real deps only:
-//   * probeDirectoryVersion / readDirectory -> supabase-js over
-//     v_warehouse_directory + config (logic in _shared/wh_directory_reader.ts)
+//   * readDirectory -> supabase-js client.rpc('wh_directory_atomic_read') —
+//     ONE atomic rpc POST returning {version, rows} under one Postgres
+//     snapshot (logic in _shared/wh_directory_reader.ts; r120 OPT-1: the r40
+//     pagination + P2-4 double-probe read chain is retired for the
+//     single-snapshot RPC)
+//   * probeDirectoryVersion -> supabase-js config GET (UNCHANGED — kept for
+//     the replay path + /health; no longer part of the fresh-path pre-fanout
+//     chain, which reads the version atomically inside the rpc payload)
 //   * fetcher -> the r69 RPC REAL FETCHER (makeRpcShardFetcher over the
 //     shard service-key channel, _shared/wh_shard_channel.ts — the §6.1
 //     wh_query POST; the select-shape URL stays the target identity). The
@@ -54,14 +60,12 @@ const deps: WhEngineDeps = (() => {
   const resolveShardKey = makeShardKeyResolver({ ownRef, ownKey, remoteKeys: shardKeys });
 
   const client = db();
-  const reader = makeDirectoryReader({
-    fetchPage: async (from, to) => {
-      const { data, count, error } = await client
-        .from('v_warehouse_directory')
-        .select('*', { count: 'exact' })
-        .range(from, to);
-      return { data, count, error };
-    },
+  // r120 OPT-1: the directory read is ONE atomic rpc POST — the
+  // single-statement language-sql wh_directory_atomic_read RPC returns
+  // {version, rows} under one Postgres snapshot (the r40 paginated-page
+  // wiring + P2-4 double-probe are retired; the version-probe
+  // wiring below is UNCHANGED — the replay path + /health still probe it).
+  const atomicReader = makeDirectoryReader({
     fetchVersion: async () => {
       const { data, error } = await client
         .from('config')
@@ -70,6 +74,10 @@ const deps: WhEngineDeps = (() => {
         .maybeSingle();
       if (error) return { value: null, error };
       return data === null ? null : { value: (data as { value: unknown }).value, error: null };
+    },
+    fetchAtomic: async () => {
+      const { data, error } = await client.rpc('wh_directory_atomic_read');
+      return { data, error };
     },
   });
   // r47 read-plane reader (wh-contract r47 errata): fixed limit(2) over
@@ -86,8 +94,8 @@ const deps: WhEngineDeps = (() => {
     },
   });
   return {
-    probeDirectoryVersion: reader.probeDirectoryVersion,
-    readDirectory: reader.readDirectory,
+    probeDirectoryVersion: atomicReader.probeDirectoryVersion,
+    readDirectory: atomicReader.readDirectory,
     // r69 §3.4: the RPC-primary real fetcher over the shard key channel
     // (D7/D8/D9 — never throws/rejects; the §6.1 wh_query POST on the rpc
     // arm, the loud shard_path_select_disabled refusal on the residual
