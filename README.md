@@ -1,6 +1,6 @@
 # supabase-warehouse-engine
 
-Standalone **sharded-warehouse query engine** for one Supabase free-tier project. A single Deno edge function (`supabase/functions/warehouse-engine/`) over a pure library island (`supabase/functions/_shared/wh_*.ts`), extracted verbatim from [`supabase-fleet-manager`](https://github.com/ariellebridget3O/supabase-fleet-manager) @ `ca4d280` (MIT — see `LICENSE` and `PROVENANCE.md`).
+Standalone **sharded-warehouse query engine** for one Supabase free-tier project. A single Deno edge function (`supabase/functions/warehouse-engine/`) over a pure library island (`supabase/functions/_shared/wh_*.ts`), extracted from [`supabase-fleet-manager`](https://github.com/ariellebridget3O/supabase-fleet-manager) @ `ca4d280` (MIT — see `LICENSE` and `PROVENANCE.md` for the per-file byte-diff ledger).
 
 What it does:
 
@@ -71,7 +71,7 @@ Full wire contract: [API.md](API.md).
 
 ## Onboarding rescue lines
 
-1. **`deno` missing** — `make test` runs `scripts/run-tests.mjs`, which prints a loud banner with the exact install command (`curl -fsSL https://deno.land/x/install/install.sh | sh`) and **exits 1**. It never silently skips (green-when-unverified is banned). Deno is needed for the battery and `deno check` — *not* for deploy (`--use-api` bundles server-side).
+1. **`deno` missing** — `make test` runs `scripts/run-tests.mjs` (a node-run wrapper — stock `node` executes it; `deno task test` bypasses the wrapper), which prints a loud banner with the exact install command (`curl -fsSL https://deno.land/x/install/install.sh | sh`) and **exits 1**. It never silently skips (green-when-unverified is banned). Deno is needed for the battery and `deno check` — *not* for deploy (`--use-api` bundles server-side).
 2. **Supabase CLI auth** — export `SUPABASE_ACCESS_TOKEN=sbp_…` (a real PAT from dashboard → account → tokens). **Explicit, never a fallback**: this repo deliberately drops FM's `deploy.sh` fallback that offered the bearer token as a PAT — that silent swap just 401s confusingly. Three tokens, three jobs: PAT (Management API) ≠ `WHE_BEARER_TOKEN` (this function) ≠ shard service keys.
 3. **Project paused (free tier)** — preflight before anything: `curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" https://api.supabase.com/v1/projects/$REF | jq .status` → expect `ACTIVE_HEALTHY`; `PAUSED` ⇒ dashboard → restore project, then re-run.
 4. **`verify_jwt` left on** — `supabase/config.toml` pins `[functions.warehouse-engine] verify_jwt = false`, and deploys pass `--no-verify-jwt`. Discrimination: a **bare gateway 401** (no `auth_kind` field) = platform JWT check rejected the call before the handler; the fn's **own 401** always says `auth rejected before route dispatch (<kind>)` with an `auth_kind` field (see API.md).

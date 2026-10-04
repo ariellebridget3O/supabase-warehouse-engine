@@ -8,14 +8,14 @@ The `wh_*` modules are a **pure library island**: no `Deno.env`, no DB client im
 
 - Every wh_\* module is env-free and DB-free (self-declared and battery-pinned in their headers: `wh_types.ts:11-12`, `wh_handshake.ts:14-15`, `wh_shard_channel.ts:11`).
 - Two documented nuances (the law is "no env / no DB", not "no network"):
-  - `_shared/wh_entrypoint.ts:205` — the ONE env read inside a `_shared` module: `checkAuth` reads the bearer secret (`WHE_BEARER_TOKEN`; FM name `FLEET_TOKEN` retired). Handler-side auth is by-design the shell-adjacent exception.
+  - `_shared/wh_entrypoint.ts:205` — the ONE env read inside a `wh_*` module: `checkAuth` reads the bearer secret (`WHE_BEARER_TOKEN`; FM name `FLEET_TOKEN` retired). Handler-side auth is by-design the shell-adjacent exception. (`whe_store.ts` — the non-island seam, §2 — additionally reads the platform-injected `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` pair.)
   - `_shared/wh_shard_channel.ts:213` — the default `rawFetch` is the platform `fetch`; injectable, overridable in tests.
 - Timers are injected too (`defaultWhEngineTimers`, `wh_engine_core.ts`), so the whole merge/quorum/latency surface is deterministically testable offline.
-- **The shell owns env**: `warehouse-engine/index.ts` is the only place `WH_SHARD_KEYS`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `WH_SNAPSHOT_KEY`, `WH_RYW_V1`, `WH_REAL_FETCHER` are read; each value is threaded into the core as a plain dep (purity law F-N8).
+- **The shell owns the `WH_*` levers**: `warehouse-engine/index.ts` is the only place `WH_SHARD_KEYS`, `WH_SNAPSHOT_KEY`, `WH_RYW_V1`, `WH_REAL_FETCHER` are read; `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` are read by the shell *and* by the `whe_store` seam (§2). Each value is threaded into the core as a plain dep (purity law F-N8).
 
 ## 2. The consumer-store seam (`whe_store.ts`)
 
-FM's `_shared/supabase-client.ts` is **not copied**: it drags `types.ts` and embeds the FM config-JWT-skew gate, config cache, audit and quota helpers — fleet-manager baggage. It is replaced by `_shared/whe_store.ts` (**NEW** in this repo), the consumer-store seam:
+FM's `_shared/supabase-client.ts` is **not copied whole**: it drags `types.ts` and embeds the FM config-JWT-skew gate, config cache, audit and quota helpers — fleet-manager baggage. It is replaced by `_shared/whe_store.ts` (new seam in this repo; its `db()` body is a verbatim excerpt of the FM file — see PROVENANCE), the consumer-store seam:
 
 - `db()` semantics preserved: a single cached supabase-js service-role client built from `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` (platform-injected on Supabase), and the store exposes exactly the **6 read sites / 4 surfaces** the shell consumed (table in §6) with result shapes structurally identical to the supabase-js `{data, count, error}` triples the pure readers already consume.
 - PostgREST stays the read protocol (supabase-js), **not** a raw pg/pooler client: the geo fence's fail-closed logic depends on PostgREST's jsonb rendering semantics (jsonb numbers arrive as JS numbers — `geo_write_fence.ts:68-71,168-172`), and the battery pins those shapes.

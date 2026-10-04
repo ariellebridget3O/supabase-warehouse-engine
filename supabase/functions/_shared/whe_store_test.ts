@@ -443,3 +443,35 @@ Deno.test('whe_store purity: the only module specifier is npm:@supabase/supabase
     ok(`non-ported helper absent: ${sig}`, !storeSrc.includes(sig), 'FM helper was ported against the r116 contract');
   }
 });
+
+Deno.test('whe_store auth options: persistSession/autoRefreshToken OFF — byte-exact source pin (r116 audit F-2)', () => {
+  // Hand-computed expectation (audit probe 2026-10-04): flipping either flag
+  // to true in whe_store.ts was NOT caught by any existing pin — the auth
+  // options block was the only unpinned runtime behavior. The FM contract is
+  // edge-fn semantics: NO session persistence, NO token auto-refresh (the
+  // service-role key never expires; a persisted session would leak scope and
+  // burn memory per isolate). These pins go RED on either flip, naming the
+  // flag. Byte-exact fragments, not regex — mutation-lethal by construction.
+  const expectations: Array<[string, string]> = [
+    ['persistSession: false pinned (session scope never persisted)', 'persistSession: false'],
+    ['autoRefreshToken: false pinned (service-role key never refreshes)', 'autoRefreshToken: false'],
+    ['auth options block shape pinned (auth: { ... } carrier)', 'auth: { persistSession: false, autoRefreshToken: false }'],
+  ];
+  for (const [label, fragment] of expectations) {
+    ok(label, storeSrc.includes(fragment), `fragment gone from whe_store.ts: ${fragment}`);
+  }
+});
+
+// CLOSING GUARD — the island-harness idiom (wh_entrypoint_test.ts end-of-file
+// meta-test). Without this, ok()/eq() failures accumulate into `failures[]`
+// and are silently swallowed: every assertion in this file would be vacuous
+// (r116 audit: the persistSession mutation probe went GREEN against a file
+// whose pins "failed" invisibly — Leg B shipped the accumulator without the
+// throw). Deno runs a file's registrations in order, so this executes last.
+Deno.test('whe_store_test: assertion ledger — no silently-swallowed failures', () => {
+  console.log(`\n${passed} passed, ${failed} failed`);
+  if (failed > 0) {
+    console.error('FAILURES:\n' + failures.map((f) => `  * ${f}`).join('\n'));
+    throw new Error(`${failed} whe_store pin(s) failed`);
+  }
+});

@@ -4,9 +4,9 @@
 
 Standalone repo `supabase-warehouse-engine` ("whe"): the warehouse-engine edge function + the `wh_*` library island, extracted from `ariellebridget3O/supabase-fleet-manager` @ `ca4d280` ("r115 fm: add .github/workflows/test.yml"). MIT inherited (see LICENSE + PROVENANCE.md for the per-file ledger).
 
-### Copied verbatim
+### Copied (verbatim unless noted)
 
-- **10 `wh_*` modules — 4,630 LOC**: `wh_types.ts` (116), `wh_canonical.ts` (328), `wh_merge.ts` (550), `wh_engine_core.ts` (1,671), `wh_handshake.ts` (488), `wh_snapshot.ts` (212), `wh_shard_channel.ts` (296), `wh_directory_reader.ts` (220), `wh_entrypoint.ts` (543), `wh_testutil.ts` (206) — plus the runtime-required **`geo_write_fence.ts`** (342 LOC, the write fence + `FENCE_CONFIG_KEYS`).
+- **10 `wh_*` modules — 4,637 LOC**: `wh_types.ts` (116), `wh_canonical.ts` (328), `wh_merge.ts` (550), `wh_engine_core.ts` (1,678 — diverged post-extraction from `ca4d280`'s 1,671: raw-wire `envelope: unknown` widening + narrow relay cast, see PROVENANCE), `wh_handshake.ts` (488), `wh_snapshot.ts` (212), `wh_shard_channel.ts` (296), `wh_directory_reader.ts` (220), `wh_entrypoint.ts` (543), `wh_testutil.ts` (206) — plus the runtime-required **`geo_write_fence.ts`** (342 LOC, the write fence + `FENCE_CONFIG_KEYS`). All byte-identical to `ca4d280` except the `FLEET_TOKEN` rename sites and `wh_engine_core.ts`.
 - **10 test files — 7,502 LOC**: the 9 `wh_*_test.ts` files (6,605) + `geo_write_fence_test.ts` (897).
 - **Fixtures — 3,144 LOC**: `wh_fixtures/{E1_groupby,E2_avg,E7_min,E12_groupkeys,E14_empty}.json`.
 - **Shell**: `warehouse-engine/index.ts` (185 LOC, r40 thin-shell extraction).
@@ -17,7 +17,7 @@ Standalone repo `supabase-warehouse-engine` ("whe"): the warehouse-engine edge f
 ### Renamed / replaced
 
 - **`FLEET_TOKEN` → `WHE_BEARER_TOKEN`** — the FM bearer env name is retired (the bearer is this repo's own credential; checkAuth is the rename site, with its fail-closed 500 message). `WH_SNAPSHOT_KEY` / `WH_SHARD_KEYS` / `WH_RYW_V1` / `WH_REAL_FETCHER` keep their names (already namespaced, test-pinned verbatim).
-- **`supabase-client.ts` → `whe_store.ts`** — the consumer-store seam (`db()` semantics preserved; FM's config-JWT-skew gate, config cache, audit and quota helpers deliberately NOT carried).
+- **`supabase-client.ts` → `whe_store.ts`** — the consumer-store seam (`db()` body a verbatim excerpt; semantics preserved; FM's config-JWT-skew gate, config cache, audit and quota helpers deliberately NOT carried).
 - **`supabase/config.toml`** now pins `[functions.warehouse-engine] verify_jwt = false` (FM's config had no engine entry — the shape was carried only by the deploy flag).
 
 ### Posture
@@ -33,4 +33,4 @@ Standalone repo `supabase-warehouse-engine` ("whe"): the warehouse-engine edge f
 
 ### New (no FM provenance)
 
-README, API, DESIGN, DEPLOY, CHANGELOG, PROVENANCE, LICENSE (MIT, dual copyright), `.github/workflows/test.yml`, `Makefile`, `scripts/run-tests.mjs`, `deno.json`, `supabase/config.toml`, `_shared/whe_store.ts` + `_shared/whe_store_test.ts`.
+README, API, DESIGN, DEPLOY, CHANGELOG, PROVENANCE, LICENSE (MIT, dual copyright), `.github/workflows/test.yml`, `Makefile`, `scripts/run-tests.mjs`, `deno.json`, `supabase/config.toml`, `_shared/whe_store_test.ts`.

@@ -1,6 +1,6 @@
 # PROVENANCE — copy ledger
 
-Every copied file originated in **`supabase-fleet-manager` @ `ca4d280`** (`main`, tree clean; origin `github.com/ariellebridget3O/supabase-fleet-manager`). Verbatim copies keep byte-diffability with the source repo (future `wh_*` fixes can be re-synced by diff). Files marked **NEW** have no FM provenance.
+Every copied file originated in **`supabase-fleet-manager` @ `ca4d280`** (`main`, tree clean; origin `github.com/ariellebridget3O/supabase-fleet-manager`). Verbatim copies keep byte-diffability with the source repo (future `wh_*` fixes can be re-synced by diff). Byte-diff status (md5 per file against `ca4d280`): every ledgered file is byte-identical EXCEPT (i) the `FLEET_TOKEN`→`WHE_BEARER_TOKEN` rename sites and (ii) `wh_engine_core.ts` — both detailed below. Files marked **NEW** have no FM provenance.
 
 ## License inheritance
 
@@ -15,7 +15,7 @@ The source repo is **MIT** (`supabase-fleet-manager/LICENSE`: "Copyright (c) 202
 | `supabase/functions/_shared/wh_types.ts` | same path | 116 |
 | `supabase/functions/_shared/wh_canonical.ts` | same path | 328 |
 | `supabase/functions/_shared/wh_merge.ts` | same path | 550 |
-| `supabase/functions/_shared/wh_engine_core.ts` | same path | 1,671 |
+| `supabase/functions/_shared/wh_engine_core.ts` | same path — **NOT verbatim** (diverged post-extraction, +7 lines vs source's 1,671): ok-arm `envelope` widened to the raw wire `unknown` (AM-1/F-N7), `Omit<WhPartialEnvelope,'shard'>` partial-return, narrow relay cast at the raced fan-out relay | 1,678 |
 | `supabase/functions/_shared/wh_handshake.ts` | same path | 488 |
 | `supabase/functions/_shared/wh_snapshot.ts` | same path | 212 |
 | `supabase/functions/_shared/wh_shard_channel.ts` | same path | 296 |
@@ -24,9 +24,11 @@ The source repo is **MIT** (`supabase-fleet-manager/LICENSE`: "Copyright (c) 202
 | `supabase/functions/_shared/wh_testutil.ts` | same path (test helper; copied, not moved) | 206 |
 | `supabase/functions/_shared/geo_write_fence.ts` | same path (not a `wh_*` file; runtime-required by wh_entrypoint + shell) | 342 |
 
-Total runtime island: 4,972 LOC (10 `wh_*` = 4,630 + fence 342).
+Total runtime island: 4,979 LOC (10 `wh_*` = 4,637 + fence 342). The 4,630/4,972 figures seen in earlier drafts were the @`ca4d280` numbers before the `wh_engine_core.ts` divergence.
 
-### Tests + fixtures (verbatim)
+Rename sites (functional rename only; comments elsewhere): `wh_entrypoint.ts:205` is the env-name line — the same token rename also touches comments in `wh_snapshot.ts` / `wh_entrypoint.ts` and strings in `wh_entrypoint_test.ts` / `geo_write_fence_test.ts`; `wh_entrypoint_test.ts` additionally drops FM's `fleet-api` source-text pins (that surface stayed with FM). The shell `warehouse-engine/index.ts` differs from its @`ca4d280` counterpart by exactly 2 lines (the `whe_store` import + one rename comment).
+
+### Tests + fixtures (verbatim; rename-touched files listed above)
 
 | This repo | Source (FM) @ `ca4d280` | LOC |
 |---|---|---|
@@ -68,8 +70,8 @@ The `db/migrations/` vs `db/shard-migrations/` split is load-bearing (0015's hea
 
 | File | Note |
 |---|---|
-| `supabase/functions/_shared/whe_store.ts` | consumer-store seam; replaces FM `_shared/supabase-client.ts` (not copied: FM config-JWT/audit/quota baggage). `db()` semantics preserved. |
-| `supabase/functions/_shared/whe_store_test.ts` | recording-fake battery pinning the 6 store query shapes. |
+| `supabase/functions/_shared/whe_store.ts` | consumer-store seam. **NOT fully NEW**: the `db()` body is a verbatim excerpt of FM `_shared/supabase-client.ts` @ `ca4d280` (401 LOC file → 76; FM config-JWT/audit/quota helpers dropped, header rewritten). `db()` semantics preserved. |
+| `supabase/functions/_shared/whe_store_test.ts` | recording-fake battery pinning the 6 store query shapes (FM has no `supabase-client` test). |
 | `README.md`, `API.md`, `DESIGN.md`, `DEPLOY.md`, `CHANGELOG.md`, `PROVENANCE.md` | docs (this round). |
 | `LICENSE` | MIT text; FM copyright line preserved + new line. |
 | `.github/workflows/test.yml` | modeled on FM's workflow @ `ca4d280`; typecheck job ADDS the engine (FM deliberately excluded it). |
@@ -81,16 +83,16 @@ The `db/migrations/` vs `db/shard-migrations/` split is load-bearing (0015's hea
 
 ## Normative-source pointer map
 
-Module/migration headers cite FM `research/` docs that do not exist in this repo. Map (do not edit the headers; map, per the verbatim-copy doctrine):
+Module/migration headers cite FM `research/` docs. **None of those files exist in `supabase-fleet-manager` @ `ca4d280` — nor anywhere in that repo's history** (`git log --all -- 'research/*'` is empty; the `ca4d280` tree has no `research/` directory). The citations dangle: the docs live in the worklog lane, not the source repo. Map retained (do not edit the headers; map, per the verbatim-copy doctrine):
 
-| Cited in headers as | Lives at (FM @ `ca4d280`) |
-|---|---|
-| `research/findings_wh_catalog_contract.md` | normative for 0013/0014/0016 + the catalog contract |
-| `research/design_wh_query_rpc.md` | normative for shard 0015 (signature, registry, hash law, envelope) |
-| `research/findings_wh_scatter_gather.md` | fan-out/merge contract background |
-| `research/findings_geo_failover_design.md` | geo gate ladder G1..G6 / G-W1..W5 background |
-| `research/design_r53_wh_ryw_lsn_poll.md` | `WH_RYW_V1` lever design (cited in wh_entrypoint.ts) |
-| `research/design_r69_shard_channel.md` | shard service-key channel D-decisions (cited in index.ts) |
+| Cited in headers as | Normative for | Found in FM @ `ca4d280`? |
+|---|---|---|
+| `research/findings_wh_catalog_contract.md` | 0013/0014/0016 + the catalog contract | NO |
+| `research/design_wh_query_rpc.md` | shard 0015 (signature, registry, hash law, envelope) | NO |
+| `research/findings_wh_scatter_gather.md` | fan-out/merge contract background | NO |
+| `research/findings_geo_failover_design.md` | geo gate ladder G1..G6 / G-W1..W5 background | NO |
+| `research/design_r53_wh_ryw_lsn_poll.md` | `WH_RYW_V1` lever design (cited in wh_entrypoint.ts) | NO |
+| `research/design_r69_shard_channel.md` | shard service-key channel D-decisions (cited in index.ts) | NO |
 
 ## Not copied (deliberate)
 
