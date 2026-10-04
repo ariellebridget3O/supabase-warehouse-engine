@@ -32,12 +32,25 @@
 //   * rpcMode -> the WH_REAL_FETCHER env-guard expression (the staged r60
 //     flip lever's exact 'on' value; passed into the core via deps — F-N8
 //     purity: the _shared modules never read env)
+//   * engineBuild -> the GENERATED build stamp (r124 A8,
+//     design_r124_opt3_a8.md §2): _shared/engine_build.ts is gitignored and
+//     written by `make stamp` (the HEAD sha7). The SHELL imports the
+//     constant statically (a constant import cannot throw — the audit-B
+//     mechanism) and threads it as deps.engineBuild (the hasRealFetcher DI
+//     precedent — _shared itself never reads the file). Absent/empty ⇒ the
+//     dep is not threaded: /health renders engine_build: null + ONE
+//     fixed-string boot defect log below (echo law).
 // Deployment shape (§4.1 pinned): path'd URL, verify_jwt=false, fn-level
 // bearer auth inside the handler.
 // =============================================================================
 
 import { handleWhEngineRequest, rywGateEnabledFromEnv, FLIP_hasRealFetcher } from '../_shared/wh_entrypoint.ts';
 import type { WhEngineDeps } from '../_shared/wh_entrypoint.ts';
+// r124 A8: the GENERATED build stamp — gitignored, NEVER committed
+// (committing = sha self-reference regress). `make stamp` writes it; the
+// Makefile check/ci targets bootstrap it (a fresh clone's deno check fails
+// on the missing import otherwise).
+import { ENGINE_BUILD } from '../_shared/engine_build.ts';
 import { makeDirectoryReader, makeGeoDirectoryReader } from '../_shared/wh_directory_reader.ts';
 import { makeWhHandshake } from '../_shared/wh_handshake.ts';
 import {
@@ -54,6 +67,11 @@ import type { WhProxyRawFetch } from '../_shared/wh_shard_channel.ts';
 import { fetchFenceConfig, ownProjectRefFromSupabaseUrl } from '../_shared/geo_write_fence.ts';
 import type { WhFenceClient } from '../_shared/geo_write_fence.ts';
 import { db } from '../_shared/whe_store.ts';
+
+// r124 A8: TS — the generated constant's literal type (the file is the
+// design's exact one-liner) is widened HERE so the empty-placeholder arms
+// below type-check without touching the generator's output shape.
+const engineBuild: string = ENGINE_BUILD;
 
 // r123: the IIFE is now async (top-level await) — the WH_PROXY lever's
 // boot-once KV read below needs ONE awaited PostgREST round-trip at isolate
@@ -80,6 +98,14 @@ const deps: WhEngineDeps = await (async () => {
   }
   if (ownKey === '') {
     console.error('warehouse-engine shard key channel defect: SUPABASE_SERVICE_ROLE_KEY empty — own-ref key resolution fails closed (shard_key_missing)');
+  }
+  // r124 A8 (design §2 ⟫B-1): the stamp's ONE boot defect log — an EMPTY
+  // generated constant (a hand-written placeholder that only satisfies the
+  // import) means deploy provenance is unavailable. Fixed string, echo law:
+  // never value fragments, never a 500 on /health over it (the dep simply
+  // stays unthreaded and /health renders engine_build: null).
+  if (engineBuild === '') {
+    console.error('warehouse-engine boot defect: ENGINE_BUILD stamp absent — deploy provenance unavailable (stamp null on /health)');
   }
   const resolveShardKey = makeShardKeyResolver({ ownRef, ownKey, remoteKeys: shardKeys });
 
@@ -310,6 +336,12 @@ const deps: WhEngineDeps = await (async () => {
     // Passed INTO the core via deps (purity law — the core never reads env);
     // with the env unset this is false ⇒ the unset path is byte-identical.
     rpcMode: Deno.env.get('WH_REAL_FETCHER') === 'on',
+    // r124 A8 (design §2 ⟫B-1): the generated build stamp rides as a DI dep
+    // (the hasRealFetcher precedent above — the constant import lives in
+    // THIS shell; _shared only ever sees the injected value). Conditional
+    // spread: with an empty constant the field is ABSENT (byte-identical
+    // unset path; /health renders engine_build: null).
+    ...(engineBuild !== '' ? { engineBuild } : {}),
   };
 })();
 

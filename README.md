@@ -51,7 +51,7 @@ make test                 # or: deno task test
 
 # 4. Smoke (needs 0013 applied first — see rescue line 5):
 curl -fsS "https://$REF.supabase.co/functions/v1/warehouse-engine/health"
-#    → 200 {"v":1,"ok":true,"directory_version":N}
+#    → 200 {"v":1,"ok":true,"directory_version":N,"engine_build":"<sha7>"}
 ```
 
 ## Environment variables
@@ -75,7 +75,7 @@ Full wire contract: [API.md](API.md).
 | Route | Auth | Response |
 |---|---|---|
 | `OPTIONS *` | exempt | `204` + CORS headers |
-| `GET /health` | none | `200 {"v":1,"ok":true,"directory_version":N}` (probe failure ⇒ `500 {"v":1,"ok":false,…}`) |
+| `GET /health` | none | `200 {"v":1,"ok":true,"directory_version":N,"engine_build":"<sha7>|null"}` (r124 A8: the generated build stamp; absent ⇒ null. Probe failure ⇒ `500 {"v":1,"ok":false,…}`) |
 | `POST /query` | Bearer `WHE_BEARER_TOKEN` + `apikey` | `200` engine envelope / mapped error |
 | anything else | Bearer + `apikey` | `400 {"v":1,"error":{"code":"malformed","message":"no route <METHOD> <path>"}}` |
 

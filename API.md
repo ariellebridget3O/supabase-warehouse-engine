@@ -34,7 +34,7 @@ The handler locates the `/warehouse-engine` marker inside `url.pathname` and rou
 | # | Route | Auth | Response |
 |---|---|---|---|
 | 1 | `OPTIONS *` (any path) | exempt | `204` with `Access-Control-Allow-Origin: *`, `Allow-Methods: GET,POST,OPTIONS`, `Allow-Headers: Authorization, Content-Type, apikey`, `Max-Age: 86400` |
-| 2 | `GET /health` | none | `200 {"v":1,"ok":true,"directory_version":<int>}` — a cheap config version probe **only** (no directory embed). Probe failure ⇒ `500 {"v":1,"ok":false,"error":{"code":"internal","message":…}}`. |
+| 2 | `GET /health` | none | `200 {"v":1,"ok":true,"directory_version":<int>,"engine_build":"<sha7>|null"}` — a cheap config version probe **only** (no directory embed). r124 A8: `engine_build` is the generated build stamp (null when absent; additive — never a 500 over the stamp). Probe failure ⇒ `500 {"v":1,"ok":false,"error":{"code":"internal","message":…}}`. |
 | 3 | `POST /query` | yes | see below |
 | 4 | anything else | yes | `400 {"v":1,"error":{"code":"malformed","message":"no route <METHOD> <path>"}}` |
 

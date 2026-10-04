@@ -1280,7 +1280,14 @@ export interface ExecuteArgs {
   // phases.pre_chain_ms. Optional (absent ⇒ 0): legacy callers/tests
   // unchanged. The value is computed UPSTREAM and passed in — the core
   // never reads env and owns no clock outside args.timers (purity law).
-  timings?: { preChainMs: number };
+  // r124 OPT-3 (design §1, audit A ⟫A-3): the OPTIONAL sub-spans — dir_ms
+  // (the atomic directory read wall; 0 on the replayed path, never-ran=0)
+  // and fence_ms (the r49 consult wall measured from its EARLY start, so
+  // the dir overlap is subtracted honestly: pre_chain_ms >= max(dir_ms,
+  // fence_ms) is the invariant). Spread CONDITIONALLY into phases (both
+  // success sites) — absent keys when not threaded, keeping the exact
+  // {pre_chain_ms, handshake_ms, fanout_ms} legacy shape green.
+  timings?: { preChainMs: number; dirMs?: number; fenceMs?: number };
 }
 
 // ---------- r47 read-plane gate ladder (impl plan §2; first match wins) ----------
@@ -1422,10 +1429,14 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     // r121 OPT-1b (design §1.7): an empty-selection response is still a
     // SUCCESS envelope — it carries phases (the handshake/fanout phases
     // never ran: 0/0; pre_chain_ms is still the entrypoint-measured span).
+    // r124 OPT-3 (⟫A-3): the sub-spans spread CONDITIONALLY — absent keys
+    // when not threaded (the exact legacy shape stays pinned green).
     base.phases = {
       pre_chain_ms: args.timings?.preChainMs ?? 0,
       handshake_ms: 0,
       fanout_ms: 0,
+      ...(args.timings?.dirMs !== undefined ? { dir_ms: args.timings.dirMs } : {}),
+      ...(args.timings?.fenceMs !== undefined ? { fence_ms: args.timings.fenceMs } : {}),
     };
     return base;
   };
@@ -1850,10 +1861,17 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
   // sampler did not fire — the fold's steady state); fanout_ms is the
   // measured fanout BLOCK duration (the runFanout await wall, documented
   // at the measurement site — NOT max(perShard)).
+  // r124 OPT-3 (design §1, audit A ⟫A-3): dir_ms + fence_ms spread
+  // CONDITIONALLY from the OPTIONAL timings fields — absent keys when not
+  // threaded (the exact legacy {pre_chain_ms, handshake_ms, fanout_ms}
+  // shape stays green), present when the entrypoint threads them (0 =
+  // never-ran: replayed ⇒ dir_ms 0; unwired fence ⇒ fence_ms 0).
   response.phases = {
     pre_chain_ms: args.timings?.preChainMs ?? 0,
     handshake_ms: handshakeMs,
     fanout_ms: fanoutMs,
+    ...(args.timings?.dirMs !== undefined ? { dir_ms: args.timings.dirMs } : {}),
+    ...(args.timings?.fenceMs !== undefined ? { fence_ms: args.timings.fenceMs } : {}),
   };
   return response;
 }

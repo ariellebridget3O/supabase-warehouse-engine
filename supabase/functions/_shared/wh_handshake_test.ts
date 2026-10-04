@@ -1162,6 +1162,44 @@ Deno.test('r121 ADD (phases pin): injected counting timers — pre_chain threade
   eq('empty coverage 0/0', res4.coverage, '0/0');
 });
 
+// ---- r124 OPT-3 (design §1, audit A ⟫A-3): the sub-span conditional-spread
+// pin — timings {dirMs, fenceMs} spread INTO phases; legacy {preChainMs}-
+// only callers keep the exact {123, 0, 0} shape (the (4) pin above).
+Deno.test('r124 ADD (sub-span spread): threaded {dirMs, fenceMs} land on the phases EXACTLY (dir_ms/fence_ms); absent keys stay absent', async () => {
+  const pruneCols: Record<string, string> = { region: 'text', amount: 'numeric', created_at: 'timestamptz' };
+  const prunedFleet = [
+    { ...dirRow('S1'), key_min: '2026-01-01', key_max: '2026-06-30' },
+    { ...dirRow('S2'), key_min: '2026-07-01', key_max: '2026-12-31' },
+  ];
+  const req = {
+    v: 1,
+    qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+    table: 'orders',
+    query: {
+      select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }],
+      groupBy: ['region'],
+      where: [{ col: 'created_at', op: 'lt', value: '2025-06-30' }], // prunes BOTH shards
+    },
+  };
+  const res = await executeWhQuery({
+    req: parseWhEngineRequest(req),
+    columnTypes: pruneCols,
+    columnScales: SCALES,
+    directoryRows: prunedFleet,
+    shardKeyColumn: 'created_at',
+    shardKeyType: 'range',
+    directoryVersion: 7,
+    timers: stepTimers(),
+    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { templateHash: W1H }), []),
+    timings: { preChainMs: 123, dirMs: 4, fenceMs: 9 },
+  });
+  eq(
+    'sub-spans: the EXACT threaded phases {123, 0, 0, dir_ms 4, fence_ms 9} (conditional spread, no extra keys)',
+    res.phases,
+    { pre_chain_ms: 123, handshake_ms: 0, fanout_ms: 0, dir_ms: 4, fence_ms: 9 },
+  );
+});
+
 // ---- ADD #5 (§5.5): the empty-hash guard pin ----
 Deno.test('r121 ADD (empty-hash guard): an UNTEMPLATED plan fires ZERO inventory GETs even with an in-bucket qid (the vacuous audit is retired)', async () => {
   const fetchCalls: string[] = [];

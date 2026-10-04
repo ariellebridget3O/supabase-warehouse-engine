@@ -184,6 +184,16 @@ export interface WhEngineDeps {
   rywGateEnabled?: boolean;
   /** Optional timers injection (tests); defaults to real timers. */
   timers?: WhEngineTimers;
+  // ---- r124 A8 (design_r124_opt3_a8.md §2): the GENERATED build stamp ----
+  /** The engine build identity (`export const ENGINE_BUILD = "<sha7>"` — the
+   *  gitignored _shared/engine_build.ts, written by `make stamp` from the
+   *  HEAD sha7). Threaded by the SHELL ONLY (the hasRealFetcher precedent:
+   *  the constant import lives in warehouse-engine/index.ts; _shared itself
+   *  never reads the file — it only ever sees the value as this injected
+   *  dep, keeping the purity law intact since a constant import is not an
+   *  env read). Absent => /health renders `engine_build: null` (additive
+   *  field, never a 500 over the missing stamp). */
+  engineBuild?: string;
 }
 
 function json(body: unknown, status: number): Response {
@@ -335,6 +345,13 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
     }, 400);
   }
 
+  // r124 OPT-3 (design §1, audit A ⟫A-1): wantsReplica is HOISTED above the
+  // pre-chain try — the r49 read-dispatch fence predicate (formerly :431)
+  // must be decidable at the :339 boundary (right after the parse + RYW
+  // gates) so the consult can start EARLY. Pure local compute on `parsed` —
+  // no behavior change on any plane.
+  const wantsReplica = parsed.read_plane === 'replica';
+
   let knownVersion: number | undefined;
   try {
     // r121 OPT-1b (design §1.7): pre_chain_ms is measured HERE — the
@@ -350,6 +367,30 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
     // default real timers when unwired).
     const timers = deps.timers ?? defaultWhEngineTimers();
     const preChainStarted = timers.nowMs();
+    // r124 OPT-3 EARLY START (design §1, audit A ⟫A-1): the r49 read-dispatch
+    // fence consult starts UNAWAITED at the parse+RYW-gate boundary — 400-class
+    // requests were already returned above, so they stay consult-free (the
+    // cost law, ⟫A-1). Dependency-freedom is PROVEN (audit A): fetchFenceConfig
+    // takes no data args (the "fence trio" = 3 keys in ONE .in() GET), the
+    // consult is PURE-READ, and only local compute sits between the two
+    // awaits — starting it before the replay probe / directory read is
+    // semantics-free. The consume block (below, after the directory read)
+    // replaces the old serial await; the predicate SEMANTICS are the former
+    // :431 line's exactly (the typeof guard is hoisted into `ownRef`).
+    // Consume order: dir first -> fence (⟫A-2), with the deterministic
+    // both-fail precedence — the DIRECTORY error wins (a fence rejection is
+    // rethrown only when the directory read succeeded).
+    const ownRef = typeof deps.ownProjectRef === 'string' ? deps.ownProjectRef : '';
+    const fenceEligible = !wantsReplica && deps.fetchFenceConfig !== undefined && ownRef !== '';
+    const fenceStartMs = fenceEligible ? timers.nowMs() : 0;
+    const fenceP: Promise<WhFenceRead> | undefined = fenceEligible ? deps.fetchFenceConfig!() : undefined;
+    // Defensive settlement guard: the consult must NEVER become an unhandled
+    // rejection if the chain escapes early (a failed replay probe, a failed
+    // directory read, a failed sign — the same paths where the OLD serial
+    // code never fired the consult at all). The guard marks the rejection
+    // handled; the consume block below still rethrows it when reached with
+    // the directory read ok (today's throw semantics preserved, ⟫A-2).
+    fenceP?.catch(() => {});
     // §4.6 snapshot replay: verify chain (sig -> TTL -> version) BEFORE the
     // expensive full-embed read. ANY failure => silent full embed (never an
     // error). A valid replay skips the directory read AND the re-attach —
@@ -371,8 +412,15 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
       }
     }
     let freshSnapshot: string | undefined;
+    // r124 OPT-3 sub-span (⟫A-3): dir_ms measures the atomic directory read
+    // wall; replayed ⇒ 0 (the never-ran=0 convention). The read is STARTED
+    // here (only on !replayed — an unconditional start would add an rpc POST
+    // per replay request) and consumed immediately (dir first -> fence).
+    let dirMs = 0;
     if (!replayed) {
+      const dirStartMs = timers.nowMs();
       const read = await deps.readDirectory();
+      dirMs = timers.nowMs() - dirStartMs;
       directoryRows = read.rows;
       version = read.version;
       knownVersion = version;
@@ -384,6 +432,24 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
       // Unreachable (both branches assign) — a narrow backstop for TS flow
       // analysis that doubles as a loud tripwire if the branches ever change.
       throw new WhEngineError('internal', 'directory replay/read produced no rows');
+    }
+    // r124 OPT-3 (⟫A-2): the fence CONSUME — dir first, then fence. A fence
+    // ok:false degrades silently to placements (unchanged — the read plane
+    // degrades, never throws, G-W1 is a WRITE-plane rule); a fence REJECTION
+    // is rethrown only when the directory read succeeded (the both-fail
+    // precedence: the directory error already escaped above). The consult was
+    // STARTED early at the try boundary — its wall (fence_ms, ⟫A-3) runs from
+    // the early start, so the overlap with the directory read is subtracted
+    // honestly (pre_chain_ms >= max(dir_ms, fence_ms) is the invariant).
+    let geoReadDispatch: WhGeoReadDispatch | undefined;
+    let fenceMs = 0;
+    if (fenceP !== undefined) {
+      const fence = await fenceP;
+      fenceMs = timers.nowMs() - fenceStartMs;
+      if (fence.ok) {
+        const dispatch = resolveReadDispatch(fence.values, ownRef);
+        if (dispatch.kind !== 'placements') geoReadDispatch = dispatch;
+      }
     }
 
     // r40 P0-3: per-table projection (directory = routing truth; the full
@@ -416,28 +482,23 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
     // r47: resolve the geo-mode config ONLY on the replica plane (zero
     // overhead on the primary plane — the pre-r47 behavior is byte-identical;
     // a missing dep fails closed inside the engine's gate ladder).
-    const wantsReplica = parsed.read_plane === 'replica';
+    // (r124 OPT-3: wantsReplica is hoisted above the try — the fence
+    // eligibility predicate must be decidable at the try boundary.)
     const geoMode = wantsReplica && deps.readGeoMode !== undefined ? await deps.readGeoMode() : undefined;
 
-    // r49 B2 R3 (re-audit #6): the legacy primary-plane READ dispatch
-    // identity — ONE combined config read (the override key rides the same
-    // read, re-audit #3e). Only on the legacy primary plane (the replica
-    // plane's identity is the geo row and NEVER consults the override), only
-    // when BOTH deps are wired (absent ⇒ the pre-r49 path, byte-identical).
-    // A failed read DEGRADES to placements (the read plane degrades, never
-    // throws — G-W1's 500 is a WRITE-plane rule). 'placements' resolves to
-    // no instruction at all, keeping the unset path byte-identical.
-    let geoReadDispatch: WhGeoReadDispatch | undefined;
-    if (!wantsReplica && deps.fetchFenceConfig !== undefined && typeof deps.ownProjectRef === 'string' && deps.ownProjectRef !== '') {
-      const fence = await deps.fetchFenceConfig();
-      if (fence.ok) {
-        const dispatch = resolveReadDispatch(fence.values, deps.ownProjectRef);
-        if (dispatch.kind !== 'placements') geoReadDispatch = dispatch;
-      }
-    }
+    // r124 OPT-3: the r49 B2 R3 serial consult block that stood HERE (after
+    // the hashes + geo-mode read) is REPLACED by the early-start + consume
+    // pair above (the early start at the try boundary, the consume right
+    // after the directory read). The semantics the old block pinned — ONE
+    // combined config read, replica plane never consults, placements
+    // identity = no instruction (byte-identical unset path) — are unchanged;
+    // only the FIRING ORDER moved (parallel-safe per the audit A dependency
+    // proof).
 
     // r121 OPT-1b (design §1.7): the pre-chain span CLOSES here — after the
-    // r49 fence consult, before the engine's own in-core clock starts.
+    // r49 fence consult has SETTLED (r124 OPT-3: the fence/dir pair is
+    // consumed before this point, so the span is the wall of the pair plus
+    // the local compute), before the engine's own in-core clock starts.
     const preChainMs = timers.nowMs() - preChainStarted;
 
     const response = await executeWhQuery({
@@ -460,7 +521,13 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
       // (ExecuteArgs.timings — optional upstream; the engine defaults
       // pre_chain_ms to 0 when absent.)
       timers,
-      timings: { preChainMs },
+      // r124 OPT-3 (⟫A-3): the sub-span timers ride alongside preChainMs —
+      // dir_ms (0 on the replayed path: never-ran=0) + fence_ms (0 when the
+      // fence dep is unwired). OPTIONAL fields upstream: the core spreads
+      // them CONDITIONALLY into phases so legacy callers/tests that thread
+      // only preChainMs keep the exact phases shape (the wh_handshake_test
+      // exact pin stays green).
+      timings: { preChainMs, dirMs, fenceMs },
       fetcher: deps.fetcher,
       // r44 §5.2: the handshake rides only when wired (optional dep — absent
       // => the ungated pre-r44 pipeline, keeping the stub path reachable).
@@ -550,10 +617,14 @@ export async function handleWhEngineRequest(req: Request, deps: WhEngineDeps): P
   }
 
   // r40 P2-1: /health is a config version probe only — L2 shape per §4.1.
+  // r124 A8 (design §2 ⟫B-1): the additive `engine_build` field — the shell
+  // threads the generated stamp (DI); absent ⇒ null. The field can NEVER
+  // 500 the probe (a static-import constant cannot throw; null is the
+  // absent face) and the 500 arm below is untouched.
   if (path === '/health' && req.method === 'GET') {
     try {
       const version = await deps.probeDirectoryVersion();
-      return json({ v: 1, ok: true, directory_version: version }, 200);
+      return json({ v: 1, ok: true, directory_version: version, engine_build: deps.engineBuild ?? null }, 200);
     } catch (e) {
       return json({ v: 1, ok: false, error: { code: 'internal', message: (e as Error).message } }, 500);
     }

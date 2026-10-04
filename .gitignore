@@ -43,3 +43,7 @@ coverage/
 *.dump
 *.sql.gz
 backups/
+
+# ---- Generated (r124 A8: the ENGINE_BUILD stamp — `make stamp`, NEVER
+# committed: committing = sha self-reference regress) ----
+supabase/functions/_shared/engine_build.ts

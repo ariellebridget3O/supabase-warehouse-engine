@@ -106,6 +106,19 @@ Optional, same endpoint (separate calls or one array):
 
 ## 5. Deploy
 
+r124 A8: the deploy rides the GATE — five ordered checks (on-branch main /
+clean tree / HEAD == origin/main after fetch / stamp fresh / token present);
+a refusal dies with a fixed message and never deploys:
+
+```bash
+make stamp && make deploy-gate && make deploy
+```
+
+`make deploy` re-runs the gate (belt-and-braces) and then the exact CLI line
+below; `SUPABASE_ACCESS_TOKEN` + `WHE_PROJECT_REF` come from the caller's
+env. The stamp (`_shared/engine_build.ts`) is gitignored and regenerated per
+commit — NEVER committed (sha self-reference regress):
+
 ```bash
 SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" \
 npx -y supabase functions deploy warehouse-engine \
@@ -122,7 +135,7 @@ npx -y supabase functions deploy warehouse-engine \
 ```bash
 # 6a. /health — the first 200 (needs only migration 0013 applied):
 curl -fsS "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/health"
-#    → 200 {"v":1,"ok":true,"directory_version":1}
+#    → 200 {"v":1,"ok":true,"directory_version":1,"engine_build":"<sha7>"}
 
 # 6b. authed /query — expect the PINNED pre-flip 500 (ships disabled):
 curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/query" \

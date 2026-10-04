@@ -37,9 +37,17 @@ import { handleWhEngineRequest, rywGateEnabledFromEnv, FLIP_hasRealFetcher } fro
 import type { WhEngineDeps } from './wh_entrypoint.ts';
 import { makeDirectoryReader, toWhDirectoryRow, coerceDirectoryVersion } from './wh_directory_reader.ts';
 import { signDirectorySnapshot, signSnapshotBlob, verifyDirectorySnapshot } from './wh_snapshot.ts';
-import type { WhDirectoryRow, WhGeoDirectoryRow, WhShardFetcher } from './wh_engine_core.ts';
+import {
+  // r124 OPT-3: the both-fail precedence discriminator arm THROWS this from
+  // the injected directory fake (a WhEngineError is relayed RAW on the wire,
+  // unlike a plain Error which scrubs — the pair makes the dir-wins
+  // precedence observable through the error envelope).
+  WhEngineError,
+} from './wh_engine_core.ts';
+import type { WhDirectoryRow, WhGeoDirectoryRow, WhShardFetcher, WhEngineTimers } from './wh_engine_core.ts';
 import type { WhPartialEnvelope } from './wh_types.ts';
 import type { TemplateInventoryRow, WhShardHandshake } from './wh_handshake.ts';
+import type { WhFenceRead, WhFenceValues } from './geo_write_fence.ts';
 import indexSrc from '../warehouse-engine/index.ts' with { type: 'text' };
 
 let passed = 0;
@@ -139,7 +147,7 @@ function failFetch(warning: { code?: string; httpStatus?: number; stamped?: bool
   return async () => ({ ok: false, warning, estRows: 0 });
 }
 
-interface Counters { probe: number; read: number }
+interface Counters { probe: number; read: number; fence: number }
 
 function makeDeps(opts: {
   rows?: WhDirectoryRow[];
@@ -159,8 +167,24 @@ function makeDeps(opts: {
   // r69 battery: the RPC-plane mode flag injection (absent => the handler
   // default OFF — the same additive shape as rywGateEnabled above).
   rpcMode?: boolean;
+  // ---- r124 OPT-3/A8 battery hooks (additive — absent => the pre-r124 dep
+  // shape; every existing cell is untouched) ----
+  // A8: the generated build stamp (present/absent arms on the /health L2
+  // shape — the shell threads it in prod; tests inject it here).
+  engineBuild?: string;
+  // OPT-3: the r49 fence fake (wrapped by the harness counter — pins read
+  // counters.fence, never the raw fn) + the dispatch identity.
+  fetchFenceConfig?: () => Promise<WhFenceRead>;
+  ownProjectRef?: string;
+  // OPT-3: a CONTROLLABLE read impl (the parallel-firing proof resolves it
+  // manually); the harness counter still wraps it. Takes precedence over
+  // readThrows when both are set.
+  readImpl?: () => Promise<{ rows: WhDirectoryRow[]; version: number }>;
+  // OPT-3: sub-span invariant timers (the step-clock arms inject a counting
+  // nowMs; absent => the handler default real timers).
+  timers?: WhEngineTimers;
 } = {}): { deps: WhEngineDeps; counters: Counters } {
-  const counters: Counters = { probe: 0, read: 0 };
+  const counters: Counters = { probe: 0, read: 0, fence: 0 };
   const rows = opts.rows ?? ORDERS_ROWS;
   const version = opts.version ?? 42;
   const deps: WhEngineDeps = {
@@ -171,6 +195,7 @@ function makeDeps(opts: {
     },
     readDirectory: async () => {
       counters.read++;
+      if (opts.readImpl !== undefined) return opts.readImpl();
       if (opts.readThrows) throw opts.readThrows;
       return { rows, version };
     },
@@ -189,6 +214,21 @@ function makeDeps(opts: {
       : {}),
     ...(opts.rywGateEnabled !== undefined ? { rywGateEnabled: opts.rywGateEnabled } : {}),
     ...(opts.rpcMode !== undefined ? { rpcMode: opts.rpcMode } : {}),
+    // r124 OPT-3/A8 hooks: the fence fake is WRAPPED so pins observe the
+    // consult count (the increment happens synchronously at invocation —
+    // observable before the promise settles); the stamp + timers ride the
+    // same spread-conditional shape as every optional dep above.
+    ...(opts.fetchFenceConfig !== undefined
+      ? {
+        fetchFenceConfig: async () => {
+          counters.fence++;
+          return opts.fetchFenceConfig!();
+        },
+      }
+      : {}),
+    ...(opts.ownProjectRef !== undefined ? { ownProjectRef: opts.ownProjectRef } : {}),
+    ...(opts.engineBuild !== undefined ? { engineBuild: opts.engineBuild } : {}),
+    ...(opts.timers !== undefined ? { timers: opts.timers } : {}),
   };
   return { deps, counters };
 }
@@ -272,9 +312,19 @@ async function optionsHealthPins(): Promise<void> {
     const { deps: hDeps, counters } = makeDeps();
     const h = await handleWhEngineRequest(req('/health', { token: null }), hDeps);
     eq('/health unauthenticated 200', h.status, 200);
-    eq('/health L2 shape', await h.json(), { v: 1, ok: true, directory_version: 42 });
+    // r124 A8 (⟫B-3): the L2 shape RE-PINNED for the additive engine_build
+    // field — the dep ABSENT (the default makeDeps shape) renders null. The
+    // stamp can never 500 the probe (a static-import constant cannot throw).
+    eq('/health L2 shape (re-pinned r124: additive engine_build, absent => null)', await h.json(), { v: 1, ok: true, directory_version: 42, engine_build: null });
     eq('/health did not read the directory (P2-1)', counters.read, 0);
     eq('/health probed config once', counters.probe, 1);
+
+    // r124 A8 present/absent arms (⟫B-3): the stamp rides ONLY when threaded
+    // (in prod: `make stamp` wrote a non-empty sha7 and the shell spreads it).
+    const { deps: stampDeps } = makeDeps({ engineBuild: 'abc1234' });
+    const hs = await handleWhEngineRequest(req('/health', { token: null }), stampDeps);
+    eq('/health stamp PRESENT: the sha7 rides additively', (await hs.json()).engine_build, 'abc1234');
+    eq('/health stamp present: status still 200 unauthenticated', hs.status, 200);
 
     const { deps: fDeps } = makeDeps({ probeThrows: new Error('config probe failed') });
     const hf = await handleWhEngineRequest(req('/health', { token: null }), fDeps);
@@ -879,6 +929,23 @@ async function rywFlipPins(): Promise<void> {
     ok('index.ts reads the WH_RYW_V1 lever through the shared parser', indexSrc.includes("rywGateEnabled: rywGateEnabledFromEnv(Deno.env.get('WH_RYW_V1'))"), 'wiring line absent');
     ok('index.ts imports the lever parser (no ad-hoc env parse)', indexSrc.includes('rywGateEnabledFromEnv'), 'import absent');
 
+    // ---- r124 A8 statics: the generated build stamp rides the DI law ----
+    // The SHELL imports the constant (a static import cannot throw) and
+    // threads it; _shared itself never reads the file — it only sees the
+    // value as deps.engineBuild (the hasRealFetcher precedent). The boot
+    // defect log for an empty constant is fixed-string + boot-time (echo law).
+    ok(
+      "index.ts A8: the ENGINE_BUILD stamp is imported + threaded as deps.engineBuild (the hasRealFetcher DI precedent — the constant import lives in the shell, never in _shared)",
+      indexSrc.includes("import { ENGINE_BUILD } from '../_shared/engine_build.ts';") &&
+        indexSrc.includes('...(engineBuild !== \'\' ? { engineBuild } : {}),'),
+      'the stamp import or the DI thread is missing',
+    );
+    ok(
+      'index.ts A8: the stamp-absent boot defect log exists and is the pinned fixed string (echo law; boot-time, never per-request)',
+      indexSrc.includes('warehouse-engine boot defect: ENGINE_BUILD stamp absent — deploy provenance unavailable (stamp null on /health)'),
+      'the fixed-string boot defect log is missing',
+    );
+
     // m5 rides this section (same design §8 batch)
     m5DependencyGraphPin();
   });
@@ -1071,6 +1138,152 @@ async function rpcPlaneBatteryPins(): Promise<void> {
 }
 
 // -----------------------------------------------------------------------------
+// r124 OPT-3 — the pre-chain fence-parallelize battery (design_r124_opt3_a8.md
+// §1, audit A ⟫A-5). Six offline cells: (a) the parallel-firing proof,
+// (b) the sub-span wall invariant, (c) replay dir_ms 0 + consult still fires,
+// (d) both-fail ⇒ the DIRECTORY error wins, (e) fence-throw ⇒ 500,
+// (f) 400-class ⇒ zero consults + zero rpc POSTs. The ladder-side sub-span
+// record (⟫A-5g) lives in my-project/scripts (outside this repo) — out of
+// scope for the whe battery by design.
+// -----------------------------------------------------------------------------
+
+/** A healthy OPEN fence read — the geo_write_fence_test fixture shape (the
+ *  0017/0019-seeded post-bootstrap state; primary_override undefined ⇒ the
+ *  placements identity ⇒ no instruction on the wire). */
+function fenceRead(over: Partial<WhFenceValues> = {}): WhFenceRead {
+  return { ok: true, values: { read_only: false, write_epoch: 1, primary_override: undefined, ...over } };
+}
+
+/** Counting step timers (every nowMs call advances 5ms) — the sub-span
+ *  invariant arms ride this; NO exact-value pins on the measured numbers
+ *  (the noise law: only presence + the structural invariant). */
+function opt3StepTimers(): WhEngineTimers {
+  let n = 0;
+  return {
+    nowMs: () => (n += 5),
+    startTimeout: (_ms: number) => ({ promise: new Promise<'timeout'>(() => {}), dispose: () => {} }),
+  };
+}
+
+async function opt3PreChainPins(): Promise<void> {
+  console.log('r124 OPT-3: pre-chain fence parallelize');
+  await withEnv('WHE_BEARER_TOKEN', TOKEN, async () => {
+    // (a) ⟫A-5a PARALLEL-FIRING PROOF: the fence consult is INITIATED while
+    // the directory read is still in-flight. Controllable deferred: the dir
+    // read resolves ONLY when released below; under the pre-r124 serial
+    // shape the consult would fire strictly AFTER the dir read settled, so
+    // counters.fence would still be 0 at the tick. The early-start shape
+    // (fence unawaited at the try boundary) has it at 1.
+    let releaseDir!: () => void;
+    const dirGate = new Promise<{ rows: WhDirectoryRow[]; version: number }>((resolve) => {
+      releaseDir = () => resolve({ rows: ORDERS_ROWS, version: 42 });
+    });
+    const { deps, counters } = makeDeps({
+      readImpl: () => dirGate,
+      fetchFenceConfig: async () => fenceRead(),
+      ownProjectRef: 'engineref',
+    });
+    const pending = handleWhEngineRequest(req('/query', { method: 'POST', body: COUNT_REQ }), deps);
+    // One macrotask tick: the handler has then reached the early-start
+    // window (consult initiated) and parked on the unresolved dir read.
+    await new Promise((r) => setTimeout(r, 0));
+    eq('parallel-firing (⟫A-5a): the fence consult is INITIATED while the dir read is in-flight', [counters.fence, counters.read], [1, 1]);
+    releaseDir();
+    const pa = await pending;
+    eq('parallel-firing: the released request still serves 200', pa.status, 200);
+
+    // (b) ⟫A-5b fresh-path phases carry the sub-spans + the WALL invariant:
+    // pre_chain_ms >= max(dir_ms, fence_ms) — fence_ms runs from the EARLY
+    // start (⟫A-4: the dir overlap is subtracted honestly, never added).
+    const { deps: bDeps } = makeDeps({
+      fetchFenceConfig: async () => fenceRead(),
+      ownProjectRef: 'engineref',
+      timers: opt3StepTimers(),
+    });
+    const pb = await handleWhEngineRequest(req('/query', { method: 'POST', body: COUNT_REQ }), bDeps);
+    const bphases = ((await pb.json()) as { phases: Record<string, number> }).phases;
+    eq('sub-spans (⟫A-5b): the fresh path serves 200', pb.status, 200);
+    eq('sub-spans: the fresh path carries dir_ms', typeof bphases.dir_ms, 'number');
+    eq('sub-spans: the fresh path carries fence_ms', typeof bphases.fence_ms, 'number');
+    ok(
+      'sub-spans: the wall invariant pre_chain_ms >= max(dir_ms, fence_ms)',
+      bphases.pre_chain_ms >= Math.max(bphases.dir_ms, bphases.fence_ms),
+      JSON.stringify(bphases),
+    );
+    ok('sub-spans: handshake_ms + fanout_ms still present (additive-only spread)', typeof bphases.handshake_ms === 'number' && typeof bphases.fanout_ms === 'number', 'phases keys');
+
+    // (c) ⟫A-5c REPLAY path: the signed snapshot verify chain replaces the
+    // directory read — ZERO rpc POSTs, dir_ms 0 (never-ran=0), and the fence
+    // consult STILL fires (it started before the verify chain ran).
+    const KEY = 'opt3-snapshot-key';
+    const snap = await signDirectorySnapshot(42, ORDERS_ROWS, KEY);
+    const { deps: cDeps, counters: cCounters } = makeDeps({
+      snapshotKey: KEY,
+      fetchFenceConfig: async () => fenceRead(),
+      ownProjectRef: 'engineref',
+    });
+    const pc = await handleWhEngineRequest(req('/query', { method: 'POST', body: { ...COUNT_REQ, directory_snapshot: snap } }), cDeps);
+    const cphases = ((await pc.json()) as { phases: Record<string, number> }).phases;
+    eq('replay (⟫A-5c): the valid snapshot serves 200', pc.status, 200);
+    eq('replay: ZERO rpc POSTs (the directory read never runs)', cCounters.read, 0);
+    eq('replay: the fence is STILL consulted (the early start precedes the verify chain)', cCounters.fence, 1);
+    eq('replay: dir_ms 0 (the never-ran=0 convention)', cphases.dir_ms, 0);
+    eq('replay: fence_ms present', typeof cphases.fence_ms, 'number');
+
+    // (d) ⟫A-2/⟫A-5d BOTH-FAIL precedence: the DIRECTORY error WINS. The
+    // discriminator: the dir fake throws a WhEngineError (relayed RAW on the
+    // wire as a 400) while the fence fake throws a plain Error (which would
+    // scrub to the generic 500 'internal engine error' if it ever won the
+    // precedence). Seeing the directory's 400 + message proves the order.
+    const { deps: dDeps } = makeDeps({
+      readThrows: new WhEngineError('malformed', 'both-fail: the directory error wins'),
+      fetchFenceConfig: async () => {
+        throw new Error('both-fail: the fence error must never surface');
+      },
+      ownProjectRef: 'engineref',
+    });
+    const pd = await handleWhEngineRequest(req('/query', { method: 'POST', body: COUNT_REQ }), dDeps);
+    const dj = (await pd.json()) as { error: { code: string; message: string } };
+    eq('both-fail (⟫A-5d): the DIRECTORY error surfaces (400; a fence win would have scrubbed to the 500)', pd.status, 400);
+    eq('both-fail: the exact directory message (the fence rejection never surfaced)', dj.error.message, 'both-fail: the directory error wins');
+
+    // (e) ⟫A-5e FENCE-THROW on the read path ⇒ 500 (previously UNPINNED):
+    // the wired prod dep is never-throw; an INJECTED rejection is rethrown
+    // (dir ok) and hits the P3-4 scrub. The ok:false degrade — the never-
+    // throw contract's other face — stays pinned in geo_write_fence_test.
+    const { deps: eDeps } = makeDeps({
+      fetchFenceConfig: async () => {
+        throw new Error('injected fence read rejection');
+      },
+      ownProjectRef: 'engineref',
+    });
+    const pe = await handleWhEngineRequest(req('/query', { method: 'POST', body: COUNT_REQ }), eDeps);
+    eq('fence-throw on the read path (⟫A-5e): 500 (the rejection is rethrown when the dir read is ok)', pe.status, 500);
+    eq('fence-throw: the P3-4 scrub (no raw rejection text)', (await pe.json()).error, { code: 'internal', message: 'internal engine error' });
+
+    // (f) ⟫A-5f 400-CLASS ⇒ zero consults + zero rpc POSTs (the cost law):
+    // BOTH pre-try 400 gates — the §4.3 parse reject and the RYW lever
+    // reject — return before the pre-chain try, so nothing consults.
+    const { deps: fDeps, counters: fCounters } = makeDeps({
+      fetchFenceConfig: async () => fenceRead(),
+      ownProjectRef: 'engineref',
+    });
+    const pf = await handleWhEngineRequest(req('/query', { method: 'POST', body: { ...COUNT_REQ, query: { select: [{ op: 'count' }], having: {} } } }), fDeps);
+    eq('400-class (⟫A-5f): the having reject is a 400', pf.status, 400);
+    eq('400-class: ZERO fence consults (the parse gates precede the pre-chain try)', fCounters.fence, 0);
+    eq('400-class: ZERO rpc POSTs', fCounters.read, 0);
+
+    const { deps: gDeps, counters: gCounters } = makeDeps({
+      fetchFenceConfig: async () => fenceRead(),
+      ownProjectRef: 'engineref',
+    });
+    const pg = await handleWhEngineRequest(req('/query', { method: 'POST', body: { ...COUNT_REQ, min_lsn: '0/FFFFFFFE' } }), gDeps);
+    eq('400-class: the RYW-gate reject is a 400 (the lever default OFF)', pg.status, 400);
+    eq('400-class: the RYW arm also stays consult-free + rpc-free', [gCounters.fence, gCounters.read], [0, 0]);
+  });
+}
+
+// -----------------------------------------------------------------------------
 Deno.test('warehouse-engine smoke pins', async () => {
   await authPins();
   await optionsHealthPins();
@@ -1081,6 +1294,7 @@ Deno.test('warehouse-engine smoke pins', async () => {
   staticPins();
   await rywFlipPins();
   await rpcPlaneBatteryPins();
+  await opt3PreChainPins();
 
   console.log(`\n${passed} passed, ${failed} failed`);
   if (failed > 0) {
