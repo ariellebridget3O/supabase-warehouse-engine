@@ -28,34 +28,63 @@ Expect `"ACTIVE_HEALTHY"`. A free-tier project that auto-paused returns `"PAUSED
 Apply to the **engine host** project, in order:
 
 1. `db/migrations/0013_warehouse_catalog.sql` — `warehouse_tables`, `warehouse_placements` (two partial unique indexes), `v_warehouse_directory`, `warehouse_cold_objects`, `load_jobs`/`load_partitions`, `config.warehouse_directory_version` + `wh_bump_directory_version()`. **/health 500s until this is applied.**
-2. `db/migrations/0014_loader_rpc.sql` — `fm_loader_bookkeep` / `fm_loader_finalize` (the ONE idempotent ledger RPC).
+2. `db/migrations/0014_loader_rpc.sql` — `fm_loader_bookkeep` (the ONE idempotent ledger-write RPC — 0014 creates exactly one identity; the runner's verification pins its body/owner/ACL posture).
 3. `db/migrations/0016_rolloff_seal.sql` — the v1 seal-only roll-off FM-side half (`roll_off_threshold_pct = 0.80`, `fm_rolloff_finalize`).
 
-Either: **SQL editor** (dashboard → SQL editor → paste each file) or **psql via the session pooler**:
+**Base-schema prerequisite:** `0013` references `public.projects(id)` / `public.orgs(id)` / `public.config` — the platform base schema applied when the project was provisioned for the fleet-manager family. On a truly fresh project without those objects, `0013` fails with `42P01` until the base schema is applied first (see `scripts/migrate.sh`'s header).
+
+**Primary — the Management-API runner** (`scripts/migrate.sh`): one statement per `POST /v1/projects/{ref}/database/query` call (split by `scripts/sql_split.awk`), fail-fast on the first server error with file/statement/snippet, transient 429/5xx/network retried ×3 (numeric `Retry-After` honored on 429), and the post-apply catalog verification (`verify_migrations`) runs automatically. Needs `bash`, `curl`, `jq`, `awk` on PATH.
+
+```bash
+# rehearsal with zero network and zero env (lists files + statement counts):
+bash scripts/migrate.sh --dry-run
+# apply 0013 → 0014 → 0016 + verify (PAT + project ref; or `source .env` first):
+SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="$WHE_PROJECT_REF" \
+  bash scripts/migrate.sh
+```
+
+**Fallback — SQL editor** (dashboard → SQL editor → paste each file) or **psql via the session pooler**:
 
 ```bash
 psql "postgresql://postgres.$WHE_PROJECT_REF:<db-password>@aws-0-<region>.pooler.supabase.com:5432/postgres" \
   -f db/migrations/0013_warehouse_catalog.sql
 psql … -f db/migrations/0014_loader_rpc.sql
 psql … -f db/migrations/0016_rolloff_seal.sql
+# the fallback skips the runner's catalog sweep — run it afterwards if you like:
+SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" bash scripts/migrate.sh \
+  --project-ref "$WHE_PROJECT_REF" --verify-only
 ```
 
-> **v0.1.0 gap:** the Management-API SQL runner (`migrate.sh`, one statement per call, fail-fast) lands in v0.1.1 — apply via psql/SQL editor for now.
+> **Idempotency:** the runner re-applies ALL files in order on every run (no migration-tracking table) — every engine migration file is idempotent, so re-applying from the start is always safe (see the `scripts/migrate.sh` header ledger).
 
 ## 3. Apply shard migrations + seed templates to each SHARD project
 
-For **each serving shard** (in the single-project shape, the engine host itself is the only shard — apply to the same project):
+For **each serving shard** (in the single-project shape, the engine host itself is the only shard — apply to the same project). The shard tree:
 
-1. `db/shard-migrations/0015_wh_query_rpc.sql` — the `wh_query` RPC + registry + hash law (`WH403 wh_hash_mismatch`). 26 statements, splittable on top-level semicolons. **APPLY TARGET: serving shards only** — it lives in `db/shard-migrations/` (not `db/migrations/`) precisely so a project-side runner globbing `db/migrations/*.sql` never applies it to the wrong host.
-2. `db/shard-migrations/0016_seal_roll_off.sql` — shard-side `facts_blocks`, `unpack_block`, `facts_events`, seal functions.
-3. Seed the W1–W5 query templates **per `db/shard-templates/manifest.json`** (the body-of-record with pinned sha256 `template_hash`es — do not reformat those files). Lint first, then render the seed wave:
+- `db/shard-migrations/0015_wh_query_rpc.sql` — the `wh_query` RPC + registry + hash law (`WH403 wh_hash_mismatch`). 26 statements, splittable on top-level semicolons. **APPLY TARGET: serving shards only** — it lives in `db/shard-migrations/` (not `db/migrations/`) precisely so a project-side runner globbing `db/migrations/*.sql` never applies it to the wrong host.
+- `db/shard-migrations/0016_seal_roll_off.sql` — shard-side `facts_blocks`, `unpack_block`, `facts_events`, seal functions.
+
+**Primary — the runner in shard mode** (`--shard`): applies BOTH files from `db/shard-migrations/` in lexicographic order (0015 → 0016_seal), one statement per call, fail-fast. Engine-scoped catalog verification is SKIPPED — 0015 carries its own in-SQL verify-gate DO blocks instead. Point the ref at the SHARD's ref — never the engine project (in engine mode the runner's directory guard dies loudly if pointed at the shard tree).
+
+```bash
+# rehearsal with zero network (lists the shard files + statement counts):
+bash scripts/migrate.sh --shard --dry-run
+# apply 0015 + 0016_seal to the shard (PAT + the SHARD's project ref):
+SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="<shard-ref>" \
+  bash scripts/migrate.sh --shard
+```
+
+**Then seed the W1–W5 query templates** per `db/shard-templates/manifest.json` (the body-of-record with pinned sha256 `template_hash`es — do not reformat those files). Lint first, then render the seed wave and apply it through the runner's `--file` mode:
 
 ```bash
 python3 scripts/lint_shard_templates.py          # must report: 5/5 templates PASS
 python3 scripts/render_wh_seed_wave.py \
   --templates-dir db/shard-templates --out seed_wave.sql   # add --with-cold only if facts_blocks DDL (shard 0016) is applied
-psql … -f seed_wave.sql                          # or paste via the SQL editor
+SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="<shard-ref>" \
+  bash scripts/migrate.sh --file seed_wave.sql    # --file runs any SQL file (e.g. the rendered wave)
 ```
+
+**Fallback** for both the shard migrations and the seed wave: `psql … -f` through the session pooler or a dashboard SQL-editor paste (you bypass the runner's statement-by-statement fail-fast and `Retry-After` handling; re-runs stay safe — all files are idempotent).
 
 ## 4. Set secrets (`WHE_BEARER_TOKEN` required)
 

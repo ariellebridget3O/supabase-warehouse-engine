@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.1 — migrate surface: adapted Management-API runner + lethal pins + docs retraction
+
+### Added
+
+- **`scripts/migrate.sh`** — the Management-API SQL runner, **adapted (NOT verbatim)** from `supabase-fleet-manager` @ `ca4d280` (1,763 LOC → 959; see PROVENANCE.md for the sanctioned-delta ledger): engine verify subset **0013/0014/0016**, `--shard` mode (retargets the glob to `db/shard-migrations/`, makes the directory guard mode-conditional, skips the engine-scoped `verify_migrations`), `--dry-run` (zero network/env), PAT-only `mgmt_query` (one statement per `POST /v1/projects/{ref}/database/query`, fail-fast with file/statement/snippet, transient 429/5xx/network retried ×3 with numeric `Retry-After` honored), `WHE_PROJECT_REF` env (the `FLEET_PROJECT_REF` name retired; `FLEET_TOKEN` gone — negative-pinned in tests).
+- **`scripts/sql_split.awk`** — the POSIX-awk statement splitter port (RS `0x1e`; the byte-level twin of the runner's `read -d $'\x1e'` consumption), 135 LOC.
+- **Makefile**: `migrate-dry` (zero-network runner rehearsal; runner exit code propagates) + `ci` (check + test + lint-templates + migrate-dry).
+- **`supabase/functions/_shared/templates_test.ts`** — the fm harness (module-level passed/failed ledger + `eq()` JSON-compare + terminal `__report__`) ported with 36 lethal pins: verify-gate probes incl. the `pg_get_expr(pi.indpred, pi.indrelid)` 42703-regression killer, the new `0013+0014+0016 engine artifacts present` ok() summary, BOTH `collect_migrations` shard-guard dies + the mode-conditional guard, engine-default-glob confinement (`db/migrations` default must not end in `shard-migrations`), env contract (≥2 `WHE_PROJECT_REF`, `SUPABASE_ACCESS_TOKEN`) + the negative fm set (`FLEET_PROJECT_REF` / `FLEET_TOKEN` / `try_start_rotation` / `fleet_promote` / `edge_proxy_sql_0011` / `0001-0017 artifacts present`), migration-file identity fragments per tree, the `sql_split.awk` RS contract — plus the **manifest sha256 recompute** (each of W1–W5's file bytes hashed via `crypto.subtle.digest` and eq'd to `manifest.json`'s `template_hash`, pulling `lint_shard_templates.py`'s body-of-record invariant inside CI). Battery: 562 → 571 (9 new test cases, 0 failed).
+- **Docs retraction (8 sites)**: README quickstart step 2 + known-gaps and DEPLOY §2/§3 now make `scripts/migrate.sh` the PRIMARY apply path (engine, `--shard`, `--file` for the rendered seed wave; `--verify-only` for a fallback-path catalog sweep) with psql/SQL editor demoted to documented fallback; the v0.1.0 "migrate.sh lands in v0.1.1" gaps retired; the engine-host **base-schema prerequisite** (`public.projects` / `public.orgs` / `public.config`) documented; PROVENANCE.md ledger updated.
+
+### Fixed
+
+- **Inherited-bug fix**: the extraction had dropped the source's `set -euo pipefail` on the standalone entry and the `mgmt_query` curl retry arm (429/5xx/network ×3 with Retry-After handling) — both restored in the landed runner, byte-equal in semantics to fm @ `ca4d280`.
+
 ## 0.1.0 — extraction from supabase-fleet-manager @ `ca4d280`
 
 Standalone repo `supabase-warehouse-engine` ("whe"): the warehouse-engine edge function + the `wh_*` library island, extracted from `ariellebridget3O/supabase-fleet-manager` @ `ca4d280` ("r115 fm: add .github/workflows/test.yml"). MIT inherited (see LICENSE + PROVENANCE.md for the per-file ledger).
@@ -27,7 +41,7 @@ Standalone repo `supabase-warehouse-engine` ("whe"): the warehouse-engine edge f
 
 ### Known gaps (targeted v0.1.1)
 
-- `migrate.sh` (Management-API SQL runner + `sql_split.awk`) and `templates_test.ts` land in v0.1.1 — apply migrations via psql/SQL editor for now.
+- `migrate.sh` (Management-API SQL runner + `sql_split.awk`) and `templates_test.ts` — **delivered in 0.1.1** (see the 0.1.1 entry above); `psql`/SQL editor remain documented fallbacks.
 - Geo control plane + RYW stamp feed: later rounds (see DESIGN.md §4).
 - `deno check` of the engine entrypoint had **never** run in FM — this repo's CI now type-checks it; first green is the extraction-round verification.
 

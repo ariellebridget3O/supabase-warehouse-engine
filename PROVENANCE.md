@@ -1,6 +1,6 @@
 # PROVENANCE — copy ledger
 
-Every copied file originated in **`supabase-fleet-manager` @ `ca4d280`** (`main`, tree clean; origin `github.com/ariellebridget3O/supabase-fleet-manager`). Verbatim copies keep byte-diffability with the source repo (future `wh_*` fixes can be re-synced by diff). Byte-diff status (md5 per file against `ca4d280`): every ledgered file is byte-identical EXCEPT (i) the `FLEET_TOKEN`→`WHE_BEARER_TOKEN` rename sites and (ii) `wh_engine_core.ts` — both detailed below. Files marked **NEW** have no FM provenance.
+Every copied file originated in **`supabase-fleet-manager` @ `ca4d280`** (`main`, tree clean; origin `github.com/ariellebridget3O/supabase-fleet-manager`). Verbatim copies keep byte-diffability with the source repo (future `wh_*` fixes can be re-synced by diff). Byte-diff status (md5 per file against `ca4d280`): every ledgered file is byte-identical EXCEPT (i) the `FLEET_TOKEN`→`WHE_BEARER_TOKEN` rename sites, (ii) `wh_engine_core.ts`, and (iii) `scripts/migrate.sh` — the v0.1.1 ADAPTED extraction detailed below (`scripts/sql_split.awk` is a verbatim port). All three are detailed below. Files marked **NEW** have no FM provenance.
 
 ## License inheritance
 
@@ -64,7 +64,27 @@ Rename sites (functional rename only; comments elsewhere): `wh_entrypoint.ts:205
 | `scripts/render_wh_seed_wave.py` | same path | 241 |
 | `scripts/lint_shard_templates.py` | same path | 518 |
 
-The `db/migrations/` vs `db/shard-migrations/` split is load-bearing (0015's header: the project-side runner globs `db/migrations/*.sql`; shard files must never be globbed onto the engine host). The W1–W5 template files and `manifest.json` are **sha256-pinned bodies-of-record** — never reformat.
+The `db/migrations/` vs `db/shard-migrations/` split is load-bearing (0015's header: the project-side runner globs `db/migrations/*.sql`; shard files must never be globbed onto the engine host). The W1–W5 template files and `manifest.json` are **sha256-pinned bodies-of-record** — never reformat (the battery's `templates_test.ts` recomputes each hash from the file bytes).
+
+### Shell scripts — v0.1.1 adapted extraction (NOT verbatim)
+
+| This repo | Source (FM) @ `ca4d280` | LOC |
+|---|---|---|
+| `scripts/migrate.sh` | same path | 1,763 → 959 (adapted) |
+| `scripts/sql_split.awk` | same path | 135 (verbatim port) |
+
+`scripts/sql_split.awk` is a byte-identical port. `scripts/migrate.sh` is an **ADAPTED extraction — NOT verbatim** — with these sanctioned deltas:
+
+- env rename `FLEET_PROJECT_REF` → `WHE_PROJECT_REF`; `FLEET_TOKEN` retired — `mgmt_query` is PAT-only (`SUPABASE_ACCESS_TOKEN`),
+- `mktemp` prefixes `fleet-*` → `whe-*`,
+- verify gate set pruned to the engine subset **0013/0014/0016** (FM-only gate columns deleted — no 0011 edge-proxy, no rotation/fleet_promote probes); the ok() summary rewritten to `0013+0014+0016 engine artifacts present`,
+- FM-only die blocks deleted; 4 die texts reworded to engine-host phrasing,
+- the pg_cron warn block deleted (`cron.job` probes are an FM-cron concern),
+- `--shard` mode added: retargets the glob to `db/shard-migrations/` (a pre-exported `MIGRATIONS_DIR` still wins), makes the `collect_migrations()` directory guard MODE-CONDITIONAL (dies on a shard-tree override in engine mode only), and SKIPS the engine-scoped `verify_migrations` in shard mode,
+- bug fix restored: `set -euo pipefail` on the standalone entry + the `mgmt_query` curl retry arm (429/5xx/network ×3, numeric Retry-After honored) — the extraction draft had dropped them; the landed runner restores fm @ `ca4d280` semantics,
+- header rewritten as the whe ledger (two migration trees, idempotency ledger, base-schema prerequisite).
+
+The retirement is enforced by NEGATIVE pins in `supabase/functions/_shared/templates_test.ts` (no `FLEET_PROJECT_REF` / `FLEET_TOKEN` / `try_start_rotation` / `fleet_promote` / `edge_proxy_sql_0011` / `0001-0017 artifacts present`), and the fm harness surface (`_shared/templates_test.ts`) is ported — NOT fm's t1/t3–t6 groups (0011 edge-proxy templates, fleet-api, rotation, management-api splitter: no such modules in whe).
 
 ## Ledger — NEW (no FM provenance)
 
@@ -98,6 +118,6 @@ Module/migration headers cite FM `research/` docs. **None of those files exist i
 
 - `_shared/supabase-client.ts` + `_shared/types.ts` (FM fleet surface) — replaced by `whe_store.ts`.
 - `_shared/import_map.json` — unreferenced in FM (dead weight).
-- `_shared/http.ts` and everything else outside the engine closure (fleet-api, fleet-cron, watchdogs, deploy.sh, migrate.sh — migrate.sh lands v0.1.1).
+- `_shared/http.ts` and everything else outside the engine closure (fleet-api, fleet-cron, watchdogs, deploy.sh — `migrate.sh` + `sql_split.awk` moved UP into the adapted-extraction ledger in v0.1.1).
 - FM migrations `0017_geo_control_plane.sql`, `0022`/`0023` (geo/RYW) — geo gated fail-closed this round.
 - FM research docs, `.env.example` (FM-shaped; a whe-shaped one may land later), Git history (no filter-repo graft round 1).

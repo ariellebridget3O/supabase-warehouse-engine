@@ -33,9 +33,13 @@ cd supabase-warehouse-engine
 # 1. Offline battery — zero network, no DB, no PAT.
 make test                 # or: deno task test
 
-# 2. Apply engine-host migrations 0013 → 0014 → 0016 (psql or SQL editor — DEPLOY.md §2).
+# 2. Apply migrations with the Management-API runner (one statement per call,
+#    fail-fast, idempotent re-runs — DEPLOY.md §2):
+#    SUPABASE_ACCESS_TOKEN="$SB_PAT" WHE_PROJECT_REF="$REF" bash scripts/migrate.sh
 #    Single-project shape: the engine host is also the only shard, so ALSO apply the
-#    shard-side 0015 + 0016 and seed the W1–W5 templates (DEPLOY.md §3).
+#    shard side and seed the W1–W5 templates (DEPLOY.md §3):
+#    WHE_PROJECT_REF="$REF" bash scripts/migrate.sh --shard
+#    (psql through the pooler / the dashboard SQL editor remain documented fallbacks.)
 
 # 3. Set the bearer secret, deploy (no Docker, no local Deno needed):
 #    SUPABASE_ACCESS_TOKEN="$SB_PAT" npx -y supabase functions deploy warehouse-engine \
@@ -79,9 +83,9 @@ Full wire contract: [API.md](API.md).
 4. **`verify_jwt` left on** — `supabase/config.toml` pins `[functions.warehouse-engine] verify_jwt = false`, and deploys pass `--no-verify-jwt`. Discrimination: a **bare gateway 401** (no `auth_kind` field) = platform JWT check rejected the call before the handler; the fn's **own 401** always says `auth rejected before route dispatch (<kind>)` with an `auth_kind` field (see API.md).
 5. **Migrations before smoke** — `GET /health` answers `500 {"v":1,"ok":false,…}` until `0013_warehouse_catalog.sql` is applied (the version probe reads `config.warehouse_directory_version` / the directory view). Apply 0013 → 0014 → 0016 first, then smoke.
 
-## Known gaps (v0.1.0)
+## Known gaps (v0.1.1)
 
-- `migrate.sh` (Management-API SQL runner) and `templates_test.ts` land in **v0.1.1** — apply migrations via `psql` through the pooler or the Supabase SQL editor for now.
+- **Base-schema prerequisite (engine host):** migration `0013` references `public.projects(id)` / `public.orgs(id)` / `public.config`, which come from the **platform base schema** (applied when the project was provisioned for the fleet-manager family of engines). On a truly fresh project where those objects never existed, `0013` fails with `42P01` (undefined table) unless the base schema is applied first — `scripts/migrate.sh`'s header documents this, and the runner's `verify_migrations` assumes the base objects exist too.
 - **Geo legs fail-closed** until the geo control-plane migration (`0017`) lands: absent geo rows ⇒ write plans `503 read_only_mode`, replica-plane deps fail closed to primary, unwired fence ⇒ `500` on write plans. No geo migrations ship in 0.1.0.
 - `POST /query` is the pinned pre-flip 500 (ships disabled, above) — the real shard fetcher lands after live probes #1/#2.
 
@@ -96,6 +100,7 @@ db/migrations/0013,0014,0016                   # ENGINE-HOST schema (catalog, lo
 db/shard-migrations/0015,0016                  # SHARD-side wh_query RPC + seal/roll-off
 db/shard-templates/W1..W5 + manifest.json      # query template bodies-of-record (sha256-pinned)
 scripts/run-tests.mjs | lint_shard_templates.py | render_wh_seed_wave.py
+scripts/migrate.sh + scripts/sql_split.awk     # Management-API migration runner (engine + --shard)
 ```
 
 See [DESIGN.md](DESIGN.md) for the architecture, [DEPLOY.md](DEPLOY.md) for the step-by-step deploy, [PROVENANCE.md](PROVENANCE.md) for the verbatim-copy ledger.
