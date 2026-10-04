@@ -33,7 +33,9 @@ cd supabase-warehouse-engine
 # 1. Offline battery — zero network, no DB, no PAT.
 make test                 # or: deno task test
 
-# 2. Apply engine-host migrations 0013 → 0014 → 0016 (psql or SQL editor — DEPLOY.md).
+# 2. Apply engine-host migrations 0013 → 0014 → 0016 (psql or SQL editor — DEPLOY.md §2).
+#    Single-project shape: the engine host is also the only shard, so ALSO apply the
+#    shard-side 0015 + 0016 and seed the W1–W5 templates (DEPLOY.md §3).
 
 # 3. Set the bearer secret, deploy (no Docker, no local Deno needed):
 #    SUPABASE_ACCESS_TOKEN="$SB_PAT" npx -y supabase functions deploy warehouse-engine \
@@ -73,7 +75,7 @@ Full wire contract: [API.md](API.md).
 
 1. **`deno` missing** — `make test` runs `scripts/run-tests.mjs` (a node-run wrapper — stock `node` executes it; `deno task test` bypasses the wrapper), which prints a loud banner with the exact install command (`curl -fsSL https://deno.land/x/install/install.sh | sh`) and **exits 1**. It never silently skips (green-when-unverified is banned). Deno is needed for the battery and `deno check` — *not* for deploy (`--use-api` bundles server-side).
 2. **Supabase CLI auth** — export `SUPABASE_ACCESS_TOKEN=sbp_…` (a real PAT from dashboard → account → tokens). **Explicit, never a fallback**: this repo deliberately drops FM's `deploy.sh` fallback that offered the bearer token as a PAT — that silent swap just 401s confusingly. Three tokens, three jobs: PAT (Management API) ≠ `WHE_BEARER_TOKEN` (this function) ≠ shard service keys.
-3. **Project paused (free tier)** — preflight before anything: `curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" https://api.supabase.com/v1/projects/$REF | jq .status` → expect `ACTIVE_HEALTHY`; `PAUSED` ⇒ dashboard → restore project, then re-run.
+3. **Project paused (free tier)** — preflight before anything: `curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" https://api.supabase.com/v1/projects/$REF | jq .status` → expect `ACTIVE_HEALTHY` (requires `jq` on PATH); `PAUSED` ⇒ dashboard → restore project, then re-run.
 4. **`verify_jwt` left on** — `supabase/config.toml` pins `[functions.warehouse-engine] verify_jwt = false`, and deploys pass `--no-verify-jwt`. Discrimination: a **bare gateway 401** (no `auth_kind` field) = platform JWT check rejected the call before the handler; the fn's **own 401** always says `auth rejected before route dispatch (<kind>)` with an `auth_kind` field (see API.md).
 5. **Migrations before smoke** — `GET /health` answers `500 {"v":1,"ok":false,…}` until `0013_warehouse_catalog.sql` is applied (the version probe reads `config.warehouse_directory_version` / the directory view). Apply 0013 → 0014 → 0016 first, then smoke.
 
