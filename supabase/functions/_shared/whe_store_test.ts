@@ -19,13 +19,15 @@
 //   3. The six read chains' EXACT PostgREST wire shapes — hand-computed:
 //        eq(col, v)            => ?...&col=eq.<v>
 //        in(col, [a,b,c])      => ?...&col=in.(a,b,c)   (href: %2C %28 %29)
-//        range(from, to)       => ?...&offset=from&limit=to-from+1
-//                                 (inclusive window: (0,999) -> offset=0&limit=1000)
 //        limit(n)              => ?...&limit=n
+//        rpc(fn)               => POST /rest/v1/rpc/<fn> body {} — r120 OPT-1:
+//                                 chain #1 is the atomic {version, rows} read
+//                                 (the paginated range(from,to) GET window is
+//                                 RETIRED with the pagination loop)
 //        select('*') / select('value') / select('key,value') render verbatim
-//        count:'exact' is consumed at AWAIT time only (Prefer header) — no
-//          build-time trace in supabase-js 2.117.2, so it is pinned by the
-//          byte-exact source fragment instead (plane 3 statics)
+//        count:'exact' — RETIRED r120 together with the pagination it guarded
+//          (the loud DIRECTORY_EMBED_BOUND fleet-shape bound supersedes the
+//          truncation guard; the old count:'exact' statics went with it)
 //      Chains #1-#5 live in warehouse-engine/index.ts closures over `const
 //      client = db()` (not importable without env — the shell wires deps at
 //      boot and Deno.serve at the bottom), so the source is pinned statically
@@ -152,15 +154,18 @@ Deno.test('whe_store db(): factory output shape — builder surface + FM-provena
     await withEnv('SUPABASE_SERVICE_ROLE_KEY', FAKE_KEY, async () => {
       const client = db();
       ok('db() returns an object with .from', typeof client.from === 'function', 'no .from');
-      // The engine's six chains use exactly this builder surface (and nothing
-      // else): select -> eq / in / range / limit, terminated by maybeSingle.
+      // The engine's read chains use exactly this builder surface (and
+      // nothing else): select -> eq / in / limit, terminated by maybeSingle.
+      // r120 OPT-1: the paginated .range() window is RETIRED (chain #1 is now
+      // the atomic rpc POST, pinned below); chains #2-#6 stay .from() GETs.
       const b = client.from('v_warehouse_directory').select('*', { count: 'exact' });
       const bb = b as unknown as Record<string, unknown>;
-      for (const m of ['eq', 'in', 'range', 'limit', 'maybeSingle']) {
+      for (const m of ['eq', 'in', 'limit', 'maybeSingle']) {
         ok(`builder .${m}() exists on the select builder`, typeof bb[m] === 'function', `.${m} missing`);
       }
-      // read chains are GETs — no POST/PUT/PATCH method is ever composed here.
-      eq('read builder composes as a GET', (b as unknown as { method: string }).method, 'GET');
+      // The .from() read chains compose as GETs — the ONE POST in the engine
+      // is chain #1's rpc (pinned below; supabase-js rpc() is method=POST).
+      eq('.from() read builder composes as a GET (the ONE POST is chain #1 rpc)', (b as unknown as { method: string }).method, 'GET');
       // Client options copied verbatim from FM: our x-client-info passes
       // through under its exact lowercase key (supabase-js 2.117.2 ALSO adds
       // its own capitalized X-Client-Info — a distinct object key, unpinned).
@@ -211,13 +216,14 @@ Deno.test('index.ts: the r116 rewire — db() sourced from whe_store, supabase-c
   );
 });
 
-Deno.test('index.ts chains #1+#2: directory page + version probe — byte-exact PostgREST fragments', () => {
+Deno.test('index.ts chains #1+#2: atomic rpc POST + version probe — byte-exact PostgREST fragments', () => {
   // Hand-computed from the shell source (readDirectory wiring):
-  //   #1 page:  GET v_warehouse_directory  select=*  count=exact  range(from,to)
-  //   #2 probe: GET config  select=value  key=eq.warehouse_directory_version  maybeSingle
-  ok('#1 .from(v_warehouse_directory)', indexSrc.includes(".from('v_warehouse_directory')"), 'fragment absent');
-  ok('#1 .select(*, { count: exact })', indexSrc.includes(".select('*', { count: 'exact' })"), 'fragment absent');
-  ok('#1 .range(from, to)', indexSrc.includes('.range(from, to)'), 'fragment absent');
+  //   #1 atomic: ONE POST /rest/v1/rpc/wh_directory_atomic_read body {} —
+  //              version+rows under one Postgres snapshot (r120 OPT-1; the
+  //              paginated page GET is retired)
+  //   #2 probe:  GET config  select=value  key=eq.warehouse_directory_version  maybeSingle
+  //              (UNCHANGED — the replay path + /health still probe)
+  ok('#1 client.rpc(wh_directory_atomic_read) wired', indexSrc.includes("client.rpc('wh_directory_atomic_read')"), 'fragment absent');
   ok('#2 .from(config)', indexSrc.includes(".from('config')"), 'fragment absent');
   ok('#2 .select(value)', indexSrc.includes(".select('value')"), 'fragment absent');
   ok('#2 .eq(key, warehouse_directory_version)', indexSrc.includes(".eq('key', 'warehouse_directory_version')"), 'fragment absent');
@@ -259,25 +265,20 @@ Deno.test('index.ts chain #6: the fence read rides the SAME db() client (single 
 // which is the point of the battery).
 // -----------------------------------------------------------------------------
 
-Deno.test('whe_store: chains #1-#5 compose the hand-computed PostgREST URLs (offline, build-only)', async () => {
+Deno.test('whe_store: chain #1 rpc + chains #2-#5 compose the hand-computed PostgREST shapes (offline, build-only)', async () => {
   await withEnv('SUPABASE_URL', FAKE_URL, async () => {
     await withEnv('SUPABASE_SERVICE_ROLE_KEY', FAKE_KEY, async () => {
       const client = db();
       const href = (b: unknown) => String((b as unknown as { url: URL }).url);
 
-      // #1 page: range(0, 999) — the reader's first page (DIRECTORY_PAGE=1000,
-      // inclusive window) renders offset=0&limit=1000. Hand-computed:
-      // to-from+1 = 999-0+1 = 1000.
+      // #1 atomic rpc: supabase-js rpc() composes the ONE POST — the URL is
+      // /rest/v1/rpc/<fn>, the method is already POST at build time, and the
+      // no-args call rides the empty-args body ({} — stringified at await time).
+      const rpcB = client.rpc('wh_directory_atomic_read');
       eq(
-        '#1 page(0,999) => ?select=*&offset=0&limit=1000',
-        href(client.from('v_warehouse_directory').select('*', { count: 'exact' }).range(0, 999)),
-        `${FAKE_URL}/rest/v1/v_warehouse_directory?select=*&offset=0&limit=1000`,
-      );
-      // #1 page 2: range(1000, 1999) => offset=1000&limit=1000 (same arithmetic).
-      eq(
-        '#1 page(1000,1999) => ?select=*&offset=1000&limit=1000',
-        href(client.from('v_warehouse_directory').select('*', { count: 'exact' }).range(1000, 1999)),
-        `${FAKE_URL}/rest/v1/v_warehouse_directory?select=*&offset=1000&limit=1000`,
+        '#1 atomic rpc => POST /rest/v1/rpc/wh_directory_atomic_read body {}',
+        [String((rpcB as unknown as { url: URL }).url), (rpcB as unknown as { method: string }).method, (rpcB as unknown as { body: Record<string, never> }).body],
+        [`${FAKE_URL}/rest/v1/rpc/wh_directory_atomic_read`, 'POST', {}],
       );
       // #2 version probe: eq renders key=eq.<value>; maybeSingle adds NO query
       // param (it flips the Accept header at await time + the build-time flag

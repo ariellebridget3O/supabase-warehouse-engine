@@ -17,8 +17,12 @@
 //     foreign-table rows never reach the fetcher), P0-2 pin (shard from
 //     project_ref mapping), tier_warm 404 + directory_version on the error
 //     body (P2-3), fail_fast 500 payload, generic-500 scrub (P3-4)
-//   * wh_directory_reader: pagination, truncation guard, version double-probe
-//     with one retry (P2-4), SCALAR version coercion (P2-5), row mapping
+//   * wh_directory_reader (r120 OPT-1): the atomic {version, rows} read — ONE
+//     rpc POST (exactly-once pin), mapped rows, and every loud arm (rpc error,
+//     non-object payload, config-row-missing F7, non-integer version P2-5,
+//     non-array rows, fleet-shape bound F2 + boundary-ok) + the F3
+//     plain-Error law. The pagination loop + P2-4 double-probe pins are
+//     RETIRED with the machinery (one Postgres snapshot by construction)
 //   * static pins: index.ts deploy-gate wiring of the shipped shell (§4.1;
 //     the fleet-api discovery-route pins stay with fleet-manager)
 //   * r57 wh_ryw v1: the WH_RYW_V1 flip lever (default OFF — a min_lsn-pinned
@@ -438,81 +442,117 @@ async function readerPins(): Promise<void> {
     eq(`toWhDirectoryRow loud on ${name}`, threw, true);
   }
 
-  // Pagination: exact count 1500 -> 2 pages; truncation guard; null-count fallback.
-  function readerWithPages(pages: { data: unknown[] | null; count: number | null; error?: { message: string } }[], versionSeq: unknown[]) {
-    const pageCalls: [number, number][] = [];
+  // r120 OPT-1 harness: the fresh-path reader = the module factory over ONE
+  // atomic fetch edge (index.ts wires it to client.rpc('wh_directory_atomic_read')).
+  // The atomic results are consumed in sequence (one entry per expected rpc
+  // POST); fetchVersion keeps the old fake style — readDirectory must NEVER
+  // call it (the standalone probe is replay/health-only since P2-4 retired).
+  function atomicReader(atomicResults: { data: unknown; error?: { message: string } }[]) {
+    const calls: unknown[] = [];
     const probeCalls: number[] = [];
     const reader = makeDirectoryReader({
-      fetchPage: async (from, to) => {
-        pageCalls.push([from, to]);
-        const p = pages[Math.min(pageCalls.length - 1, pages.length - 1)];
-        if (p.error) return { data: null, count: null, error: p.error };
-        return { data: p.data, count: p.count, error: null };
-      },
       fetchVersion: async () => {
         probeCalls.push(probeCalls.length);
-        const v = versionSeq[Math.min(probeCalls.length - 1, versionSeq.length - 1)];
-        return v === 'MISSING' ? null : { value: v, error: null };
+        return { value: 42, error: null };
+      },
+      fetchAtomic: async () => {
+        calls.push(calls.length);
+        const r = atomicResults[Math.min(calls.length - 1, atomicResults.length - 1)];
+        return { data: r.data, error: r.error ?? null };
       },
     });
-    return { reader, pageCalls, probeCalls };
+    return { reader, calls, probeCalls };
   }
 
   const rawRow = { project_ref: 's1', state: 'serving', platform_status: 'ACTIVE_HEALTHY', schema_version: 3, last_health_at: 't' };
-  const page1 = Array.from({ length: 1000 }, () => rawRow);
-  const page2 = Array.from({ length: 500 }, () => rawRow);
-  const twoPages = readerWithPages([{ data: page1, count: 1500 }, { data: page2, count: 1500 }], [42, 42]);
-  const twoRes = await twoPages.reader.readDirectory();
-  eq('pagination: 1500 rows over 2 pages', [twoRes.rows.length, twoRes.version], [1500, 42]);
-  eq('pagination: page windows', twoPages.pageCalls, [[0, 999], [1000, 1999]]);
 
-  const guard = readerWithPages([{ data: [rawRow, rawRow, rawRow, rawRow], count: 3 }], [42, 42]);
-  let guardThrew = '';
+  // (a) success: ONE rpc POST -> version coerced + rows mapped through
+  // toWhDirectoryRow (P0-2: project_ref -> shard).
+  const happy = atomicReader([{ data: { version: 42, rows: [rawRow] }, error: null }]);
+  const okRes = await happy.reader.readDirectory();
+  eq('atomic read: version stamped from the ONE payload', okRes.version, 42);
+  eq('atomic read: rows map project_ref -> shard (P0-2)', okRes.rows[0].shard, 's1');
+  eq('atomic read: row passthrough fields', [okRes.rows[0].state, okRes.rows[0].platform_status, okRes.rows[0].schema_version, okRes.rows[0].last_health_at], ['serving', 'ACTIVE_HEALTHY', 3, 't']);
+  eq('atomic read: exactly ONE rpc POST per readDirectory (OPT-1)', happy.calls.length, 1);
+  eq('atomic read: the version probe is NOT part of the read (P2-4 retired)', happy.probeCalls.length, 0);
+
+  // (b) rpc error arm: the PostgREST failure text is wrapped in the loud
+  // internal message, never relayed raw.
+  const rpcErr = atomicReader([{ data: null, error: { message: 'permission denied' } }]);
+  let rpcErrCaught: unknown;
   try {
-    await guard.reader.readDirectory();
+    await rpcErr.reader.readDirectory();
   } catch (e) {
-    guardThrew = (e as Error).message;
+    rpcErrCaught = e;
   }
-  ok('truncation guard refuses over-count', guardThrew.includes('truncation guard'), guardThrew);
+  ok('rpc error -> loud internal', (rpcErrCaught as Error).message.includes('atomic directory read failed: permission denied'), (rpcErrCaught as Error)?.message);
 
-  const nullCount = readerWithPages([{ data: page1, count: null }, { data: [rawRow], count: null }], [7, 7]);
-  const nullRes = await nullCount.reader.readDirectory();
-  eq('null-count fallback stops on short page', nullRes.rows.length, 1001);
+  // (h) F3 law: the reader throws PLAIN Errors ONLY — never WhEngineError.
+  // (The entrypoint relays WhEngineError messages raw to the wire; plain
+  // Errors hit the P3-4 scrub. This battery never imports WhEngineError, so
+  // the pin is the constructor identity itself.)
+  eq('F3: the atomic reader throws a PLAIN Error (never WhEngineError)', [rpcErrCaught instanceof Error, (rpcErrCaught as Error).constructor.name], [true, 'Error']);
 
-  // P2-4 double-probe: stable pair passes; one flap retries; two flaps refuse.
-  const stable = readerWithPages([{ data: [rawRow], count: 1 }], [42, 42]);
-  eq('stable probe pair -> version stamped', (await stable.reader.readDirectory()).version, 42);
-
-  const flap = readerWithPages([{ data: [rawRow], count: 1 }, { data: [rawRow, rawRow], count: 2 }], [42, 43, 43]);
-  const flapRes = await flap.reader.readDirectory();
-  eq('one flap -> retry succeeds under the new version', [flapRes.version, flapRes.rows.length], [43, 2]);
-
-  const flap2 = readerWithPages([{ data: [rawRow], count: 1 }], [42, 43, 44, 45]);
-  let flap2Threw = '';
-  try {
-    await flap2.reader.readDirectory();
-  } catch (e) {
-    flap2Threw = (e as Error).message;
+  // (c) non-object payload arm: the rpc body must be the {version, rows}
+  // object — a drifted/garbage payload fails loudly.
+  for (const bad of ['garbage', null]) {
+    let threw = '';
+    try {
+      await atomicReader([{ data: bad, error: null }]).reader.readDirectory();
+    } catch (e) {
+      threw = (e as Error).message;
+    }
+    ok(`non-object payload (${JSON.stringify(bad)}) -> loud internal`, threw.includes('non-object payload'), threw);
   }
-  ok('two flaps -> refuse to stamp a mixed read (P2-4)', flap2Threw.includes('flapped'), flap2Threw);
 
-  const missing = readerWithPages([{ data: [rawRow], count: 1 }], ['MISSING']);
+  // (d) F7: a missing config row surfaces as jsonb null version => the EXACT
+  // loud message (never coerced to 0 — the P2-5 law's missing-row face).
+  const missing = atomicReader([{ data: { version: null, rows: [] }, error: null }]);
   let missingThrew = '';
   try {
     await missing.reader.readDirectory();
   } catch (e) {
     missingThrew = (e as Error).message;
   }
-  ok('missing config row -> loud internal', missingThrew.includes('config row missing'), missingThrew);
+  eq('config row missing -> the exact F7 message', missingThrew, 'directory version probe failed: config row missing');
 
-  const dbErr = readerWithPages([{ data: null, count: null, error: { message: 'connection refused' } }], [42]);
-  let dbErrThrew = '';
+  // (e) F1: the version arrives as the RAW jsonb scalar and is judged by the
+  // SAME P2-5 law as the standalone probe (a string '7' is not a number —
+  // never Number()-coerced into a plausible version).
+  const strVersion = atomicReader([{ data: { version: '7', rows: [] }, error: null }]);
+  let strVersionThrew = false;
   try {
-    await dbErr.reader.readDirectory();
-  } catch (e) {
-    dbErrThrew = (e as Error).message;
+    await strVersion.reader.readDirectory();
+  } catch {
+    strVersionThrew = true;
   }
-  ok('page error -> loud internal', dbErrThrew.includes('connection refused'), dbErrThrew);
+  eq("non-integer version ('7') -> the P2-5 coerce law rejects", strVersionThrew, true);
+
+  // (f) rows must be an array — a drifted RPC shape fails loudly.
+  const badRows = atomicReader([{ data: { version: 1, rows: 'x' }, error: null }]);
+  let badRowsThrew = '';
+  try {
+    await badRows.reader.readDirectory();
+  } catch (e) {
+    badRowsThrew = (e as Error).message;
+  }
+  ok("non-array rows ('x') -> loud internal", badRowsThrew.includes('non-array rows'), badRowsThrew);
+
+  // (g) F2: the loud fleet-shape bound — the retired truncation guard's
+  // successor. 1001 rows refuse; exactly 1000 rows (the bound is >, not >=)
+  // resolve. Never silently truncated, never a silent LIMIT inside the RPC.
+  const overBound = atomicReader([{ data: { version: 42, rows: Array.from({ length: 1001 }, () => rawRow) }, error: null }]);
+  let overThrew = '';
+  try {
+    await overBound.reader.readDirectory();
+  } catch (e) {
+    overThrew = (e as Error).message;
+  }
+  ok('1001 rows -> fleet-shape law breakage (F2 bound)', overThrew.includes('fleet-shape law breakage'), overThrew);
+
+  const atBound = atomicReader([{ data: { version: 42, rows: Array.from({ length: 1000 }, () => rawRow) }, error: null }]);
+  const atRes = await atBound.reader.readDirectory();
+  eq('exactly 1000 rows resolve (the bound is >, not >=)', [atRes.version, atRes.rows.length], [42, 1000]);
 }
 
 // -----------------------------------------------------------------------------
@@ -540,6 +580,11 @@ function staticPins(): void {
     'stub still present or the r69 channel wiring is missing');
   ok('index.ts wires the extracted handler', indexSrc.includes('handleWhEngineRequest(req, deps)'), 'wiring');
   ok('index.ts uses the shared directory reader', indexSrc.includes('makeDirectoryReader'), 'reader');
+  // r120 OPT-1: the reader's fetchAtomic edge is the ONE atomic rpc POST —
+  // the fresh-path pre-fanout chain collapses 4 serial RTs -> 2 (atomic + fence).
+  ok("index.ts wires the atomic directory rpc (client.rpc('wh_directory_atomic_read'))",
+    indexSrc.includes("client.rpc('wh_directory_atomic_read')"),
+    'atomic rpc wiring absent (the r40 paginated-page wiring must stay retired)');
 
   // NOTE (standalone split): the former §4.1 discovery-route pins (pinned
   // route path, path'd URL shape, NO_ENGINE_REF 503 guard, directory_version
