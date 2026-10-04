@@ -30,19 +30,23 @@ The lever set (all default **OFF**/absent):
 git clone https://github.com/ariellebridget3O/supabase-warehouse-engine
 cd supabase-warehouse-engine
 
+# 0. Once, before the credentialed steps (2–4): export REF=<your-project-ref>
+#    and SUPABASE_ACCESS_TOKEN=<sbp_… PAT> (DEPLOY.md §1 — the PAT is never
+#    WHE_BEARER_TOKEN).
+
 # 1. Offline battery — zero network, no DB, no PAT.
 make test                 # or: deno task test
 
 # 2. Apply migrations with the Management-API runner (one statement per call,
 #    fail-fast, idempotent re-runs — DEPLOY.md §2):
-#    SUPABASE_ACCESS_TOKEN="$SB_PAT" WHE_PROJECT_REF="$REF" bash scripts/migrate.sh
+#    SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="$REF" bash scripts/migrate.sh
 #    Single-project shape: the engine host is also the only shard, so ALSO apply the
 #    shard side and seed the W1–W5 templates (DEPLOY.md §3):
 #    WHE_PROJECT_REF="$REF" bash scripts/migrate.sh --shard
 #    (psql through the pooler / the dashboard SQL editor remain documented fallbacks.)
 
 # 3. Set the bearer secret, deploy (no Docker, no local Deno needed):
-#    SUPABASE_ACCESS_TOKEN="$SB_PAT" npx -y supabase functions deploy warehouse-engine \
+#    SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" npx -y supabase functions deploy warehouse-engine \
 #      --project-ref $REF --no-verify-jwt --use-api
 
 # 4. Smoke (needs 0013 applied first — see rescue line 5):
