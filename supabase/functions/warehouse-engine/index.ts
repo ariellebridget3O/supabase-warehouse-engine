@@ -40,12 +40,24 @@ import { handleWhEngineRequest, rywGateEnabledFromEnv, FLIP_hasRealFetcher } fro
 import type { WhEngineDeps } from '../_shared/wh_entrypoint.ts';
 import { makeDirectoryReader, makeGeoDirectoryReader } from '../_shared/wh_directory_reader.ts';
 import { makeWhHandshake } from '../_shared/wh_handshake.ts';
-import { makeRpcShardFetcher, makeShardKeyResolver, parseShardKeyEnv } from '../_shared/wh_shard_channel.ts';
+import {
+  makeProxiedRawFetch,
+  makeRpcShardFetcher,
+  makeShardKeyResolver,
+  parseShardKeyEnv,
+  parseWhProxyMapValue,
+} from '../_shared/wh_shard_channel.ts';
+import type { WhProxyRawFetch } from '../_shared/wh_shard_channel.ts';
 import { fetchFenceConfig, ownProjectRefFromSupabaseUrl } from '../_shared/geo_write_fence.ts';
 import type { WhFenceClient } from '../_shared/geo_write_fence.ts';
 import { db } from '../_shared/whe_store.ts';
 
-const deps: WhEngineDeps = (() => {
+// r123: the IIFE is now async (top-level await) — the WH_PROXY lever's
+// boot-once KV read below needs ONE awaited PostgREST round-trip at isolate
+// boot (⟫B4: boot-once like parseShardKeyEnv, not per-request like
+// readGeoMode). The await is fail-closed: any KV fault logs ONE fixed string
+// and boots with the lever INERT — Deno.serve below still starts.
+const deps: WhEngineDeps = await (async () => {
   // r69 §3.3 (D4/D5/D6): the shard SERVICE-KEY channel — parsed ONCE at
   // isolate boot, wired ONCE, feeding BOTH the handshake plane auth AND the
   // real fetcher (single source of truth). Purity: THIS shell owns the env
@@ -98,6 +110,54 @@ const deps: WhEngineDeps = (() => {
       return { data, error };
     },
   });
+  // r123 WH_PROXY rawFetch lever (design_r122_acct2_proxy.md §1.3/§1.4;
+  // audits ⟫B4 boot-once KV + ⟫A9 browser_headers): the acct2 egress-pool
+  // lever for the WH fanout plane. ONE boot-once KV read of
+  // `wh_shard_proxy_map` via the DIRECT db() client chain — NEVER the shared
+  // getConfig reader (it silently drops unknown keys). Activation requires ALL
+  // THREE: WH_PROXY_FETCHER exactly 'on' (mirror of the WH_REAL_FETCHER /
+  // WH_RYW_V1 activation expressions) + the DEDICATED WH_PROXY_TOKEN secret
+  // (NEVER WHE_BEARER_TOKEN — the snapshotKey doctrine) + a well-formed
+  // wh_shard_proxy_map value, re-validated ENGINE-SIDE by parseWhProxyMapValue
+  // (defense in depth — the FM 0019 validator mirrored: exactly {url, refs},
+  // strict proxy-fn URL shape, 20-char refs, host-ref ∈ refs, NO JWT-shaped
+  // string anywhere — the token NEVER rides config). ANY miss ⇒ the lever is
+  // INERT: proxyRawFetch stays undefined, the rawFetch dep below is the
+  // default platform fetch (byte-identical unset path — mirror of the
+  // rpcMode expression's unset law), and ONE fixed-string boot defect log
+  // fires (echo law: never value fragments, never the KV content).
+  // OFF is the shipped default: with the env not 'on' this block reads NO
+  // other env, performs NO KV round-trip, and boots exactly as pre-r123.
+  // The activation expression is INLINE (mirror of the rpcMode expression —
+  // the exact-string style the shell statics pin).
+  let proxyRawFetch: WhProxyRawFetch | undefined;
+  if (Deno.env.get('WH_PROXY_FETCHER') === 'on') {
+    const proxyToken = Deno.env.get('WH_PROXY_TOKEN') ?? '';
+    if (proxyToken === '') {
+      console.error('warehouse-engine wh_proxy lever defect: WH_PROXY_TOKEN unset — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+    } else {
+      try {
+        const { data, error } = await client
+          .from('config')
+          .select('value')
+          .eq('key', 'wh_shard_proxy_map')
+          .maybeSingle();
+        if (error !== null || data === null) {
+          console.error('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map row absent or unreadable — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+        } else {
+          // Validate ONCE (one boot, one defect log on any shape fault — the
+          // validator owns the per-class fixed-string log, value fragments
+          // NEVER echoed). null ⇒ inert: proxyRawFetch stays undefined.
+          const proxyMap = parseWhProxyMapValue((data as { value: unknown }).value);
+          if (proxyMap !== null) {
+            proxyRawFetch = makeProxiedRawFetch({ proxyUrl: proxyMap.url, proxyToken });
+          }
+        }
+      } catch {
+        console.error('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map read failed — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+      }
+    }
+  }
   return {
     probeDirectoryVersion: atomicReader.probeDirectoryVersion,
     readDirectory: atomicReader.readDirectory,
@@ -107,7 +167,15 @@ const deps: WhEngineDeps = (() => {
     // select arm). The pre-r69 throwing stub is DELETED (wh_entrypoint_test
     // static flipped to the deletion pin, §5). Still never REACHED while
     // hasRealFetcher=false (the handler rejects /query before any fan-out).
-    fetcher: makeRpcShardFetcher({ resolveKey: resolveShardKey }),
+    // r123 WH_PROXY lever: the rawFetch dep rides the acct2 proxy ONLY when
+    // the boot block above armed it (env 'on' + token + well-formed KV) —
+    // the spread adds NOTHING otherwise, so the inert path is byte-identical
+    // to pre-r123 (default platform fetch, the seam default in
+    // wh_shard_channel.ts). The handshake plane above stays DIRECT either way.
+    fetcher: makeRpcShardFetcher({
+      resolveKey: resolveShardKey,
+      ...(proxyRawFetch !== undefined ? { rawFetch: proxyRawFetch } : {}),
+    }),
     // r47 read-plane deps: the engine's gate ladder (G1..G6) owns every
     // decision; each dep fails CLOSED (unreadable config => null; unknown
     // table => null is_reference; a throwing read degrades to the primary).

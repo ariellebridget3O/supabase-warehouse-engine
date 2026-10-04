@@ -612,13 +612,39 @@ function staticPins(): void {
   // entrypoint's own gate message is pinned by geo_write_fence_test.ts:702
   // and is UNTOUCHED (still reachable via the deps.hasRealFetcher=false
   // override path).
+  // r123 AMENDMENT: the fetcher dep's rawFetch is now the CONDITIONALLY
+  // spread WH_PROXY lever dep (design_r122_acct2_proxy.md §1.4) — the
+  // single-line wiring grew the spread, so the r69 exact-string pin splits
+  // into the factory call + the resolveKey dep. The lever's own wiring pin
+  // follows below.
   ok('index.ts stub is deleted — the r69 RPC real fetcher over the shard channel is wired',
     !indexSrc.includes('makeRealFetcher') &&
     !indexSrc.includes('real shard fetcher lands after live probes') &&
-    indexSrc.includes('makeRpcShardFetcher({ resolveKey: resolveShardKey })') &&
+    indexSrc.includes('makeRpcShardFetcher({') &&
+    indexSrc.includes('resolveKey: resolveShardKey,') &&
     indexSrc.includes('parseShardKeyEnv(Deno.env.get(\'WH_SHARD_KEYS\'))') &&
     indexSrc.includes('rpcMode: Deno.env.get(\'WH_REAL_FETCHER\') === \'on\''),
     'stub still present or the r69 channel wiring is missing');
+  // r123 WH_PROXY lever (design_r122_acct2_proxy.md §1.3/§1.4): the rawFetch
+  // dep is CONDITIONALLY spread — with the lever inert (WH_PROXY_FETCHER not
+  // exactly 'on' / wh_shard_proxy_map KV absent-malformed / WH_PROXY_TOKEN
+  // unset) the spread adds NOTHING and the fetcher dep is the default
+  // platform fetch: the byte-identical unset path (mirror of the rpcMode
+  // expression's unset law). The KV read is the DIRECT db() chain — NEVER
+  // getConfig() (drops unknown keys) — boot-once in the shell IIFE (⟫B4),
+  // shape re-validated engine-side via parseWhProxyMapValue (defense in
+  // depth — the FM 0019 validator mirror), token from the DEDICATED
+  // WH_PROXY_TOKEN (never WHE_BEARER_TOKEN — the snapshotKey doctrine).
+  ok('index.ts r123 WH_PROXY lever: conditional rawFetch wiring + boot-once DIRECT KV read (byte-identical default fetch when inert)',
+    indexSrc.includes('...(proxyRawFetch !== undefined ? { rawFetch: proxyRawFetch } : {})') &&
+    indexSrc.includes("Deno.env.get('WH_PROXY_FETCHER') === 'on'") &&
+    indexSrc.includes("Deno.env.get('WH_PROXY_TOKEN')") &&
+    indexSrc.includes(".eq('key', 'wh_shard_proxy_map')") &&
+    indexSrc.includes('.maybeSingle()') &&
+    indexSrc.includes('parseWhProxyMapValue(') &&
+    indexSrc.includes('makeProxiedRawFetch(') &&
+    !indexSrc.includes('getConfig()'),
+    'lever wiring missing, unconditional, or the KV read is not the direct db() chain');
   ok('index.ts wires the extracted handler', indexSrc.includes('handleWhEngineRequest(req, deps)'), 'wiring');
   ok('index.ts uses the shared directory reader', indexSrc.includes('makeDirectoryReader'), 'reader');
   // r120 OPT-1: the reader's fetchAtomic edge is the ONE atomic rpc POST —
@@ -980,9 +1006,14 @@ async function rpcPlaneBatteryPins(): Promise<void> {
     // ---- §5 statics the core batch did not land ----
     // D6 single source of truth: the SAME resolver identifier feeds BOTH
     // consumers (the handshake plane auth AND the real fetcher).
+    // r123 AMENDMENT: the fetcher dep grew the conditional WH_PROXY rawFetch
+    // spread (design_r122_acct2_proxy.md §1.4) — the exact single-line wiring
+    // string splits into factory-call + resolveKey-dep fragments; the D6
+    // intent (the SAME resolver identifier on BOTH consumers) is unchanged.
     ok(
       'index.ts D6: ONE resolver instance feeds BOTH the handshake plane auth and the real fetcher',
-      indexSrc.includes('makeRpcShardFetcher({ resolveKey: resolveShardKey })') &&
+      indexSrc.includes('makeRpcShardFetcher({') &&
+        indexSrc.includes('resolveKey: resolveShardKey,') &&
         indexSrc.includes('shardServiceKey: resolveShardKey'),
       'the resolver must be wired to both consumers (single source of truth)',
     );

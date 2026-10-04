@@ -36,7 +36,13 @@ import type {
 } from './wh_engine_core.ts';
 import { checkHandshake, deriveTemplateHashes, ENGINE_TEMPLATE_MANIFEST } from './wh_handshake.ts';
 import type { DerivePlanView, HandshakePlanRef, TemplateInventoryRow, WhShardHandshake } from './wh_handshake.ts';
-import { makeRpcShardFetcher, makeShardKeyResolver, parseShardKeyEnv } from './wh_shard_channel.ts';
+import {
+  makeProxiedRawFetch,
+  makeRpcShardFetcher,
+  makeShardKeyResolver,
+  parseShardKeyEnv,
+  parseWhProxyMapValue,
+} from './wh_shard_channel.ts';
 import { deepEq, show } from './wh_testutil.ts';
 
 let passed = 0;
@@ -1415,6 +1421,266 @@ Deno.test('r69 battery core: the call site stamps o.shard onto the adapted envel
     'the detail is the wh_merge ARITY law — not the shard-gate envelope_invalid (the stamp demonstrably reached wh_merge; an unstamped call site would fail envelope.shard FIRST with a different detail and an undefined shard)',
     (res.warnings[0]?.detail ?? '').includes('group key arity 2 !== plan arity 1'),
   );
+});
+
+// =============================================================================
+// r123 WH_PROXY rawFetch lever (design_r122_acct2_proxy.md §1.3/§1.4 + the
+// r123 audit adoptions ⟫A5 validator mirror / ⟫A9 browser_headers / ⟫B4
+// boot-once / ⟫B5 burst pin).
+// =============================================================================
+// Offline + pure: the SHELL owns every env read and the boot-once KV read;
+// these cells pin the PURE halves (parseWhProxyMapValue — the engine-side
+// FM-0019 validator mirror — and makeProxiedRawFetch — the spec transform)
+// plus the seam integration through makeRpcShardFetcher (the D7/D8
+// never-throw arms work UNCHANGED behind the proxy). The shell's inert-path
+// byte-identical wiring is pinned statically in wh_entrypoint_test.ts
+// (mirror of the rpcMode unset precedent).
+
+const WH_PROXY_URL = 'https://bnwwjapoisfzkldtqzst.supabase.co/functions/v1/proxy';
+const WH_PROXY_TOKEN = 'wh-proxy-test-token'; // test fake — a real deployment reads WH_PROXY_TOKEN
+const WH_TARGET_RPC_URL = 'https://shardaexampleexampl1.supabase.co/rest/v1/rpc/wh_query';
+
+Deno.test('r123 parseWhProxyMapValue: well-formed value => {url, refs} verbatim, ZERO defect logs', () => {
+  const defects: string[] = [];
+  const v = parseWhProxyMapValue(
+    { url: WH_PROXY_URL, refs: ['bnwwjapoisfzkldtqzst', 'shardaexampleexampl1'] },
+    (m) => defects.push(m),
+  );
+  eqTrue('valid value accepted', v !== null);
+  eq('url verbatim', v?.url, WH_PROXY_URL);
+  eq('refs verbatim (order preserved)', v?.refs, ['bnwwjapoisfzkldtqzst', 'shardaexampleexampl1']);
+  eq('no defect log on the happy arm', defects.length, 0);
+});
+
+Deno.test('r123 parseWhProxyMapValue: non-object values (null/array/scalar) => not-an-object class, ONE fixed log', () => {
+  const fixed = 'wh_shard_proxy_map defect class not-an-object: config value is not a JSON object — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)';
+  for (const bad of [null, 'https://x.supabase.co', 42, [], true]) {
+    const defects: string[] = [];
+    const v = parseWhProxyMapValue(bad, (m) => defects.push(m));
+    eqTrue(`not-an-object ${show(bad)}: rejected`, v === null);
+    eq(`not-an-object ${show(bad)}: the FIXED string (echo law)`, defects, [fixed]);
+  }
+});
+
+Deno.test('r123 parseWhProxyMapValue: extra member / missing member / wrong-typed members => invalid-members class', () => {
+  const fixed = 'wh_shard_proxy_map defect class invalid-members: config value is not an object with exactly {url: string, refs: string[]} — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)';
+  const cases: [string, unknown][] = [
+    ['extra member', { url: WH_PROXY_URL, refs: ['bnwwjapoisfzkldtqzst'], extra: 1 }],
+    ['missing refs', { url: WH_PROXY_URL }],
+    ['missing url', { refs: ['bnwwjapoisfzkldtqzst'] }],
+    ['url not a string', { url: 42, refs: ['bnwwjapoisfzkldtqzst'] }],
+    ['refs not an array', { url: WH_PROXY_URL, refs: 'bnwwjapoisfzkldtqzst' }],
+    ['refs entry not a string', { url: WH_PROXY_URL, refs: [42] }],
+  ];
+  for (const [name, bad] of cases) {
+    const defects: string[] = [];
+    const v = parseWhProxyMapValue(bad, (m) => defects.push(m));
+    eqTrue(`${name}: rejected`, v === null);
+    eq(`${name}: the FIXED invalid-members log`, defects, [fixed]);
+  }
+});
+
+Deno.test('r123 parseWhProxyMapValue: url shape faults => bad-url class (raw byte shape — scheme, trailing dot, path, case, ref length)', () => {
+  const cases: [string, string][] = [
+    ['http scheme', 'http://bnwwjapoisfzkldtqzst.supabase.co/functions/v1/proxy'],
+    ['trailing-dot host (⟫A7 raw-exact stance)', 'https://bnwwjapoisfzkldtqzst.supabase.co./functions/v1/proxy'],
+    ['rest path not functions', 'https://bnwwjapoisfzkldtqzst.supabase.co/rest/v1/rpc/wh_query'],
+    ['path suffix', 'https://bnwwjapoisfzkldtqzst.supabase.co/functions/v1/proxyX'],
+    ['host ref short', 'https://shortref.supabase.co/functions/v1/proxy'],
+    ['uppercase ref', 'https://BNWWJAPOISFZKLDTQZST.supabase.co/functions/v1/proxy'],
+  ];
+  for (const [name, url] of cases) {
+    const defects: string[] = [];
+    const v = parseWhProxyMapValue({ url, refs: ['bnwwjapoisfzkldtqzst'] }, (m) => defects.push(m));
+    eqTrue(`bad-url ${name}: rejected`, v === null);
+    eqTrue(`bad-url ${name}: ONE fixed log naming the class`, defects.length === 1 && defects[0]!.includes('defect class bad-url'));
+  }
+});
+
+Deno.test('r123 parseWhProxyMapValue: ref-entry shape faults => bad-ref class', () => {
+  const cases: [string, string[]][] = [
+    ['19 chars', ['bnwwjapoisfzkldtqzs']],
+    ['21 chars', ['bnwwjapoisfzkldtqzstt']],
+    ['uppercase', ['BNWWJAPOISFZKLDTQZST']],
+    ['dotted host', ['bnwwjapoisfzkldtqzst.supabase.co']],
+  ];
+  for (const [name, refs] of cases) {
+    const defects: string[] = [];
+    const v = parseWhProxyMapValue({ url: WH_PROXY_URL, refs }, (m) => defects.push(m));
+    eqTrue(`bad-ref ${name}: rejected`, v === null);
+    eqTrue(`bad-ref ${name}: ONE fixed log naming the class`, defects.length === 1 && defects[0]!.includes('defect class bad-ref'));
+  }
+});
+
+Deno.test('r123 parseWhProxyMapValue: host-ref not in refs => url-not-in-refs class (consistency, fail-closed)', () => {
+  const defects: string[] = [];
+  const v = parseWhProxyMapValue({ url: WH_PROXY_URL, refs: ['shardaexampleexampl1'] }, (m) => defects.push(m));
+  eqTrue('rejected', v === null);
+  eqTrue('ONE fixed log naming the class', defects.length === 1 && defects[0]!.includes('defect class url-not-in-refs'));
+});
+
+Deno.test('r123 parseWhProxyMapValue: JWT-shaped string ANYWHERE => jwt-shaped-string class (token NEVER in config — ENFORCED)', () => {
+  const cases: [string, unknown][] = [
+    ['uppercase JWT refs entry', { url: WH_PROXY_URL, refs: ['eyJhbGciOiJIUzI1NiIsInR5'] }],
+    // the lethal one: 20-char ALL-LOWERCASE eyJ-prefixed string that WOULD
+    // pass ^[a-z0-9]{20}$ — the belt must catch it (class jwt, not bad-ref)
+    ['lowercase 20-char eyJ ref', { url: WH_PROXY_URL, refs: ['eyJabcdefghijklmnopq'] }],
+  ];
+  for (const [name, value] of cases) {
+    const defects: string[] = [];
+    const v = parseWhProxyMapValue(value, (m) => defects.push(m));
+    eqTrue(`jwt ${name}: rejected`, v === null);
+    eqTrue(`jwt ${name}: ONE fixed log naming the class`, defects.length === 1 && defects[0]!.includes('defect class jwt-shaped-string'));
+    eqTrue(`jwt ${name}: echo law — the log carries NO value fragment`, !defects[0]!.includes('eyJhb') && !defects[0]!.includes('eyJabc'));
+  }
+});
+
+Deno.test('r123 proxiedRawFetch: spec shape — POST to the proxy URL, Bearer WH_PROXY_TOKEN, body EXACTLY {url, http_method, headers, body, cache:0, browser_headers:false}', async () => {
+  const calls: RawCall[] = [];
+  const proxied = makeProxiedRawFetch({
+    proxyUrl: WH_PROXY_URL,
+    proxyToken: WH_PROXY_TOKEN,
+    fetchImpl: fakeRaw({ calls, status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(w1Wire()) }),
+  });
+  const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-test-key', rawFetch: proxied });
+  const rpc: WhRpcSpec = { p_template_hash: W1H, p_params: { p_min: 1 } };
+  const out = await fetcher('shard-a', WH_TARGET_RPC_URL, rpc);
+  eqTrue('the relayed 200 wire resolves (the D8 ok-arm unchanged behind the proxy)', out.ok === true);
+  eq('exactly ONE transport call — at the PROXY url', calls.length, 1);
+  const call = calls[0]!;
+  eq('proxy request URL = the acct2 proxy fn (absolute)', call.url, WH_PROXY_URL);
+  eq('outer method POST', call.init.method, 'POST');
+  eq('outer Authorization = Bearer WH_PROXY_TOKEN (the dedicated plane)', call.init.headers['Authorization'], `Bearer ${WH_PROXY_TOKEN}`);
+  eq('outer Content-Type = the spec envelope', call.init.headers['Content-Type'], 'application/json');
+  eq('outer headers are EXACTLY the two spec-plane headers', Object.keys(call.init.headers).sort().join(','), 'Authorization,Content-Type');
+  const spec = JSON.parse(call.init.body!) as Record<string, unknown>;
+  eq('spec members EXACTLY {url, http_method, headers, body, cache, browser_headers}', Object.keys(spec).sort(), ['body', 'browser_headers', 'cache', 'headers', 'http_method', 'url']);
+  eq('spec.url = the ABSOLUTE target url verbatim', spec.url, WH_TARGET_RPC_URL);
+  eqTrue('spec.url is an absolute https url', typeof spec.url === 'string' && (spec.url as string).startsWith('https://'));
+  eq('spec.http_method mirrors init.method', spec.http_method, 'POST');
+  eq('spec.headers = the shard auth headers VERBATIM (shard creds ride the spec)', spec.headers, {
+    'Accept-Profile': 'public',
+    apikey: 'sk-test-key',
+    Authorization: 'Bearer sk-test-key',
+    'Content-Type': 'application/json',
+  });
+  eq('spec.body = the rpc body string verbatim', spec.body, JSON.stringify({ p_template_hash: W1H, p_params: { p_min: 1 } }));
+  eq('spec.cache = the NUMBER 0 (defeats the ep 300s default TTL on both layers)', spec.cache, 0);
+  eqTrue('spec.cache is typeof number (never the string "0")', typeof spec.cache === 'number');
+  eq('spec.browser_headers = false (⟫A9 — no browser-masquerade injection)', spec.browser_headers, false);
+});
+
+Deno.test('r123 proxiedRawFetch: residual select GET arm — http_method GET, spec.body null, headers verbatim (no Content-Type)', async () => {
+  const calls: RawCall[] = [];
+  const proxied = makeProxiedRawFetch({ proxyUrl: WH_PROXY_URL, proxyToken: WH_PROXY_TOKEN, fetchImpl: fakeRaw({ calls, status: 200, body: '' }) });
+  const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-test-key', rawFetch: proxied });
+  const out = await fetcher('shard-a', 'https://shardaexampleexampl1.supabase.co/rest/v1/wh_rows?select=%2A');
+  eqTrue('the GET arm still degrades loudly at the fetcher (select-arm refusal unchanged)', out.ok === false && out.warning.code === 'shard_path_select_disabled');
+  const spec = JSON.parse(calls[0]!.init.body!) as Record<string, unknown>;
+  eq('spec.http_method GET', spec.http_method, 'GET');
+  eq('spec.body null (init.body undefined ?? null)', spec.body, null);
+  eq('spec.headers verbatim — NO Content-Type on the GET arm', spec.headers, {
+    'Accept-Profile': 'public',
+    apikey: 'sk-test-key',
+    Authorization: 'Bearer sk-test-key',
+  });
+  eqTrue('outer transport stays POST + Bearer (the proxy plane is POST-only)', calls[0]!.init.method === 'POST' && calls[0]!.init.headers['Authorization'] === `Bearer ${WH_PROXY_TOKEN}`);
+});
+
+Deno.test('r123 passthrough: the proxy Response is consumed VERBATIM — 200 wire body relays unchanged (D8 + crash-gate work unchanged)', async () => {
+  const wire = w1Wire();
+  const proxied = makeProxiedRawFetch({
+    proxyUrl: WH_PROXY_URL,
+    proxyToken: WH_PROXY_TOKEN,
+    fetchImpl: fakeRaw({ status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(wire) }),
+  });
+  const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-test-key', rawFetch: proxied });
+  const out = await fetcher('shard-a', WH_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+  eqTrue('ok arm', out.ok === true);
+  eq('envelope = the proxied body, parsed VERBATIM (no re-shaping at the seam)', (out as { envelope: unknown }).envelope, wire);
+  eq('estRows from the relayed rowCount', (out as { estRows?: number }).estRows, 2);
+});
+
+Deno.test('r123 passthrough: proxy-generated 403 JSON error relays as a non-2xx warning — no throw, no code misclassification', async () => {
+  const proxied = makeProxiedRawFetch({
+    proxyUrl: WH_PROXY_URL,
+    proxyToken: WH_PROXY_TOKEN,
+    fetchImpl: fakeRaw({ status: 403, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ error: 'forbidden', code: 'PROXY_FORBIDDEN' }) }),
+  });
+  const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-test-key', rawFetch: proxied });
+  const out = await fetcher('shard-a', WH_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+  eqTrue('non-2xx warning arm (no exception)', out.ok === false);
+  eq('warning = {httpStatus:403} EXACTLY (4xx: stamped ABSENT; PROXY_FORBIDDEN can never match ^WH[0-9]{3}$)', out.ok === false ? out.warning : undefined, { httpStatus: 403 });
+});
+
+Deno.test('r123 passthrough: proxy 502 with application/json → advisory stamped:true (the D8 header-PRESENCE law unchanged through the proxy)', async () => {
+  const proxied = makeProxiedRawFetch({
+    proxyUrl: WH_PROXY_URL,
+    proxyToken: WH_PROXY_TOKEN,
+    fetchImpl: fakeRaw({ status: 502, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ error: 'bad gateway', code: 'DNS_FAILED' }) }),
+  });
+  const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-test-key', rawFetch: proxied });
+  const out = await fetcher('shard-a', WH_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+  eq('warning = {httpStatus:502, stamped:true} (DNS_FAILED never matches ^WH[0-9]{3}$ — no misroute)', out.ok === false ? out.warning : undefined, { httpStatus: 502, stamped: true });
+});
+
+Deno.test('r123 never-throw: the 403/429/502 sweep — the proxied fetcher NEVER throws, every arm a non-2xx warning', async () => {
+  for (const status of [403, 429, 502]) {
+    const proxied = makeProxiedRawFetch({
+      proxyUrl: WH_PROXY_URL,
+      proxyToken: WH_PROXY_TOKEN,
+      fetchImpl: fakeRaw({ status, headers: { 'content-type': 'application/json' }, body: JSON.stringify({ error: 'proxy refusal', code: 'PROXY_DOWN' }) }),
+    });
+    const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-test-key', rawFetch: proxied });
+    let out: Awaited<ReturnType<typeof fetcher>> | undefined;
+    let threw = false;
+    try {
+      out = await fetcher('shard-a', WH_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+    } catch {
+      threw = true;
+    }
+    eqTrue(`proxy ${status}: NO exception`, !threw);
+    eqTrue(`proxy ${status}: warning arm`, out?.ok === false);
+    eq(`proxy ${status}: httpStatus relayed`, out && out.ok === false ? out.warning.httpStatus : undefined, status);
+  }
+});
+
+Deno.test('r123 never-throw: transport rejection INSIDE the proxied fetch => the fetcher arm-0 network warning (seam contract preserved — the wrapper does NOT swallow)', async () => {
+  const calls: RawCall[] = [];
+  const proxied = makeProxiedRawFetch({ proxyUrl: WH_PROXY_URL, proxyToken: WH_PROXY_TOKEN, fetchImpl: fakeRaw({ reject: true, calls }) });
+  const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-test-key', rawFetch: proxied });
+  let out: Awaited<ReturnType<typeof fetcher>> | undefined;
+  let threw = false;
+  try {
+    out = await fetcher('shard-a', WH_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+  } catch {
+    threw = true;
+  }
+  eqTrue('NO exception escapes the fetcher', !threw);
+  eq('the SEAM contract catch classifies it (arm-0 network — swallowing in the wrapper would MISclassify a network fault as an http warning)', out && out.ok === false ? out.warning : undefined, { code: 'network' });
+  eqTrue('the rejection happened at the PROXY transport (one call attempted)', calls.length === 1);
+});
+
+Deno.test('r123 ⟫B5 burst pin: RATE_LIMITED-shaped 429 (+Retry-After) → engine warning arm, NO throw, no WH-code misroute', async () => {
+  const proxied = makeProxiedRawFetch({
+    proxyUrl: WH_PROXY_URL,
+    proxyToken: WH_PROXY_TOKEN,
+    fetchImpl: fakeRaw({
+      status: 429,
+      headers: { 'content-type': 'application/json', 'retry-after': '60' },
+      body: JSON.stringify({ error: 'rate limit exceeded', code: 'RATE_LIMITED' }),
+    }),
+  });
+  const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-test-key', rawFetch: proxied });
+  let out: Awaited<ReturnType<typeof fetcher>> | undefined;
+  let threw = false;
+  try {
+    out = await fetcher('shard-a', WH_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+  } catch {
+    threw = true;
+  }
+  eqTrue('rate-limit burst: NO exception (the per-shard degrade arm — never a /query hard-fail by itself)', !threw);
+  eq('warning = {httpStatus:429} EXACTLY — RATE_LIMITED can never match ^WH[0-9]{3}$ so the code field stays ABSENT (no D8 misroute; audit-B verified)', out && out.ok === false ? out.warning : undefined, { httpStatus: 429 });
 });
 
 // -----------------------------------------------------------------------------

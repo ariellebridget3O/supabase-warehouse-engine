@@ -112,6 +112,182 @@ export function parseShardKeyEnv(
   return out;
 }
 
+// ---------- the WH_PROXY rawFetch lever (r123, design_r122_acct2_proxy.md §1.3/§1.4) ----------
+//
+// The engine-side half of the acct2 proxy plane: a boot-validated
+// `wh_shard_proxy_map` KV value (the FM 0019 validator MIRRORED here —
+// defense in depth; the engine never trusts a value it did not shape-check)
+// plus the `proxiedRawFetch` transform (§1.4): (url, init) → POST <proxyUrl>
+// with a JSON spec carrying the target url/method/headers/body verbatim.
+// Purity law intact: BOTH pieces are pure — the SHELL (warehouse-engine/
+// index.ts) owns every env read and the ONE boot-once KV read (⟫B4) and
+// wires this with the WH_PROXY_FETCHER / WH_PROXY_TOKEN envs.
+//
+// ECHO LAW (r57, wh_shard_channel.ts:20-23): every defect log below is a
+// FIXED string — the KV value is NEVER echoed, never value fragments
+// (a JWT-shaped string in the value would otherwise leak into stdout).
+
+/** The strict proxy-fn URL shape: exactly `https://<20-char-ref>.supabase.co/
+ *  functions/v1/proxy` (lowercase ref; default 443; no trailing dot — raw
+ *  byte shape, deliberately narrower than DNS identity, ⟫A7 stance). */
+const WH_PROXY_FN_URL_RE = /^https:\/\/[a-z0-9]{20}\.supabase\.co\/functions\/v1\/proxy$/;
+/** Each refs entry is an EXACT 20-char lowercase project ref. */
+const WH_PROXY_REF_RE = /^[a-z0-9]{20}$/;
+/** Token NEVER in config — enforced, not just documented (⟫A5): any
+ *  JWT-shaped string anywhere in the value rejects the WHOLE value. */
+const JWT_SHAPED_RE = /^eyJ/;
+
+/** The validated `wh_shard_proxy_map` value (the shape the FM writer emits). */
+export interface WhProxyMapValue {
+  /** The acct2 proxy fn URL (engine-side validated: strict shape above). */
+  url: string;
+  /** The allowlisted WH shard refs the proxy may reach. */
+  refs: string[];
+}
+
+/**
+ * parseWhProxyMapValue — the ENGINE-SIDE mirror of the FM `wh_shard_proxy_map`
+ * validator (fm db/migrations/0019_geo_b2_prestage.sql:175-220, ⟫A5):
+ *   * value must be a JSON object with EXACTLY the members `{url, refs}`
+ *     (extra members REJECTED; url: string; refs: array of strings);
+ *   * NO JWT-shaped string (`^eyJ`) anywhere in the value — the proxy token
+ *     NEVER rides the config KV (the r69 §3.3 doctrine made ENFORCED);
+ *   * `url` must match ^https://[a-z0-9]{20}\.supabase\.co/functions/v1/proxy$
+ *     AND its host-ref must be ∈ refs (consistency, fail-closed);
+ *   * every refs entry must match ^[a-z0-9]{20}$.
+ * ANY fault ⇒ null + ONE fixed-string defect log via onDefect (default
+ * console.error) — the caller stays inert (lever OFF, default platform
+ * fetch). The mirror exists because the KV is WRITTEN by the flip runbook
+ * and READ here: a malformed or poisoned value must never arm the lever,
+ * even if the FM-side validator regresses (defense in depth).
+ */
+export function parseWhProxyMapValue(
+  value: unknown,
+  onDefect?: (msg: string) => void,
+): WhProxyMapValue | null {
+  const defect = onDefect ?? ((msg: string) => console.error(msg));
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    defect('wh_shard_proxy_map defect class not-an-object: config value is not a JSON object — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const members = Object.keys(record).sort();
+  if (
+    members.length !== 2 || members[0] !== 'refs' || members[1] !== 'url' ||
+    typeof record.url !== 'string' || !Array.isArray(record.refs) ||
+    record.refs.some((entry) => typeof entry !== 'string')
+  ) {
+    defect('wh_shard_proxy_map defect class invalid-members: config value is not an object with exactly {url: string, refs: string[]} — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+    return null;
+  }
+  const url = record.url;
+  const refs = record.refs as string[];
+  if ([url, ...refs].some((s) => JWT_SHAPED_RE.test(s))) {
+    defect('wh_shard_proxy_map defect class jwt-shaped-string: a string in the config value is JWT-shaped — the proxy token NEVER rides the config KV — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+    return null;
+  }
+  if (!WH_PROXY_FN_URL_RE.test(url)) {
+    defect('wh_shard_proxy_map defect class bad-url: url does not match the acct2 proxy-fn URL shape — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+    return null;
+  }
+  if (refs.some((entry) => !WH_PROXY_REF_RE.test(entry))) {
+    defect('wh_shard_proxy_map defect class bad-ref: a refs entry is not a 20-char lowercase project ref — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+    return null;
+  }
+  // The regex above pins the byte shape `https://<20>.supabase.co/...`, so
+  // the host-ref is exactly bytes 8..28 (no URL parse, no normalization —
+  // raw-exact matching, ⟫A7).
+  const hostRef = url.slice('https://'.length, 'https://'.length + 20);
+  if (!refs.includes(hostRef)) {
+    defect('wh_shard_proxy_map defect class url-not-in-refs: the url host ref is not listed in refs — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+    return null;
+  }
+  return { url, refs };
+}
+
+/** The rawFetch seam type (RpcShardFetcherDeps.rawFetch, above) restated
+ *  structurally so the proxy wrapper is drop-in at the SAME seam — the
+ *  fetcher's D7 never-throw arms and the D8 classification consume it
+ *  unchanged. */
+export type WhProxyRawFetch = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body?: string },
+) => Promise<{
+  ok?: boolean;
+  status?: number;
+  headers?: { get(name: string): string | null };
+  text: () => Promise<string>;
+}>;
+
+export interface ProxiedRawFetchDeps {
+  /** The acct2 proxy fn URL (parseWhProxyMapValue-validated upstream). */
+  proxyUrl: string;
+  /** The DEDICATED WH_PROXY_TOKEN (the shell owns the env read; NEVER
+   *  WHE_BEARER_TOKEN — the snapshotKey doctrine, index.ts:152-155). */
+  proxyToken: string;
+  /** Injectable transport (prod: the platform fetch; tests: fakes). */
+  fetchImpl?: (
+    url: string,
+    init: { method: string; headers: Record<string, string>; body: string },
+  ) => Promise<{
+    ok?: boolean;
+    status?: number;
+    headers?: { get(name: string): string | null };
+    text: () => Promise<string>;
+  }>;
+}
+
+/**
+ * makeProxiedRawFetch (§1.4) — the WH_PROXY lever transform: the shard
+ * fetcher's rawFetch dep, rerouted through the acct2 proxy fn:
+ *   (url, init) → POST <proxyUrl> {
+ *     Authorization: Bearer <WH_PROXY_TOKEN>,   // the OUTER plane auth
+ *     Content-Type: application/json,
+ *     body: {url, http_method: init.method, headers: init.headers,
+ *            body: init.body ?? null, cache: 0, browser_headers: false}
+ *   }
+ * Contract notes (ALL load-bearing):
+ *   * The shard creds (apikey / Authorization service JWT / Accept-Profile)
+ *     ride `headers` VERBATIM inside the spec — ep forwards them
+ *     (allowAuthorization: true; only hop-by-hop / x-supabase-* dropped).
+ *   * `cache: 0` is the NUMBER zero — it defeats ep's 300s default TTL on
+ *     BOTH cache layers (WH reads must never serve stale).
+ *   * `browser_headers: false` (⟫A9) — without it ep injects
+ *     Accept/sec-fetch-* browser-masquerade headers, making the proxied POST
+ *     non-byte-equivalent to the direct path.
+ *   * NEVER-THROW SEAM CONTRACT (preserved EXACTLY): this wrapper does NOT
+ *     catch transport rejections — a rejection propagates to the fetcher's
+ *     arm-0 catch-inside (wh_shard_channel.ts, the load-bearing try around
+ *     rawFetch) which degrades to the `network` warning. Swallowing here
+ *     into a fake Response-like would MISCLASSIFY a network fault as an
+ *     http-status warning — the catch stays where the seam puts it.
+ *   * The proxy's OWN errors (401/403/429/502 JSON) arrive as ordinary
+ *     non-2xx Responses and are returned VERBATIM — the fetcher's non-2xx
+ *     warning arm classifies them; nothing here throws on them.
+ */
+export function makeProxiedRawFetch(deps: ProxiedRawFetchDeps): WhProxyRawFetch {
+  const transport = deps.fetchImpl ??
+    ((url: string, init: { method: string; headers: Record<string, string>; body: string }) => fetch(url, init));
+  return (url, init) => {
+    const spec = {
+      url,
+      http_method: init.method,
+      headers: init.headers,
+      body: init.body ?? null,
+      cache: 0,
+      browser_headers: false,
+    };
+    return transport(deps.proxyUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${deps.proxyToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(spec),
+    });
+  };
+}
+
 // ---------- the real fetcher (D7/D8/D9, §3.4) ----------
 
 /** Default response byte cap: P≤64KB (wh_query contract §4.5). */
