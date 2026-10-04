@@ -6,7 +6,7 @@
 - **max_rows F15 goes manifest-side**: a plan limit strictly above the matched template's `ENGINE_TEMPLATE_MANIFEST.max_rows` refuses pre-fanout with ZERO shard POSTs (`==` passes; the sampled inventory `max_rows` column remains the registry-drift signal).
 - **`phases` response field**: `{pre_chain_ms, handshake_ms, fanout_ms}` on success envelopes only (omitted on errors) — `pre_chain_ms` is entrypoint-threaded (`ExecuteArgs.timings`), `handshake_ms` is 0 on unsampled calls, `fanout_ms` is the measured fanout block duration.
 - Accepted per design §1.3a: WH402/WH403/transport/429/5xx classes are non-exempt under `fail_fast` (honest 500 on unsampled calls) — rolling-deploy/key-rotation runbook note in DESIGN.md §8.
-- Battery re-pin follows in Leg 2 (design §5 ledger — retire/re-write/add counts); engine typecheck green (`make check`).
+- **Battery re-pin (Leg 2, design §5 D6 ledger)**: 571 → 582 green — 9 inverted pins re-written to the folded observables (LETHAL 1/1b/2/3/3b/7, fail_fast-exemption, fleet/order pins across wh_handshake/wh_geo_plane/wh_shard_channel/wh_entrypoint tests), 10 lethal tests added (full mapped-refusal record + fail_fast twin, manifest max_rows 1001/1000-boundary, sampler determinism vectors + recording-fake + statelessness + `K_SAMPLING` identity, phases incl. absent-on-error, empty-hash guard, unmapped WH402/WH403/5xx fail_fast, F2-clamp-under-drift) with mutation RED-proofs (M1: mapping arm deleted → 3 files RED; M2: sampler predicate hard-false → 3 files RED); fence `stable()` strips the new `phases` timing field alongside `latency_ms`. Engine typecheck green (`make check`).
 
 ## 0.1.1 — migrate surface: adapted Management-API runner + lethal pins + docs retraction
 

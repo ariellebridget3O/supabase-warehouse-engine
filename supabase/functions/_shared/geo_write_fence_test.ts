@@ -508,11 +508,17 @@ function gateReq(path: string, body: unknown): Request {
   });
 }
 
-/** Strip the run-to-run noise (latency fields) so full-body deep-eqs are exact. */
+/** Strip the run-to-run noise (latency fields) so full-body deep-eqs are exact.
+ *  r121 OPT-1b: the fold added `phases` {pre_chain_ms, handshake_ms,
+ *  fanout_ms} to success envelopes — fanout_ms is a MEASURED wall (real
+ *  timers: 0 or 1ms run-to-run), so the timing surface strips alongside
+ *  latency_ms exactly like it (the byte-identity law is about WIRE SHAPE,
+ *  not wall noise; the phases pin lives in wh_handshake_test.ts). */
 function stable(v: unknown): unknown {
   if (v === null || typeof v !== 'object') return v;
   const obj = { ...(v as Record<string, unknown>) };
   delete obj.latency_ms;
+  delete obj.phases;
   if (Array.isArray(obj.perShard)) {
     obj.perShard = (obj.perShard as Record<string, unknown>[]).map((p) => {
       const q = { ...p };

@@ -512,18 +512,56 @@ Deno.test('geo exec G-A: tier_warm is PLANE-INVARIANT (fires before the geo gate
   eqTrue('geo gates never consulted after the 404', geoReads === 0);
 });
 
-Deno.test('geo exec: handshake skipped on a won replica plane; runs on primary', async () => {
+Deno.test('geo exec (r121 folded): handshake skipped on a won replica plane AND on the R3 dispatch; the primary samples ONLY in-bucket', async () => {
   const calls: { shard: string; url: string }[] = [];
   let inventoryReads = 0;
   const handshake = { readTemplateInventory: () => { inventoryReads++; return Promise.resolve([]); } };
-  await runWith(baseReq({ read_plane: 'replica' }), {
+  // A won replica plane NEVER samples (plane guard `!onReplicaPlane`) — even
+  // with an in-bucket qid + limit. (A TEMPLATED plan can never WIN the
+  // replica — G5 — so on a won replica the empty-hash guard stacks on top;
+  // the plane guard stays load-bearing defense-in-depth for it.)
+  await runWith(baseReq({ read_plane: 'replica', qid: 'skip-me', query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], limit: 10 } }), {
     geoMode: 'spread',
     geoReader: () => Promise.resolve([geoRow()]),
     handshake,
   }, calls);
-  eqTrue('no inventory reads on replica plane', inventoryReads === 0);
-  await runWith(baseReq(), { handshake }, calls);
-  eqTrue('inventory reads happen per primary shard', inventoryReads === 3);
+  eqTrue('no inventory reads on a won replica plane (in-bucket qid — the plane guard dominates)', inventoryReads === 0);
+  eqTrue('the won replica serves normally (one fetch, 1/1)', calls.length === 1 && calls[0]?.shard === 'fmhostref');
+  // The R3 geoDispatch target NEVER samples either (`geoDispatch === null` guard).
+  inventoryReads = 0;
+  const callsEd: { shard: string; url: string }[] = [];
+  await executeWhQuery({
+    ...(BASE_ARGS as unknown as Record<string, unknown>),
+    req: parseWhEngineRequest(baseReq({ qid: 'skip-me', query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], limit: 10 } })),
+    fetcher: async (shard: string) => { callsEd.push({ shard, url: '' }); return { ok: true as const, envelope: scalarEnv(shard, 'orders') }; },
+    handshake,
+    templateHashes: [ENGINE_TEMPLATE_MANIFEST[0].template_hash],
+    geoReadDispatch: { kind: 'remote', target: 'remote-ref' },
+  } as never);
+  eqTrue('no inventory reads on the R3 dispatch plane (in-bucket qid — the geoDispatch guard dominates)', inventoryReads === 0);
+  eqTrue('the R3 dispatch target IS fetched (single-target serve)', callsEd.length === 1 && callsEd[0]?.shard === 'remote-ref');
+  // PRIMARY plane, SAMPLED-FORCED (in-bucket qid + limit + templated plan):
+  // the fired sweep runs one inventory GET per selected shard and the empty
+  // inventory fails every shard closed BEFORE any POST.
+  inventoryReads = 0;
+  const callsS: { shard: string; url: string }[] = [];
+  const resS = await executeWhQuery({
+    ...(BASE_ARGS as unknown as Record<string, unknown>),
+    req: parseWhEngineRequest(baseReq({ qid: 'skip-me', query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], limit: 10 } })),
+    fetcher: async (shard: string) => { callsS.push({ shard, url: '' }); return { ok: true as const, envelope: scalarEnv(shard, 'orders') }; },
+    handshake,
+    templateHashes: [ENGINE_TEMPLATE_MANIFEST[0].template_hash],
+  } as never);
+  eqTrue('SAMPLED primary: inventory reads happen per primary shard (one per shard, per fired sweep)', inventoryReads === 3);
+  eqTrue('SAMPLED primary: template_missing excludes BEFORE dispatch (zero fetches)', callsS.length === 0);
+  eqTrue('SAMPLED primary: coverage 0/3 partial', resS.coverage === '0/3' && resS.partial === true);
+  // PRIMARY plane, UNSAMPLED (the fixture qid, bucket 14): the fold's steady
+  // state — zero inventory reads, the fan-out proceeds untouched.
+  inventoryReads = 0;
+  const callsU: { shard: string; url: string }[] = [];
+  await runWith(baseReq(), { handshake, templateHashes: [ENGINE_TEMPLATE_MANIFEST[0].template_hash] }, callsU);
+  eqTrue('UNSAMPLED primary: ZERO inventory GETs (folded steady state)', inventoryReads === 0);
+  eqTrue('UNSAMPLED primary: the fan-out proceeded (3 fetches, 3/3)', callsU.length === 3);
 });
 
 Deno.test('geo exec: fail_fast still collects-then-fails on the replica plane', async () => {
@@ -654,6 +692,10 @@ Deno.test('geo exec P3-6 pin: scalar {W2} plan — primary handshake LIVE, repli
   );
   eq('derive: scalar min/count(col) wh_probe_agg (select-path query) => {W2} (kind-matched)', w2, [ENGINE_TEMPLATE_MANIFEST[1].template_hash]);
   const scalarAggQuery = { select: [{ op: 'min', col: 'amount', alias: 'm' }, { op: 'count', col: 'amount', alias: 'c' }] };
+  // r121: the sampled backstop requires limitK present — the sampled-forced
+  // arms add limit 10 (≤ the manifest max_rows 1000, so the manifest
+  // pre-refusal never fires) and the IN-BUCKET qid 'skip-me' (bucket 7).
+  const scalarAggQuerySampled = { ...scalarAggQuery, limit: 10 };
   const w2Envelope = (shard: string): WhPartialEnvelope => ({
     v: 1,
     shard,
@@ -676,30 +718,44 @@ Deno.test('geo exec P3-6 pin: scalar {W2} plan — primary handshake LIVE, repli
     max_rows: 1000,
   }];
 
-  // (i) the gate REFUSES on a {W2}-less inventory: per-shard handshake runs,
-  // zero fetches, 0/3 partial (selected = 3, all excluded pre-dispatch).
+  // (i) SAMPLED-FORCED: the gate REFUSES on a {W2}-less inventory — per-shard
+  // handshake runs, zero fetches, 0/3 partial (selected = 3, all excluded
+  // pre-dispatch). PLUS the unsampled steady-state arm: zero inventory reads,
+  // the fan-out proceeds untouched (the reactive fold, audit-B F5 accepted).
   const callsNoW2: { shard: string; url: string }[] = [];
   let inventoryReadsNoW2 = 0;
   const resNoW2 = await executeWhQuery({
     ...(BASE_ARGS as unknown as Record<string, unknown>),
-    req: parseWhEngineRequest(baseReq({ table: 'wh_probe_agg', query: scalarAggQuery })),
+    req: parseWhEngineRequest(baseReq({ table: 'wh_probe_agg', qid: 'skip-me', query: scalarAggQuerySampled })),
     fetcher: recordingFetcher(callsNoW2),
     handshake: { readTemplateInventory: () => { inventoryReadsNoW2++; return Promise.resolve([]); } },
     templateHashes: w2,
   } as never);
-  eqTrue('handshake ran per primary shard (the scalar plan GATES — not vacuous)', inventoryReadsNoW2 === 3);
+  eqTrue('handshake ran per primary shard on the FIRED sweep (the scalar plan GATES — not vacuous)', inventoryReadsNoW2 === 3);
   eqTrue('template_missing excludes BEFORE dispatch (zero fetches)', callsNoW2.length === 0);
   eq('coverage 0/3 partial', [resNoW2.coverage, resNoW2.partial], ['0/3', true]);
   eqTrue('every shard excluded template_missing', resNoW2.perShard.length === 3 && resNoW2.perShard.every((p) => p.ok === false && p.error === 'template_missing'));
 
-  // (i-b) the gate OPENS when the inventory satisfies {W2}: the plan fans
-  // out on the select path and the scalar aggregate merges ({m:'5', c:6} =
-  // min of 5/5/5, 2+2+2 counts).
+  const callsNoW2Unsampled: { shard: string; url: string }[] = [];
+  let inventoryReadsNoW2Unsampled = 0;
+  const resNoW2Unsampled = await executeWhQuery({
+    ...(BASE_ARGS as unknown as Record<string, unknown>),
+    req: parseWhEngineRequest(baseReq({ table: 'wh_probe_agg', query: scalarAggQuery })), // bucket-14 qid, no limit
+    fetcher: async (shard: string) => { callsNoW2Unsampled.push({ shard, url: '' }); return { ok: true as const, envelope: w2Envelope(shard) }; },
+    handshake: { readTemplateInventory: () => { inventoryReadsNoW2Unsampled++; return Promise.resolve([]); } },
+    templateHashes: w2,
+  } as never);
+  eqTrue('UNSAMPLED: ZERO inventory reads (folded steady state)', inventoryReadsNoW2Unsampled === 0);
+  eqTrue('UNSAMPLED: the {W2}-less inventory is never consulted — the fan-out rides (3 fetches, 3/3)', callsNoW2Unsampled.length === 3 && resNoW2Unsampled.coverage === '3/3');
+
+  // (i-b) SAMPLED-FORCED: the gate OPENS when the inventory satisfies {W2}:
+  // the plan fans out on the select path and the scalar aggregate merges
+  // ({m:'5', c:6} = min of 5/5/5, 2+2+2 counts).
   const callsOpen: { shard: string; url: string }[] = [];
   let inventoryReadsOpen = 0;
   const resOpen = await executeWhQuery({
     ...(BASE_ARGS as unknown as Record<string, unknown>),
-    req: parseWhEngineRequest(baseReq({ table: 'wh_probe_agg', query: scalarAggQuery })),
+    req: parseWhEngineRequest(baseReq({ table: 'wh_probe_agg', qid: 'skip-me', query: scalarAggQuerySampled })),
     fetcher: async (shard: string) => { callsOpen.push({ shard, url: '' }); return { ok: true as const, envelope: w2Envelope(shard) }; },
     handshake: { readTemplateInventory: () => { inventoryReadsOpen++; return Promise.resolve(w2Inventory); } },
     templateHashes: w2,
@@ -710,16 +766,16 @@ Deno.test('geo exec P3-6 pin: scalar {W2} plan — primary handshake LIVE, repli
   // 5n (the >2^53 law — sums/mins finalize bigint, never Number), count 6.
   eqTrue('scalar aggregate merged through the select path (numeric min finalizes bigint 5n)', deepEq(resOpen.result, { m: 5n, c: 6 }));
 
-  // (ii) the REPLICA-plane equivalent: G5 vetoes the {W2} plan — the
-  // replica ref is never fetched; the fallback primary serve rides the same
-  // handshake gate (open inventory ⇒ a normal served wire + the geo
-  // warning; the replica plane itself never consults the derived set except
-  // as this veto).
+  // (ii) SAMPLED-FORCED, the REPLICA-plane equivalent: G5 vetoes the {W2}
+  // plan — the replica ref is never fetched; the FALLBACK primary serve
+  // rides the same sampled gate (open inventory ⇒ a normal served wire + the
+  // geo warning; the replica plane itself never consults the derived set
+  // except as this veto, and a WON replica plane would never sample).
   const callsRep: { shard: string; url: string }[] = [];
   let inventoryReadsRep = 0;
   const resRep = await executeWhQuery({
     ...(BASE_ARGS as unknown as Record<string, unknown>),
-    req: parseWhEngineRequest(baseReq({ table: 'wh_probe_agg', read_plane: 'replica', query: scalarAggQuery })),
+    req: parseWhEngineRequest(baseReq({ table: 'wh_probe_agg', read_plane: 'replica', qid: 'skip-me', query: scalarAggQuerySampled })),
     fetcher: async (shard: string) => { callsRep.push({ shard, url: '' }); return { ok: true as const, envelope: w2Envelope(shard) }; },
     handshake: { readTemplateInventory: () => { inventoryReadsRep++; return Promise.resolve(w2Inventory); } },
     templateHashes: w2,

@@ -1,7 +1,16 @@
 // =============================================================================
 // _shared/wh_handshake_test.ts — RED-first proofs for the §5.2 ENGINE⇄SHARD
-// HANDSHAKE + the §6.3 F14/F2 consumption gates (r44).
+// HANDSHAKE + the §6.3 F14/F2 consumption gates (r44) + the r121 OPT-1b
+// handshake-fold battery (design_r121_opt1b_handshake_fold.md §5 D6 ledger).
 // =============================================================================
+// r121 OPT-1b (§5): the per-query inventory sweep is FOLDED into wh_query
+// per-call eligibility (classifyFetchFailure maps shard WH400/WH401 → exempt
+// template_missing; the sweep survives ONLY as the 1-in-16 SAMPLED backstop,
+// K_SAMPLING=7 over sha256(qid)[0]&15) — the engine-level pins below were
+// RE-WRITTEN to the folded observables (LETHAL 1/1b/2/3/3b/7 + the
+// fail_fast-exemption + fleet pins), and the 7 lethal ADD groups
+// (mapping / manifest-max_rows / sampler 4-part / phases / empty-hash guard /
+// unmapped fail_fast / F2-clamp-under-drift) are pinned r121-style.
 // Normative source: research/design_wh_query_rpc.md §5.2 (discovery/
 // verification handshake: inventory GET, required-hashes ⊆ returned set,
 // schema_version match, [F15] max_rows fail-fast BEFORE any wh_query call,
@@ -42,6 +51,10 @@ import {
   gatePartialAgainstPlan,
   parseWhEngineRequest,
   buildMergePlan,
+  classifyFetchFailure,
+  K_SAMPLING,
+  qidSampleBucket,
+  WhEngineError,
 } from './wh_engine_core.ts';
 import type { WhDirectoryRow, WhEngineTimers, WhShardFetcher } from './wh_engine_core.ts';
 import type { WhPartialEnvelope } from './wh_types.ts';
@@ -231,6 +244,63 @@ function countingFetch(envelopeFor: (shard: string) => WhPartialEnvelope, calls:
   return async (shard) => {
     calls.push(shard);
     return { ok: true, envelope: envelopeFor(shard), estRows: 0 };
+  };
+}
+
+/** r121: a shard that REFUSES the wh_query call (the folded per-call
+ *  eligibility check) — the warning rides classifyFetchFailure exactly as
+ *  the real fetcher emits it. estRows is the TRANSPORT-side estimate; the
+ *  mapped-exclusion record must re-attach the DIRECTORY lane instead. */
+function refusingFetch(
+  warning: { code?: string; httpStatus?: number; stamped?: boolean },
+  calls: string[],
+  estRows = 0,
+): WhShardFetcher {
+  return async (shard) => {
+    calls.push(shard);
+    return { ok: false, warning, estRows } as const;
+  };
+}
+
+// ---- r121 OPT-1b sampler fixtures (design §1.5; hand-computed sha256) ----
+// bucket(qid) = sha256(qid utf8)[0] & 15; fires iff === K_SAMPLING (7).
+//   'skip-me'        → 0x97 & 15 = 7  (FIRES)
+//   'r121-sample-26' → 0x17 & 15 = 7  (FIRES)
+//   'r121-sample-68' → 0xd7 & 15 = 7  (FIRES)
+//   'r121-sample-76' → 0x97 & 15 = 7  (FIRES)
+//   'r121-in-1'      → 0xb8 & 15 = 8  (out)
+//   'r121-skip-0'    → 0x8d & 15 = 13 (out)
+//   'r121-skip-1'    → 0x2f & 15 = 15 (out)
+//   'qid-7'          → 0xc5 & 15 = 5  (out)
+//   '01J9Q1…' (the legacy fixture qid) → 0x5e & 15 = 14 (out — the old
+//   per-query-sweep pins inverted exactly because this qid is UNSAMPLED).
+const SAMPLED_QID = 'skip-me';
+const OUTBUCKET_QID = 'r121-in-1';
+
+/** The grouped plan WITH a limit: the sampled backstop requires limitK
+ *  present (the manifest pre-refusal lane shares the planRef), so every
+ *  sampled-forced variant below uses this request (bucket 7 → fires). */
+const SAMPLED_REQ = parseWhEngineRequest({
+  v: 1,
+  qid: SAMPLED_QID,
+  table: 'orders',
+  query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], limit: 100 },
+});
+/** Identical plan, OUT-of-bucket qid (bucket 8): isolates the sampler as the
+ *  only difference between the sampled/unsampled arms. */
+const OUTBUCKET_REQ = parseWhEngineRequest({
+  v: 1,
+  qid: OUTBUCKET_QID,
+  table: 'orders',
+  query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], limit: 100 },
+});
+/** Counting timers (every nowMs call advances 3ms) — the phases pin's
+ *  hand-computed lower bounds ride this. */
+function stepTimers(): WhEngineTimers {
+  let n = 0;
+  return {
+    nowMs: () => (n += 3),
+    startTimeout: (_ms: number) => ({ promise: new Promise<'timeout'>(() => {}), dispose: () => {} }),
   };
 }
 
@@ -617,79 +687,104 @@ Deno.test('gate: garbage envelopes fall through (wh_merge envelope_invalid law o
 // =============================================================================
 // 6. ENGINE-LEVEL (executeWhQuery) — the §5.2 gate + consumption gates live.
 // =============================================================================
-Deno.test('LETHAL 1: inventory missing a required hash => template_missing, shard EXCLUDED, ZERO wh_query fetches', async () => {
+Deno.test('LETHAL 1 (folded): ineligible shard IS POSTed, refuses WH400 => mapped template_missing; ZERO inventory GETs on the unsampled path', async () => {
   const fetchCalls: string[] = [];
   const invCalls: string[] = [];
   const res = await executeWhQuery({
     ...execBase(GROUPED_REQ, [dirRow('S1')]),
-    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { templateHash: W1H }), fetchCalls),
-    handshake: fakeHandshake({ S1: [invRow(W2H)] }, invCalls), // W1 required, W2 offered
+    fetcher: refusingFetch({ httpStatus: 400, code: 'WH400' }, fetchCalls, 7),
+    handshake: fakeHandshake({ S1: [invRow(W2H)] }, invCalls), // W1 required, W2 offered — the drift the shard itself now reports
     templateHashes: [W1H],
   });
-  eq('warning: template_missing (est_rows 0 — directory lane absent)', res.warnings, [{ shard: 'S1', code: 'template_missing', est_rows: 0, retried: false }]);
-  eq('shard excluded, never attempted', res.perShard, [{ shard: 'S1', ok: false, latencyMs: res.perShard[0]?.latencyMs, error: 'template_missing' }]);
+  eq('mapped refusal: template_missing class, WH400 detail KEPT, est_rows re-attached from the DIRECTORY lane (0 — no estimate; the transport estRows 7 never wins)', res.warnings, [{ shard: 'S1', code: 'template_missing', est_rows: 0, retried: false, detail: 'WH400' }]);
+  eq('shard POSTed then excluded (the fold: eligibility is enforced shard-side per call — the RT was happening anyway)', res.perShard, [{ shard: 'S1', ok: false, latencyMs: res.perShard[0]?.latencyMs, error: 'template_missing' }]);
   eq('coverage 0/1, partial', [res.coverage, res.partial], ['0/1', true]);
-  eq('LETHAL: wh_query fetch-call count == 0', fetchCalls, []);
-  eq('inventory read exactly once (no caching)', invCalls, ['S1']);
-  eq('merged output carries NOTHING from the excluded shard', res.rows, []);
+  eq('FOLDED law: the wh_query POST happened (the old "ZERO wh_query fetches" pin is inverted)', fetchCalls, ['S1']);
+  eq('unsampled steady state: ZERO inventory GETs (fixture qid bucket 14 ≠ 7)', invCalls, []);
+  eq('merged output carries NOTHING from the refused shard', res.rows, []);
 });
 
-Deno.test('LETHAL 1b: est_rows rides the directory row_estimate lane when available (§4.4)', async () => {
-  const res = await executeWhQuery({
-    ...execBase(GROUPED_REQ, [dirRow('S1', { rowEstimate: 123 })]),
-    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }]), []),
-    handshake: fakeHandshake({ S1: [] }, []), // inventory-empty => template_missing
-    templateHashes: [W1H],
-  });
-  eq('warning carries the shard est_rows=123 (degrade-vs-abort weight)', res.warnings, [{ shard: 'S1', code: 'template_missing', est_rows: 123, retried: false }]);
-});
-
-Deno.test('LETHAL 2: inventory row schema_version 2 vs directory table 3 => schema_mismatch, ZERO wh_query fetches', async () => {
+Deno.test('LETHAL 1b (folded): the mapped warning re-attaches est_rows from the directory row_estimate lane (§4.4 degrade-vs-abort weight)', async () => {
   const fetchCalls: string[] = [];
   const res = await executeWhQuery({
-    ...execBase(GROUPED_REQ, [dirRow('S1', { tableSchemaVersion: 3 })]),
+    ...execBase(GROUPED_REQ, [dirRow('S1', { rowEstimate: 123 })]),
+    fetcher: refusingFetch({ httpStatus: 400, code: 'WH400' }, fetchCalls, 999), // transport estRows 999 must NOT win
+    handshake: fakeHandshake({ S1: [] }, []), // wired but UNSED on the unsampled path
+    templateHashes: [W1H],
+  });
+  eq('warning carries the shard est_rows=123 (hand-computed directory lane; detail keeps WH400)', res.warnings, [{ shard: 'S1', code: 'template_missing', est_rows: 123, retried: false, detail: 'WH400' }]);
+  eq('the refusal POST happened first (folded law)', fetchCalls, ['S1']);
+});
+
+Deno.test('LETHAL 2 (folded, SAMPLED-FORCED): in-bucket qid fires the inventory GET; schema mismatch excludes PRE-execute (zero POSTs)', async () => {
+  const fetchCalls: string[] = [];
+  const invCalls: string[] = [];
+  const res = await executeWhQuery({
+    ...execBase(SAMPLED_REQ, [dirRow('S1', { tableSchemaVersion: 3 })]),
     fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }]), fetchCalls),
-    handshake: fakeHandshake({ S1: [invRow(W1H, { schema_version: 2 })] }, []),
+    handshake: fakeHandshake({ S1: [invRow(W1H, { schema_version: 2 })] }, invCalls),
     templateHashes: [W1H],
     tableSchemaVersion: 3,
   });
-  eq('schema_mismatch exclusion (ddl-wave gate at handshake, before any call)', res.warnings, [{ shard: 'S1', code: 'schema_mismatch', est_rows: 0, retried: false }]);
-  eq('LETHAL: wh_query fetch-call count == 0', fetchCalls, []);
+  eq('schema_mismatch exclusion at the fired sweep (before any call)', res.warnings, [{ shard: 'S1', code: 'schema_mismatch', est_rows: 0, retried: false }]);
+  eq('LETHAL: the fired sweep still gates — ZERO wh_query POSTs', fetchCalls, []);
+  eq('inventory GET fired exactly once (bucket 7)', invCalls, ['S1']);
   eq('coverage 0/1', res.coverage, '0/1');
 });
 
-Deno.test('LETHAL 3: plan limit 500 vs template max_rows 100 => max_rows_exceeded AND zero wh_query fetches (fail-fast BEFORE any call)', async () => {
+Deno.test('LETHAL 2 (folded, UNSAMPLED): the schema gate demotes to the ENVELOPE gate AFTER the POST (same plan, out-of-bucket qid)', async () => {
   const fetchCalls: string[] = [];
+  const invCalls: string[] = [];
+  const res = await executeWhQuery({
+    ...execBase(OUTBUCKET_REQ, [dirRow('S1', { tableSchemaVersion: 3 })]),
+    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { schemaVersion: 2 }), fetchCalls),
+    handshake: fakeHandshake({ S1: [invRow(W1H, { schema_version: 2 })] }, invCalls),
+    templateHashes: [W1H],
+    tableSchemaVersion: 3,
+  });
+  eq('schema_mismatch exclusion (consumption-site envelope gate — never merges, audit-B F5 accepted)', res.warnings, [{ shard: 'S1', code: 'schema_mismatch', est_rows: 0, retried: false }]);
+  eq('the POST happened first (unsampled: no inventory audit)', fetchCalls, ['S1']);
+  eq('ZERO inventory GETs (steady state)', invCalls, []);
+  eq('coverage 0/1', res.coverage, '0/1');
+});
+
+Deno.test('LETHAL 3 (manifest-source): limit 1001 > manifest max_rows 1000 => max_rows_exceeded refusal, ZERO shard POSTs, ZERO inventory (F15 with zero network)', async () => {
+  const fetchCalls: string[] = [];
+  const invCalls: string[] = [];
   const res = await executeWhQuery({
     ...execBase(parseWhEngineRequest({
       v: 1,
       qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
       table: 'orders',
-      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], limit: 500 },
+      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], limit: 1001 },
     }), [dirRow('S1')]),
     fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }]), fetchCalls),
-    handshake: fakeHandshake({ S1: [invRow(W1H, { max_rows: 100 })] }, []),
+    handshake: fakeHandshake({ S1: [invRow(W1H)] }, invCalls),
     templateHashes: [W1H],
   });
-  eq('max_rows_exceeded refusal', res.warnings, [{ shard: 'S1', code: 'max_rows_exceeded', est_rows: 0, retried: false }]);
-  eq('LETHAL: the wh_query fetch stub recorded NO /rpc/wh_query call', fetchCalls, []);
+  eq('max_rows_exceeded refusal (manifest-side — the pinned ENGINE_TEMPLATE_MANIFEST.max_rows is the refusal source now)', res.warnings, [{ shard: 'S1', code: 'max_rows_exceeded', est_rows: 0, retried: false }]);
+  eq('LETHAL: perShard latencyMs == 0 EXACTLY (no round trip happened — hand-computed law)', res.perShard, [{ shard: 'S1', ok: false, latencyMs: 0, error: 'max_rows_exceeded' }]);
+  eq('LETHAL: the wh_query fetch stub recorded NO call', fetchCalls, []);
+  eq('ZERO inventory GETs (the pre-refusal is mutually exclusive with the sampled sweep)', invCalls, []);
   eq('coverage 0/1, partial', [res.coverage, res.partial], ['0/1', true]);
 });
 
-Deno.test('LETHAL 3b: boundary — limit 100 == max_rows 100 passes the handshake and fans out (only strictly-greater refuses)', async () => {
+Deno.test('LETHAL 3b (manifest boundary): limit 1000 == manifest max_rows 1000 passes (only strictly-greater refuses) and the POST happens', async () => {
   const fetchCalls: string[] = [];
+  const invCalls: string[] = [];
   const res = await executeWhQuery({
     ...execBase(parseWhEngineRequest({
       v: 1,
       qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
       table: 'orders',
-      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], limit: 100 },
+      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], limit: 1000 },
     }), [dirRow('S1')]),
     fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { templateHash: W1H }), fetchCalls),
-    handshake: fakeHandshake({ S1: [invRow(W1H, { max_rows: 100 })] }, []),
+    handshake: fakeHandshake({ S1: [invRow(W1H, { max_rows: 1000 })] }, invCalls),
     templateHashes: [W1H],
   });
-  eq('eligible shard IS fetched (exactly once)', fetchCalls, ['S1']);
+  eq('boundary == included: the shard IS fetched (exactly once)', fetchCalls, ['S1']);
+  eq('unsampled: the sampled backstop never ran', invCalls, []);
   eq('no warnings, merged', [res.warnings, res.coverage], [[], '1/1']);
   eq('group merged (hand-computed: eu s=100n c=1)', res.rows, [{ k: ['eu'], aggs: { s: 100n, c: 1 } }]);
 });
@@ -810,27 +905,29 @@ Deno.test('LETHAL 6d: scalar partials carry no sentinel — truncated:false merg
   eq('scalar truncated:true — no F2 gate, still merges', [sentineled.warnings, sentineled.result], [[], { s: 50n, c: 5 }]);
 });
 
-Deno.test('LETHAL 7 (engine arm): wrong-shape inventory bodies fail CLOSED — template_missing, NEVER a throw', async () => {
+Deno.test('LETHAL 7 (folded engine arm, SAMPLED-FORCED): wrong-shape inventory bodies fail CLOSED — template_missing, NEVER a throw', async () => {
   for (const body of ['null', '{"keys":5}', '[null]', 'not json']) {
     const raw = jsonFetch(body as string).fetcher;
+    const fetchCalls: string[] = [];
     const res = await executeWhQuery({
-      ...execBase(GROUPED_REQ, [dirRow('S1')]),
-      fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }]), []),
+      ...execBase(SAMPLED_REQ, [dirRow('S1')]),
+      fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }]), fetchCalls),
       handshake: makeWhHandshake({ fetcher: raw, shardServiceKey: () => 'sk' }),
       templateHashes: [W1H],
     });
     eq(`inventory body ${body} => template_missing exclusion, no throw`, res.warnings.map((w) => w.code), ['template_missing']);
+    eq(`...the fired sweep still gates: ZERO POSTs`, fetchCalls, []);
     eq(`...coverage 0/1`, res.coverage, '0/1');
   }
 });
 
-Deno.test('fail_fast + handshake exclusions => NO 5xx (§5.2 exclusions degrade+warn, exempt from collect-then-fail)', async () => {
+Deno.test('fail_fast + SAMPLED handshake exclusions => NO 5xx (§5.2 exclusions degrade+warn, exempt from collect-then-fail)', async () => {
   const res = await executeWhQuery({
     ...execBase(parseWhEngineRequest({
       v: 1,
-      qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+      qid: SAMPLED_QID,
       table: 'orders',
-      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'] },
+      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], limit: 100 },
       coverage_mode: 'fail_fast',
     }), [dirRow('S1'), dirRow('S2')]),
     fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }]), []),
@@ -838,7 +935,7 @@ Deno.test('fail_fast + handshake exclusions => NO 5xx (§5.2 exclusions degrade+
     templateHashes: [W1H],
   });
   eq('response returned (no throw), coverage 1/2', [res.coverage, res.partial], ['1/2', true]);
-  eq('S2 carried as template_missing', res.warnings, [{ shard: 'S2', code: 'template_missing', est_rows: 0, retried: false }]);
+  eq('S2 carried as template_missing (the fired sweep\'s exclusion is fail_fast-exempt)', res.warnings, [{ shard: 'S2', code: 'template_missing', est_rows: 0, retried: false }]);
 });
 
 Deno.test('plan honesty: a template hash OUTSIDE the engine manifest is a 4xx BEFORE any network I/O', async () => {
@@ -861,35 +958,286 @@ Deno.test('plan honesty: a template hash OUTSIDE the engine manifest is a 4xx BE
   eq('ZERO wh_query fetches', fetchCalls, []);
 });
 
-Deno.test('eligible fleet: inventory once per shard per gather (no caching), fetches only eligible shards, hand-computed merge', async () => {
+Deno.test('eligible fleet (SAMPLED-FORCED): inventory once per shard per fired sweep (no caching), fetches only eligible shards, hand-computed merge; the SAME qid re-fires (stateless sampler)', async () => {
   const fetchCalls: string[] = [];
   const invCalls: string[] = [];
   const shards = [dirRow('S1'), dirRow('S2')];
-  const base = { ...execBase(GROUPED_REQ, shards), fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: s === 'S1' ? '100' : '200', c: 1 }], { templateHash: W1H }), fetchCalls) };
+  const base = { ...execBase(SAMPLED_REQ, shards), fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: s === 'S1' ? '100' : '200', c: 1 }], { templateHash: W1H }), fetchCalls) };
   const hs = fakeHandshake({ S1: [invRow(W1H)], S2: [invRow(W1H, { state: 'frozen' })] }, invCalls);
 
   const r1 = await executeWhQuery({ ...base, handshake: hs, templateHashes: [W1H] });
   eq('first gather: both shards fetched', fetchCalls, ['S1', 'S2']);
-  eq('first gather: inventory once per shard', invCalls, ['S1', 'S2']);
+  eq('first gather: inventory once per shard (the fired sweep sweeps the WHOLE selected population)', invCalls, ['S1', 'S2']);
   eq('coverage 2/2, not partial', [r1.coverage, r1.partial], ['2/2', false]);
   eq('hand-computed eu merge 100n+200n=300n, count 2', r1.rows, [{ k: ['eu'], aggs: { s: 300n, c: 2 } }]);
 
   await executeWhQuery({ ...base, handshake: hs, templateHashes: [W1H] });
-  eq('second gather re-reads the inventory (NO cross-call caching, §5.2)', invCalls, ['S1', 'S2', 'S1', 'S2']);
+  eq('second gather re-reads the inventory (NO cross-call caching, §5.2; the same qid re-fires — the sampler is stateless)', invCalls, ['S1', 'S2', 'S1', 'S2']);
   eq('second gather re-fetches (no memoized eligibility)', fetchCalls, ['S1', 'S2', 'S1', 'S2']);
 });
 
-Deno.test('mixed fleet: eligible shard fans out, ineligible degrades — coverage counts merged contributions only', async () => {
+Deno.test('mixed fleet (SAMPLED-FORCED): eligible shard fans out, ineligible degrades at the fired sweep — coverage counts merged contributions only', async () => {
   const res = await executeWhQuery({
-    ...execBase(GROUPED_REQ, [dirRow('S1', { rowEstimate: 10 }), dirRow('S2', { rowEstimate: 999999 })]),
+    ...execBase(SAMPLED_REQ, [dirRow('S1', { rowEstimate: 10 }), dirRow('S2', { rowEstimate: 999999 })]),
     fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: s === 'S1' ? '100' : '200', c: 1 }], { templateHash: W1H }), []),
     handshake: fakeHandshake({ S1: [invRow(W1H)], S2: [invRow(W1H, { schema_version: 4 })] }, []),
     templateHashes: [W1H],
     tableSchemaVersion: 3,
   });
-  eq('S2 schema_mismatch at handshake (inventory v4 vs table v3)', res.warnings, [{ shard: 'S2', code: 'schema_mismatch', est_rows: 999999, retried: false }]);
+  eq('S2 schema_mismatch at the fired sweep (inventory v4 vs table v3, est_rows from the directory lane)', res.warnings, [{ shard: 'S2', code: 'schema_mismatch', est_rows: 999999, retried: false }]);
   eq('only S1 merged', res.rows, [{ k: ['eu'], aggs: { s: 100n, c: 1 } }]);
   eq('coverage 1/2, partial', [res.coverage, res.partial], ['1/2', true]);
+});
+
+// =============================================================================
+// 7. r121 OPT-1b ADD groups (design §5 D6 ledger; B = manifest max_rows is
+//    covered by the LETHAL 3/3b rewrites above).
+// =============================================================================
+
+// ---- ADD #1 (§5.1): the mapping pin — THE mutation target (M1) ----
+Deno.test('r121 ADD (mapping pin, the mutation target): shard WH400 refusal maps to the FULL template_missing record — est_rows re-attached from the DIRECTORY lane, detail kept, latency measured', async () => {
+  const fetchCalls: string[] = [];
+  const invCalls: string[] = [];
+  const res = await executeWhQuery({
+    ...execBase(GROUPED_REQ, [dirRow('S1', { rowEstimate: 4242 })]),
+    fetcher: refusingFetch({ httpStatus: 400, code: 'WH400' }, fetchCalls, 999999), // transport estRows must LOSE to the directory lane
+    handshake: fakeHandshake({}, invCalls),
+    templateHashes: [W1H],
+  });
+  eq('FULL mapped exclusion record (byte-pinned; the transport estRows 999999 never wins)', res.warnings, [
+    { shard: 'S1', code: 'template_missing', est_rows: 4242, retried: false, detail: 'WH400' },
+  ]);
+  eqTrue('perShard: ok false, error template_missing, latencyMs > 0 (the refusal RT measured)', res.perShard.length === 1 && res.perShard[0]?.ok === false && (res.perShard[0]?.latencyMs ?? 0) > 0 && res.perShard[0]?.error === 'template_missing');
+  eq('unsampled: ZERO inventory GETs (the mapping IS the eligibility check)', invCalls, []);
+  eq('coverage 0/1, partial (degrade, never 5xx)', [res.coverage, res.partial], ['0/1', true]);
+});
+
+Deno.test('r121 ADD (mapping fail_fast twin): WH400 refusal => template_missing is EXEMPT from collect-then-fail (NO 5xx)', async () => {
+  const res = await executeWhQuery({
+    ...execBase(parseWhEngineRequest({
+      v: 1,
+      qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+      table: 'orders',
+      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'] },
+      coverage_mode: 'fail_fast',
+    }), [dirRow('S1', { rowEstimate: 5 })]),
+    fetcher: refusingFetch({ httpStatus: 400, code: 'WH400' }, [], 0),
+    templateHashes: [W1H],
+  });
+  eq('NO 5xx — the response returned (mapped refusal rides the exempt class)', res.coverage, '0/1');
+  eq('the mapped refusal warning (est_rows 5 from the directory lane, detail kept)', res.warnings, [
+    { shard: 'S1', code: 'template_missing', est_rows: 5, retried: false, detail: 'WH400' },
+  ]);
+});
+
+// ---- ADD #3 (§5.3): the sampler 4-part pin (mutation target M2) ----
+Deno.test('r121 ADD (sampler i+iv): qidSampleBucket determinism — hand-computed sha256(qid)[0]&15 vectors + the K_SAMPLING=7 import identity', async () => {
+  eq('K_SAMPLING is the exported constant 7', K_SAMPLING, 7);
+  // IN-BUCKET (fire): sha256 first bytes 0x97 / 0x17 / 0xd7 / 0x97 → &15 = 7
+  for (const [qid, want] of [['skip-me', 7], ['r121-sample-26', 7], ['r121-sample-68', 7], ['r121-sample-76', 7]] as const) {
+    eq(`bucket('${qid}') === ${want} (in-bucket, FIRES)`, await qidSampleBucket(qid), want);
+  }
+  // OUT-BUCKET (never fires): 0xb0→0, 0xb8→8, 0x8d→13, 0x2f→15, 0xc5→5.
+  // NOTE: 'r121-sample-5' was listed in-bucket in the leg-1 brief, but the
+  // real Web Crypto sha256 first byte is 0xb0 → bucket 0 — pinned at the
+  // TRUE computed value (defect noted in the ledger report).
+  for (const [qid, want] of [['r121-sample-5', 0], ['r121-in-1', 8], ['r121-skip-0', 13], ['r121-skip-1', 15], ['qid-7', 5]] as const) {
+    eq(`bucket('${qid}') === ${want} (out-bucket, never fires)`, await qidSampleBucket(qid), want);
+  }
+  eqTrue('the fired bucket IS the pinned constant (predicate identity)', (await qidSampleBucket('skip-me')) === K_SAMPLING);
+});
+
+Deno.test('r121 ADD (sampler iii): statelessness — the same qid always yields the same bucket/decision (no isolate state, recycle-safe)', async () => {
+  const a = await qidSampleBucket('skip-me');
+  const b = await qidSampleBucket('skip-me');
+  eq('in-bucket qid: repeat computation identical', a, b);
+  const c = await qidSampleBucket('r121-in-1');
+  const d = await qidSampleBucket('r121-in-1');
+  eq('out-bucket qid: repeat computation identical', c, d);
+  eqTrue('the out-bucket qid genuinely differs from the fired bucket', c !== K_SAMPLING);
+});
+
+Deno.test('r121 ADD (sampler ii, recording fake): in-bucket qid => inventory GET fired EXACTLY once per shard; out-bucket => ZERO GETs (POSTs ride unchanged)', async () => {
+  const invIn: string[] = [];
+  const fetchIn: string[] = [];
+  await executeWhQuery({
+    ...execBase(SAMPLED_REQ, [dirRow('S1'), dirRow('S2')]),
+    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { templateHash: W1H }), fetchIn),
+    handshake: fakeHandshake({ S1: [invRow(W1H)], S2: [invRow(W1H)] }, invIn),
+    templateHashes: [W1H],
+  });
+  eq('in-bucket: one inventory GET per shard (the sampled backstop sweeps the whole population)', invIn, ['S1', 'S2']);
+  eq('in-bucket: eligible verdicts fan out (one POST per shard)', fetchIn, ['S1', 'S2']);
+
+  const invOut: string[] = [];
+  const fetchOut: string[] = [];
+  await executeWhQuery({
+    ...execBase(OUTBUCKET_REQ, [dirRow('S1'), dirRow('S2')]),
+    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { templateHash: W1H }), fetchOut),
+    handshake: fakeHandshake({ S1: [invRow(W1H)], S2: [invRow(W1H)] }, invOut),
+    templateHashes: [W1H],
+  });
+  eq("out-bucket: ZERO inventory GETs (the fold's steady state)", invOut, []);
+  eq('out-bucket: POSTs happen unchanged', fetchOut, ['S1', 'S2']);
+});
+
+// ---- ADD #4 (§5.4): the phases pin ----
+Deno.test('r121 ADD (phases pin): injected counting timers — pre_chain threaded, handshake_ms == 0 unsampled / > 0 sampled, fanout_ms measured; phases ABSENT on error envelopes; present on the empty-selection success', async () => {
+  const okEnv = countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { templateHash: W1H }), []);
+
+  // (1) UNSAMPLED success: exact hand-computed pre_chain (threaded), handshake 0, fanout measured.
+  const res1 = await executeWhQuery({
+    ...execBase(OUTBUCKET_REQ, [dirRow('S1')]),
+    timers: stepTimers(),
+    fetcher: okEnv,
+    templateHashes: [W1H],
+    timings: { preChainMs: 123 },
+  });
+  eq('unsampled: pre_chain_ms is the ENTRYPOINT-THREADED value (exact 123)', res1.phases?.pre_chain_ms, 123);
+  eq('unsampled: handshake_ms == 0 (the fold steady state)', res1.phases?.handshake_ms, 0);
+  eqTrue('unsampled: fanout_ms measured (>= one counting step — the runFanout block wall)', (res1.phases?.fanout_ms ?? 0) >= 1);
+
+  // (2) SAMPLED success: handshake_ms > 0 (the fired sweep is measured).
+  const res2 = await executeWhQuery({
+    ...execBase(SAMPLED_REQ, [dirRow('S1')]),
+    timers: stepTimers(),
+    fetcher: okEnv,
+    handshake: fakeHandshake({ S1: [invRow(W1H)] }, []),
+    templateHashes: [W1H],
+    timings: { preChainMs: 123 },
+  });
+  eq('sampled: pre_chain_ms still the threaded 123', res2.phases?.pre_chain_ms, 123);
+  eqTrue('sampled: handshake_ms > 0 (the fired sweep block measured)', (res2.phases?.handshake_ms ?? 0) > 0);
+  eqTrue('sampled: fanout_ms >= 0', (res2.phases?.fanout_ms ?? -1) >= 0);
+
+  // (3) ERROR envelope: fail_fast 5xx — phases can never ride it (post-assembly injection is bypassed by the throw).
+  let threw: unknown = null;
+  try {
+    await executeWhQuery({
+      ...execBase(parseWhEngineRequest({
+        v: 1,
+        qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+        table: 'orders',
+        query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'] },
+        coverage_mode: 'fail_fast',
+      }), [dirRow('S1')]),
+      timers: stepTimers(),
+      fetcher: refusingFetch({ httpStatus: 400, code: 'WH402' }, [], 0),
+      templateHashes: [W1H],
+    });
+  } catch (err) {
+    threw = err;
+  }
+  eq('fail_fast threw WhEngineError internal', threw instanceof WhEngineError && (threw as WhEngineError).code, 'internal');
+  eqTrue('phases ABSENT on the error payload', threw !== null && !('phases' in (threw as object)));
+
+  // (4) EMPTY-SELECTION success: phases present with EXACT zeros for the never-ran blocks.
+  const pruneCols: Record<string, string> = { region: 'text', amount: 'numeric', created_at: 'timestamptz' };
+  const prunedFleet = [
+    { ...dirRow('S1'), key_min: '2026-01-01', key_max: '2026-06-30' },
+    { ...dirRow('S2'), key_min: '2026-07-01', key_max: '2026-12-31' },
+  ];
+  const res4 = await executeWhQuery({
+    req: parseWhEngineRequest({
+      v: 1,
+      qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+      table: 'orders',
+      query: {
+        select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }],
+        groupBy: ['region'],
+        where: [{ col: 'created_at', op: 'lt', value: '2025-06-30' }], // prunes BOTH shards (hi < key_min on every row)
+      },
+    }),
+    columnTypes: pruneCols,
+    columnScales: SCALES,
+    directoryRows: prunedFleet,
+    shardKeyColumn: 'created_at',
+    shardKeyType: 'range',
+    directoryVersion: 7,
+    timers: stepTimers(),
+    fetcher: okEnv,
+    timings: { preChainMs: 123 },
+  });
+  eq('empty-selection success carries the EXACT phases {123, 0, 0} (hand-computed: the handshake/fanout blocks never ran)', res4.phases, { pre_chain_ms: 123, handshake_ms: 0, fanout_ms: 0 });
+  eq('empty coverage 0/0', res4.coverage, '0/0');
+});
+
+// ---- ADD #5 (§5.5): the empty-hash guard pin ----
+Deno.test('r121 ADD (empty-hash guard): an UNTEMPLATED plan fires ZERO inventory GETs even with an in-bucket qid (the vacuous audit is retired)', async () => {
+  const fetchCalls: string[] = [];
+  const invCalls: string[] = [];
+  const res = await executeWhQuery({
+    ...execBase(SAMPLED_REQ, [dirRow('S1'), dirRow('S2')]), // in-bucket qid + limit present — only the hash guard can block
+    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }]), fetchCalls),
+    handshake: fakeHandshake({}, invCalls),
+    // templateHashes ABSENT — the untemplated plan (templateHashes.length === 0)
+  });
+  eq('ZERO inventory GETs regardless of the bucket (the planRef.templateHashes.length > 0 guard)', invCalls, []);
+  eq('the fan-out proceeded normally (no gate on an untemplated plan)', fetchCalls, ['S1', 'S2']);
+  eq('no warnings, full coverage', [res.warnings, res.coverage], [[], '2/2']);
+});
+
+// ---- ADD #6 (§5.6): the unmapped fail_fast pin (unchanged-class byte-pins) ----
+Deno.test('r121 ADD (unmapped classes byte-pin): WH402/WH403 stay excluded; 5xx/network keep the transport class — the mapping never re-masks', () => {
+  eq('WH402 (hash-shape) => {excluded, detail WH402} — NOT template_missing', classifyFetchFailure({ httpStatus: 400, code: 'WH402' }), { code: 'excluded', detail: 'WH402' });
+  eq('WH403 (registry integrity) => {excluded, detail WH403}', classifyFetchFailure({ httpStatus: 400, code: 'WH403' }), { code: 'excluded', detail: 'WH403' });
+  eq('WH500 riding 5xx => http_5xx (transport class wins, never re-masked)', classifyFetchFailure({ httpStatus: 503, code: 'WH500' }), { code: 'http_5xx', stamped: false, detail: 'WH500' });
+  eq('WH400 riding 5xx => http_5xx + WH400 detail (the refusal code never masks a 5xx — design §1.3a more-honest law)', classifyFetchFailure({ httpStatus: 502, code: 'WH400' }), { code: 'http_5xx', stamped: false, detail: 'WH400' });
+  eq('network => network', classifyFetchFailure({ code: 'network' }), { code: 'network' });
+});
+
+Deno.test('r121 ADD (unmapped fail_fast): WH402 refusal => excluded => fail_fast 5xx (unchanged class, collect-then-fail)', async () => {
+  let threw: unknown = null;
+  try {
+    await executeWhQuery({
+      ...execBase(parseWhEngineRequest({
+        v: 1,
+        qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+        table: 'orders',
+        query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'] },
+        coverage_mode: 'fail_fast',
+      }), [dirRow('S1')]),
+      fetcher: refusingFetch({ httpStatus: 400, code: 'WH402' }, [], 0),
+      templateHashes: [W1H],
+    });
+  } catch (err) {
+    threw = err;
+  }
+  eq('fail_fast 5xx (excluded is NOT exempt — only template_missing/schema_mismatch/max_rows_exceeded are)', threw instanceof WhEngineError && (threw as WhEngineError).code, 'internal');
+  eq('perShard carries the excluded classification', (threw as WhEngineError).perShard, [
+    { shard: 'S1', ok: false, latencyMs: (threw as WhEngineError).perShard?.[0]?.latencyMs, error: 'excluded' },
+  ]);
+});
+
+// ---- ADD #7 (§5.7): the F2-clamp-under-drift pin (documented vocabulary case) ----
+Deno.test('r121 ADD (F2-clamp-under-drift): registry max_rows < manifest — the sampled sweep sees the drift, the shard CLAMPS (truncated:true) and F2 codes truncated_groupby', async () => {
+  const fetchCalls: string[] = [];
+  const invCalls: string[] = [];
+  const res = await executeWhQuery({
+    ...execBase(parseWhEngineRequest({
+      v: 1,
+      qid: SAMPLED_QID,
+      table: 'orders',
+      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], limit: 500 },
+    }), [dirRow('S1')]),
+    // The shard executes, its sentinel clamps at the REGISTRY cap (500 < the
+    // 800 groups the data would yield) and stamps truncated:true.
+    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { truncated: true, rowCountOverride: 800, templateHash: W1H }), fetchCalls),
+    // Registry drift: the live inventory pins max_rows 500 (manifest says 1000).
+    handshake: fakeHandshake({ S1: [invRow(W1H, { max_rows: 500 })] }, invCalls),
+    templateHashes: [W1H],
+  });
+  eq('sampled sweep read the drifted registry (one GET; K 500 == registry max_rows 500 stays ELIGIBLE at the boundary)', invCalls, ['S1']);
+  eq('the POST happened (manifest 1000 >= 500 — no pre-refusal on the manifest lane)', fetchCalls, ['S1']);
+  eq('the clamped partial NEVER merges: F2 truncated_groupby, est_rows partial-derived 800 (the §6.3 F2 vocabulary under drift)', res.warnings, [{
+    shard: 'S1',
+    code: 'truncated_groupby',
+    est_rows: 800,
+    retried: false,
+    detail: 'grouped partial carries the truncation sentinel (truncated=true) — never silently merged (§6.3 F2)',
+  }]);
+  eq('coverage 0/1, partial', [res.coverage, res.partial], ['0/1', true]);
+  eq('rows carry nothing from the clamped shard', res.rows, []);
 });
 
 // -----------------------------------------------------------------------------

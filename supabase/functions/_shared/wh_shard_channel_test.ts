@@ -1260,14 +1260,16 @@ Deno.test('r69 battery core: limit echo rides the rpc target p_params; limit:nul
   eqTrue('no limit key at all', nul.seen.every((t) => !('limit' in (t.rpc?.p_params as Record<string, unknown>))));
 });
 
-Deno.test('r69 battery core: whCode survives classify into warnings[].detail on BOTH arms (AM-5/F-N2 unit pins)', () => {
+Deno.test('r69 battery core: whCode survives classify into warnings[].detail on BOTH arms (AM-5/F-N2 unit pins) — r121: WH400/WH401 MAP to template_missing', () => {
   // Hand-computed: the generic-http arm computes {code:'excluded', detail:
   // 'http <n>'} / the 402/429/5xx arms their own outcomes — then the ONE
   // additive post-branch step replaces detail with the WH code. The branch
   // ORDER is untouched (402/429 still classify first) and the lift covers
-  // BOTH arms (F-N2).
-  eq('400-class: {excluded, detail WH400} (the generic-http detail is REPLACED, not appended)', classifyFetchFailure({ httpStatus: 400, code: 'WH400' }), { code: 'excluded', detail: 'WH400' });
-  eq('401-class: {excluded, detail WH401}', classifyFetchFailure({ httpStatus: 401, code: 'WH401' }), { code: 'excluded', detail: 'WH401' });
+  // BOTH arms (F-N2). r121 OPT-1b (design §1.3): the WH400/WH401 arms now MAP
+  // to the §5.2-exempt template_missing class (detail KEPT, scoped to the
+  // generic-4xx/code-only excluded arms); WH402/WH403 stay excluded.
+  eq('400-class: {template_missing, detail WH400} (the r121 mapped-refusal record — unit-level)', classifyFetchFailure({ httpStatus: 400, code: 'WH400' }), { code: 'template_missing', detail: 'WH400' });
+  eq('401-class: {template_missing, detail WH401}', classifyFetchFailure({ httpStatus: 401, code: 'WH401' }), { code: 'template_missing', detail: 'WH401' });
   eq('402 arm: http_402 FIRST, then the lift (order untouched, both arms enriched)', classifyFetchFailure({ httpStatus: 402, code: 'WH402' }), { code: 'http_402', detail: 'WH402' });
   eq('429 arm: http_429 + the lift', classifyFetchFailure({ httpStatus: 429, code: 'WH429' }), { code: 'http_429', detail: 'WH429' });
   eq('5xx arm: http_5xx + stamped rides + WH500 detail (the shard-integrity alarm class, AM-12)', classifyFetchFailure({ httpStatus: 503, stamped: true, code: 'WH500' }), { code: 'http_5xx', stamped: true, detail: 'WH500' });
@@ -1295,13 +1297,16 @@ Deno.test('r69 battery core: whCode + stamped ride the engine outcome through th
     }));
   // 400-class: the WH body code is the DETAIL CARRIER — classify lifts it
   // onto warnings[].detail (the generic-http arm would otherwise eat it).
+  // r121 OPT-1b: WH400 maps to the EXEMPT template_missing class (detail
+  // kept; est_rows re-attached from the directory lane — these fixtures
+  // carry no row_estimate, so 0), and the exclusion degrades, never 5xxs.
   const r400 = await run({ status: 400, body: '{"code":"WH400","message":"bad template"}' });
-  eq('400 WH400: the warning detail IS the shard code (both-arms lift)', r400.warnings, [
-    { shard: 'shard-a', code: 'excluded', est_rows: 0, retried: false, detail: 'WH400' },
+  eq('400 WH400: mapped to template_missing with the shard code as detail (r121 record)', r400.warnings, [
+    { shard: 'shard-a', code: 'template_missing', est_rows: 0, retried: false, detail: 'WH400' },
   ]);
   eq('the honest shard still merges', [r400.coverage, r400.partial], ['1/2', true]);
-  eq('perShard carries the classified error', r400.perShard.map((p) => ({ shard: p.shard, ok: p.ok, error: p.error })), [
-    { shard: 'shard-a', ok: false, error: 'excluded' },
+  eq('perShard carries the mapped error', r400.perShard.map((p) => ({ shard: p.shard, ok: p.ok, error: p.error })), [
+    { shard: 'shard-a', ok: false, error: 'template_missing' },
     { shard: 'shard-b', ok: true, error: null },
   ]);
   // 5xx-with-json: stamped rides perShard (AM-12: the §5.3 page doctrine

@@ -341,31 +341,72 @@ async function queryPathPins(): Promise<void> {
     eq('perShard present and healthy', gj.perShard.map((p: { shard: string; ok: boolean }) => [p.shard, p.ok]), [['shard-a', true], ['shard-b', true]]);
     eq('fetcher saw mapped shards (P0-2: project_ref->shard)', seen, ['shard-a', 'shard-b']);
 
-    // r44 §5.2 plumbing pin: a wired handshake dep reaches executeWhQuery.
-    // The plan here declares NO template hashes (the §2.0 select path), so
-    // the handshake's required-hashes check is vacuously ELIGIBLE by design
-    // (the wh_query plane is where hashes bite — exclusion arms with real
-    // hashes live in wh_handshake_test.ts). What this pin proves: the
-    // handshake runs ONCE per candidate shard BEFORE any wh_query call, an
-    // eligible verdict lets fan-out proceed unchanged, and the response is
-    // the normal merge (no warning, no 5xx).
+    // r44 §5.2 plumbing pin — RE-WRITTEN r121 OPT-1b (the fold): the
+    // per-query inventory sweep is GONE from the critical path. Two folded
+    // arms:
+    //   (a) the DEFAULT hashless plan (table orders derives no templates):
+    //       the EMPTY-HASH guard means ZERO inventory reads at ANY qid —
+    //       the vacuous select-path audit is retired (design §1.6) — and
+    //       the fan-out proceeds unchanged (200, normal merge).
+    //   (b) a TEMPLATED plan (wh_probe_agg scalar min/count(col) derives
+    //       {W2}) with an IN-BUCKET qid + limit: the SAMPLED backstop fires,
+    //       reads the inventory ONCE per candidate shard BEFORE any
+    //       wh_query call, and an eligible verdict lets fan-out proceed.
     const hsSeen: string[] = [];
     const hsDeps = makeDeps({
       fetcher: okFetch((s) => scalarEnv(s, 'orders'), hsSeen),
       handshake: {
         readTemplateInventory: async (shard: string): Promise<TemplateInventoryRow[]> => {
           hsSeen.push(`inv:${shard}`);
-          return []; // vacuously-eligible inventory for a hashless plan
+          return [];
         },
       },
     });
     const hsRes = await handleWhEngineRequest(req('/query', { method: 'POST', body: COUNT_REQ }), hsDeps.deps);
-    eq('handshake-wired query still 200 (eligible verdict, normal merge)', hsRes.status, 200);
+    eq('handshake-wired hashless query still 200 (normal merge)', hsRes.status, 200);
     const hj = await hsRes.json();
-    eq('hashless-plan handshake exclusion does NOT fire', hj.warnings, []);
-    eq('coverage 2/2 complete (eligible verdict => normal fan-out)', [hj.coverage, hj.partial], ['2/2', false]);
-    eq('handshake ran per candidate shard, BEFORE any wh_query call (once, no caching)', hsSeen, ['inv:shard-a', 'inv:shard-b', 'shard-a', 'shard-b']);
-    eq('handshake ran exactly once per shard (no duplicate inventory reads)', hsSeen.filter((s: string) => s.startsWith('inv:')).length, 2);
+    eq('folded default: ZERO inventory reads on the hashless plan (empty-hash guard — the per-query sweep is retired)', hsSeen, ['shard-a', 'shard-b']);
+    eq('folded default: no warnings, coverage 2/2 complete', [hj.warnings, hj.coverage, hj.partial], [[], '2/2', false]);
+
+    const hsSeen2: string[] = [];
+    const w2Hash = 'a095adaa148253aee8d1cc8e976f01b3579beeea5082f3862df4a908c20b2659'; // W2 (manifest schema_version 1)
+    const hsDeps2 = makeDeps({
+      rows: [dirRow('shard-a', 'wh_probe_agg', { schemaVersion: 1 }), dirRow('shard-b', 'wh_probe_agg', { schemaVersion: 1 })],
+      fetcher: okFetch((s) => ({
+        v: 1,
+        shard: s,
+        table: 'wh_probe_agg',
+        schema_version: 1,
+        partial: {
+          kind: 'scalar',
+          aggs: { m: { op: 'min', col: 'amount' }, c: { op: 'count', col: 'amount' } },
+          rows: [{ k: [], a: { m: '5', c: 2 } }],
+          rowCount: 1,
+          more: false,
+        },
+      } as unknown as WhPartialEnvelope), hsSeen2),
+      handshake: {
+        readTemplateInventory: async (shard: string): Promise<TemplateInventoryRow[]> => {
+          hsSeen2.push(`inv:${shard}`);
+          return [{ template_hash: w2Hash, qc_class: 'QC2', logical_table: 'wh_probe_agg', schema_version: 1, state: 'active', max_rows: 1000 }];
+        },
+      },
+    });
+    const SAMPLED_TEMPLATED_REQ = {
+      v: 1,
+      qid: 'skip-me', // sha256('skip-me')[0] = 0x97 → &15 = 7 = K_SAMPLING (hand-computed leg-1 vector)
+      table: 'wh_probe_agg',
+      column_types: { amount: 'numeric' }, // the client-declared type channel (erratum §4.3) — the agg needs it
+      column_scales: { amount: 0 },
+      query: { select: [{ op: 'min', col: 'amount', alias: 'm' }, { op: 'count', col: 'amount', alias: 'c' }], limit: 10 },
+    };
+    const hsRes2 = await handleWhEngineRequest(req('/query', { method: 'POST', body: SAMPLED_TEMPLATED_REQ }), hsDeps2.deps);
+    eq('sampled templated query still 200 (eligible verdict, normal merge)', hsRes2.status, 200);
+    const hj2 = await hsRes2.json();
+    eq('SAMPLED: inventory once per candidate shard, BEFORE any wh_query call (folded order pin, in-bucket qid)', hsSeen2, ['inv:shard-a', 'inv:shard-b', 'shard-a', 'shard-b']);
+    eq('SAMPLED: exactly one inventory read per shard (no duplicates)', hsSeen2.filter((s: string) => s.startsWith('inv:')).length, 2);
+    eq('SAMPLED: coverage 2/2, no warnings', [hj2.coverage, hj2.warnings], ['2/2', []]);
+    eq('SAMPLED: hand-computed scalar merge through the wire (min bigint serialized "5", count 2+2=4)', hj2.result, { m: '5', c: 4 });
 
     // P0-3: the per-table projection — a query for orders must never fan out
     // over events-only shards (and vice versa), even though readDirectory
@@ -774,8 +815,8 @@ async function rywFlipPins(): Promise<void> {
     const rOnDefault = await handleWhEngineRequest(req('/query', { method: 'POST', body: COUNT_REQ }), dOnDefault);
     const keysOn = Object.keys((await rOnDefault.json()) as Record<string, unknown>).sort();
     eq('default path key set identical in both lever states (additive-only)', keysOn, keysOff);
-    eq('default path key set is the pre-r57 envelope (no new fields)', keysOff, [
-      'coverage', 'coverage_ratio', 'directory_version', 'latency_ms', 'partial', 'perShard', 'qid', 'result', 'v', 'warnings',
+    eq('default path key set is the r121 envelope (the fold adds EXACTLY `phases` to the r57 set)', keysOff, [
+      'coverage', 'coverage_ratio', 'directory_version', 'latency_ms', 'partial', 'perShard', 'phases', 'qid', 'result', 'v', 'warnings',
     ]);
 
     // ---- static wiring pins: the lever's single read site ----
