@@ -90,7 +90,7 @@ Full wire contract: [API.md](API.md).
 ## Known gaps (v0.1.1)
 
 - **Base-schema prerequisite (engine host):** migration `0013` references `public.projects(id)` / `public.orgs(id)` / `public.config`, which come from the **platform base schema** (applied when the project was provisioned for the fleet-manager family of engines). On a truly fresh project where those objects never existed, `0013` fails with `42P01` (undefined table) unless the base schema is applied first — `scripts/migrate.sh`'s header documents this, and the runner's `verify_migrations` assumes the base objects exist too.
-- **Geo legs fail-closed** until the geo control-plane migration (`0017`) lands: absent geo rows ⇒ write plans `503 read_only_mode`, replica-plane deps fail closed to primary, unwired fence ⇒ `500` on write plans. No geo migrations ship in 0.1.0.
+- **Geo legs fail-closed** until the geo control-plane migration (`0017`) lands: absent geo rows ⇒ write plans `503 read_only_mode`, replica-plane deps fail closed to primary, unwired fence ⇒ `500` on write plans. No geo migrations ship in this release.
 - `POST /query` is the pinned pre-flip 500 (ships disabled, above) — the real shard fetcher lands after live probes #1/#2.
 
 ## Repo map

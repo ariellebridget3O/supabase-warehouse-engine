@@ -126,10 +126,12 @@ MGMT_API_BASE="https://api.supabase.com"
 MGMT_LAST_ERROR=""
 MGMT_RESPONSE_FILE=""
 MGMT_HEADERS_FILE=""
-# Shard mode flag: set to 1 by the standalone entry's --shard (or by a library
-# caller before collect_migrations/apply_all_migrations). It (a) lets the
-# collect_migrations() directory guard accept db/shard-migrations/ and (b)
-# marks the standalone apply flow to SKIP verify_migrations (engine-scoped).
+# Shard mode flag: set to 1 by the standalone entry's --shard (a library
+# caller may also export it before collect_migrations/apply_all_migrations).
+# It (a) lets the collect_migrations() directory guard accept db/shard-migrations/.
+# The standalone APPLY flow's verify_migrations skip is keyed off SHARD (set by
+# the --shard flag itself), NOT off this variable — a library caller setting
+# only WHE_SHARD_MODE gets the guard disable alone (verify stays engine-scoped).
 WHE_SHARD_MODE="${WHE_SHARD_MODE:-0}"
 # ---------- splitter ----------------------------------------------------------
 # sql_split <file> — stdout: statements separated by ASCII 0x1e (see .awk).
@@ -271,7 +273,6 @@ run_sql_file() {
 # convention triggers a loud warning rather than a silent mis-ordering.
 MIGRATION_FILES=()
 collect_migrations() {
-  local f raw=() shard_dir_probe=""
   local f raw=() shard_dir_probe=""
   # DIRECTORY SAFETY GUARD: this runner globs ONE migration tree per run.
   # Engine mode (default) applies the ENGINE project's own migrations from
