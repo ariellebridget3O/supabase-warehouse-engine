@@ -521,13 +521,16 @@ async function readerPins(): Promise<void> {
 function staticPins(): void {
   console.log('static pins (shell wiring only — fleet-api discovery stays in fleet-manager)');
   ok('index.ts keeps the deploy gate (hasRealFetcher rides the FLIP constant)',
-    indexSrc.includes('hasRealFetcher: FLIP_hasRealFetcher') && FLIP_hasRealFetcher === false,
-    'gate line absent or the constant was flipped');
+    indexSrc.includes('hasRealFetcher: FLIP_hasRealFetcher') && FLIP_hasRealFetcher === true,
+    'gate line absent or the constant was reverted to the pre-r118 stub state');
   // r69 (design_r69_shard_channel.md §5 statics): the probe-gated stub is
   // DELETED and replaced by the RPC real fetcher over the shard key channel —
   // the old source-text stub-message pin flips to the DELETION pin. The gate
-  // itself stays false and byte-identical (pin above; the entrypoint's own
-  // gate message is pinned by geo_write_fence_test.ts:702 and is UNTOUCHED).
+  // constant is FLIPPED TRUE r118 (design_r118_realfetcher_flip.md §3b — all
+  // flip conditions met; pin above discriminates a revert to false). The
+  // entrypoint's own gate message is pinned by geo_write_fence_test.ts:702
+  // and is UNTOUCHED (still reachable via the deps.hasRealFetcher=false
+  // override path).
   ok('index.ts stub is deleted — the r69 RPC real fetcher over the shard channel is wired',
     !indexSrc.includes('makeRealFetcher') &&
     !indexSrc.includes('real shard fetcher lands after live probes') &&

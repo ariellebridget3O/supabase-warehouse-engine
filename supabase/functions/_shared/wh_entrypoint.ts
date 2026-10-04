@@ -83,7 +83,10 @@ export function rywGateEnabledFromEnv(raw: string | undefined): boolean {
 
 /**
  * r44 FLIP_hasRealFetcher — the SINGLE flip site for the §4.1 deploy gate.
- * Stays FALSE this round (do NOT flip).
+ * FLIPPED TRUE r118 (design_r118_realfetcher_flip.md §3b): all three gate
+ * conditions were met — real fetcher frozen r69, PAT wall down (PAT alive
+ * 68 rounds), probes #1/#2/#3 green (r59 PAT-only battery + r118 PostgREST
+ * service-key re-proof).
  *
  * Flip to true ONLY when ALL of the following hold (scatter §9 probe ladder):
  *   1. the REAL shard fetcher is frozen in — the QC2 compile is design-frozen
@@ -99,7 +102,7 @@ export function rywGateEnabledFromEnv(raw: string | undefined): boolean {
  * change to this constant — never a deploy-time env — so the flip lands on
  * a reviewed diff.
  */
-export const FLIP_hasRealFetcher = false;
+export const FLIP_hasRealFetcher = true;
 
 export interface WhEngineDeps {
   /** Cheap config probe for the current directory version (§4.6 verify chain input). */
