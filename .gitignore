@@ -1,0 +1,45 @@
+# ---- Secrets & env ----
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+master-password.txt
+
+# ---- Supabase CLI local state ----
+.supabase/
+supabase/.branches
+supabase/.temp
+
+# ---- Node / Deno ----
+node_modules/
+deno.lock
+.npm/
+.yarn/
+
+# ---- Build / dist ----
+dist/
+build/
+out/
+.next/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# ---- Logs ----
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# ---- Test artifacts ----
+coverage/
+.nyc_output/
+
+# ---- Local snapshots / dumps ----
+*.dump
+*.sql.gz
+backups/

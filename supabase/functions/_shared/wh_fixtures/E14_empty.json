@@ -1,0 +1,18 @@
+{
+  "id": "E14_empty_fleet",
+  "doc": "findings_wh_scatter_gather.md §8 E14 — WHERE 1=0 over the fleet: sum NULL (not 0), count 0; every shard still answers one scalar row",
+  "table": "orders",
+  "shards": {
+    "S1": [],
+    "S2": [],
+    "S3": []
+  },
+  "query": {
+    "groupKeys": [],
+    "aggs": {
+      "s": { "op": "sum", "col": "amount", "colPlan": { "col": "amount", "type": "numeric", "scale": 0 } },
+      "c": { "op": "count" }
+    }
+  },
+  "expected": { "s": null, "c": 0 }
+}

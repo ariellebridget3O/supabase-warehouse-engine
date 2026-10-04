@@ -1,0 +1,14 @@
+{
+  "id": "E7_min_allnull_shard",
+  "doc": "findings_wh_scatter_gather.md §8 E7 — MIN: shard-null partial is the identity, not a value; all-NULL fleet stays NULL",
+  "table": "items",
+  "shards": {
+    "S1": [ { "price": "5" }, { "price": "7" } ],
+    "S2": [ { "price": null }, { "price": null } ]
+  },
+  "query": {
+    "groupKeys": [],
+    "aggs": { "m": { "op": "min", "col": "price", "colPlan": { "col": "price", "type": "int8" } } }
+  },
+  "expected": { "m": 5 }
+}

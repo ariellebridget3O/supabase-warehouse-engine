@@ -1,0 +1,34 @@
+{
+  "id": "E1_3shard_groupby",
+  "doc": "findings_wh_scatter_gather.md §8 E1 — 3-shard GROUP BY region, sum(amount)+count(*)",
+  "table": "orders",
+  "shards": {
+    "S1": [
+      { "region": "eu", "amount": "100" }, { "region": "eu", "amount": "100" }, { "region": "eu", "amount": "100" },
+      { "region": "eu", "amount": "100" }, { "region": "eu", "amount": "100" }, { "region": "eu", "amount": "100" },
+      { "region": "us", "amount": "100" }, { "region": "us", "amount": "100" }, { "region": "us", "amount": "100" }
+    ],
+    "S2": [
+      { "region": "eu", "amount": "100" }, { "region": "eu", "amount": "100" },
+      { "region": "eu", "amount": "100" }, { "region": "eu", "amount": "100" },
+      { "region": "ap", "amount": "50" }
+    ],
+    "S3": [
+      { "region": "us", "amount": "100" }, { "region": "us", "amount": "100" }, { "region": "us", "amount": "100" },
+      { "region": "us", "amount": "100" }, { "region": "us", "amount": "100" }, { "region": "us", "amount": "100" },
+      { "region": "us", "amount": "100" }
+    ]
+  },
+  "query": {
+    "groupKeys": [{ "col": "region", "type": "text" }],
+    "aggs": {
+      "s": { "op": "sum", "col": "amount", "colPlan": { "col": "amount", "type": "numeric", "scale": 0 } },
+      "c": { "op": "count" }
+    }
+  },
+  "expected": [
+    { "k": ["ap"], "aggs": { "s": 50, "c": 1 } },
+    { "k": ["eu"], "aggs": { "s": 1000, "c": 10 } },
+    { "k": ["us"], "aggs": { "s": 1000, "c": 10 } }
+  ]
+}

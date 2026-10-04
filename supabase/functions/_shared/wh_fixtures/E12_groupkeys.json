@@ -1,0 +1,19 @@
+{
+  "id": "E12_null_empty_nullstring",
+  "doc": "findings_wh_scatter_gather.md §8 E12 — GROUP BY keeps null, '' and 'null' pairwise distinct (SQL NULL clusters with NULL, never with '')",
+  "table": "t",
+  "shards": {
+    "S1": [ { "region": "eu" }, { "region": "" }, { "region": null }, { "region": "null" } ],
+    "S2": [ { "region": null }, { "region": "" } ]
+  },
+  "query": {
+    "groupKeys": [{ "col": "region", "type": "text" }],
+    "aggs": { "c": { "op": "count" } }
+  },
+  "expected": [
+    { "k": [""], "aggs": { "c": 2 } },
+    { "k": ["eu"], "aggs": { "c": 1 } },
+    { "k": ["null"], "aggs": { "c": 1 } },
+    { "k": [null], "aggs": { "c": 2 } }
+  ]
+}

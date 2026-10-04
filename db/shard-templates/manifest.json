@@ -1,0 +1,170 @@
+[
+ {
+  "slug": "W1_grouped_sum_count",
+  "file": "W1_grouped_sum_count.sql",
+  "template_hash": "a934e7e062f59cff5a856afdc7aa743ec9be11c068c7e861ea856c36b40bdbfd",
+  "logical_table": "wh_probe_agg",
+  "qc_class": "QC2",
+  "kind": "rows",
+  "merge_ops": [
+   "groupby",
+   "sum",
+   "count"
+  ],
+  "group_keys": [
+   "region"
+  ],
+  "params_schema": {
+   "id_min": "int8",
+   "id_max": "int8"
+  },
+  "timeout_ms": 8000,
+  "max_rows": 1000,
+  "schema_version": 1,
+  "state": "active",
+  "aggs": {
+   "x": {
+    "op": "sum",
+    "col": "amount"
+   },
+   "c": {
+    "op": "count"
+   }
+  },
+  "encoding": {
+   "x": "text",
+   "c": "number"
+  }
+ },
+ {
+  "slug": "W2_scalar_minmax",
+  "file": "W2_scalar_minmax.sql",
+  "template_hash": "a095adaa148253aee8d1cc8e976f01b3579beeea5082f3862df4a908c20b2659",
+  "logical_table": "wh_probe_agg",
+  "qc_class": "QC2",
+  "kind": "scalar",
+  "merge_ops": [
+   "min",
+   "max",
+   "count_col"
+  ],
+  "group_keys": [],
+  "params_schema": {
+   "id_min": "int8",
+   "id_max": "int8"
+  },
+  "timeout_ms": 8000,
+  "max_rows": 1000,
+  "schema_version": 1,
+  "state": "active",
+  "aggs": {
+   "min": {
+    "op": "min",
+    "col": "amount"
+   },
+   "max": {
+    "op": "max",
+    "col": "amount"
+   },
+   "c": {
+    "op": "count_col",
+    "col": "amount"
+   }
+  },
+  "encoding": {
+   "min": "text",
+   "max": "text",
+   "c": "number"
+  }
+ },
+ {
+  "slug": "W3_scalar_avg_pair",
+  "file": "W3_scalar_avg_pair.sql",
+  "template_hash": "bca9dd2c591ed48a0fa5367179dd5deb1d752ed9141c23e6ad53083becf8ecac",
+  "logical_table": "wh_probe_agg",
+  "qc_class": "QC2",
+  "kind": "scalar",
+  "merge_ops": [
+   "avg_pair"
+  ],
+  "group_keys": [],
+  "params_schema": {
+   "id_min": "int8",
+   "id_max": "int8"
+  },
+  "timeout_ms": 8000,
+  "max_rows": 1000,
+  "schema_version": 1,
+  "state": "active",
+  "aggs": {
+   "s": {
+    "op": "sum",
+    "col": "amount"
+   },
+   "c": {
+    "op": "count_col",
+    "col": "amount"
+   }
+  },
+  "encoding": {
+   "s": "text",
+   "c": "number"
+  }
+ },
+ {
+  "slug": "W4_topk",
+  "file": "W4_topk.sql",
+  "template_hash": "dccfc317035961a6310c31194e86a01c715f384ac8cbdc33fb00f35f27eefcee",
+  "logical_table": "wh_probe_agg",
+  "qc_class": "QC3",
+  "kind": "rows",
+  "merge_ops": [
+   "topk",
+   "raw_rows"
+  ],
+  "group_keys": [],
+  "params_schema": {},
+  "timeout_ms": 8000,
+  "max_rows": 1000,
+  "schema_version": 1,
+  "state": "active",
+  "aggs": {},
+  "encoding": {}
+ },
+ {
+  "slug": "W5_cold_agg",
+  "file": "W5_cold_agg.sql",
+  "template_hash": "9a8e922d064539e3418fd77dbc17479fe6a9b69bafe0f182128c675ef1f95234",
+  "logical_table": "facts_blocks",
+  "qc_class": "COLD_AGG",
+  "kind": "scalar",
+  "merge_ops": [
+   "sum",
+   "count_col"
+  ],
+  "group_keys": [],
+  "params_schema": {
+   "dataset": "text",
+   "day_from": "date",
+   "day_to": "date"
+  },
+  "timeout_ms": 8000,
+  "max_rows": 1000,
+  "schema_version": 1,
+  "state": "active",
+  "aggs": {
+   "s": {
+    "op": "sum",
+    "col": "value"
+   },
+   "c": {
+    "op": "count_col",
+    "col": "value"
+   }
+  },
+  "encoding": {
+   "s": "text",
+   "c": "number"
+  }
+ }
+]

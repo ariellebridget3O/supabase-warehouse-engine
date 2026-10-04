@@ -1,0 +1,18 @@
+# supabase-warehouse-engine — minimal project config.
+#
+# LAW: this config ships MINIMAL on purpose. A platform runtime block in
+# config.toml (the edge-runtime section) breaks `supabase functions deploy`
+# with ProjectConfigParseError — never add one.
+#
+# project_id is a local placeholder (the CLI's project identity inside this
+# repo); real deployments pass --project-ref <ref> explicitly.
+
+project_id = "warehouse-engine"
+
+# The engine does its own auth at fn level (checkAuth in
+# _shared/wh_entrypoint.ts: timing-safe `Authorization: Bearer WHE_BEARER_TOKEN`
+# compare + apikey presence check). Platform JWT verification must stay OFF,
+# or every request 401s at the gateway before the handler is ever reached
+# (a bare gateway 401 carries no `auth_kind` field — see API.md).
+[functions.warehouse-engine]
+verify_jwt = false
