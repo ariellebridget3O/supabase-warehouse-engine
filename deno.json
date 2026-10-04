@@ -1,0 +1,6 @@
+{
+  "tasks": {
+    "test": "deno test --no-check -q --allow-env --allow-read",
+    "check": "deno check supabase/functions/warehouse-engine/index.ts supabase/functions/_shared/wh_entrypoint.ts"
+  }
+}

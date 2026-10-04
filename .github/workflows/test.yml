@@ -1,0 +1,68 @@
+name: Test & Typecheck
+# supabase-warehouse-engine CI — modeled on supabase-fleet-manager's
+# .github/workflows/test.yml @ ca4d280, with ONE deliberate divergence:
+# the typecheck job covers the ENGINE (warehouse-engine/index.ts +
+# _shared/wh_entrypoint.ts). FM deliberately excluded the engine from its
+# type gate because it "ships disabled" there (FM test.yml:9-10); in this
+# repo the engine IS the product, so it gets type-checked — this closes the
+# P1 "the engine was never type-checked in FM".
+#
+# Command pins (verbatim from the repo docs — do not drift):
+#  - deno test : the offline battery is hermetic ("no DB, no PAT, no
+#    network"). Test doubles are typed loosely, hence --no-check (the
+#    entrypoints are type-checked separately by the typecheck job), and
+#    --allow-read is granted bare because several tests read repo
+#    fixtures/source by path (wh_fixtures/, db/shard-templates/manifest.json,
+#    db/shard-migrations/0015_wh_query_rpc.sql, entrypoint source pins).
+#  - deno check: supabase/functions/warehouse-engine/index.ts +
+#    supabase/functions/_shared/wh_entrypoint.ts (the full runtime closure
+#    of the engine walks from these two).
+#  - Deno 2.x (denoland/setup-deno@v2, deno-version v2.x).
+#
+# ENV SAFETY: the env block below carries ONLY throwaway dummies so CI sees
+# the same shape of environment as a configured operator box. No real secret
+# is ever needed: the suite makes zero network calls (every fetch in the
+# exercised code is stubbed via installFetchStub in the *_test.ts files; the
+# entrypoint is imported as text, not executed), and every test that cares
+# about an env var saves/deletes/restores it itself (the
+# `const saved = Deno.env.get(...); try { ... } finally { restore }` pattern
+# in wh_entrypoint_test.ts / geo_write_fence_test.ts).
+# WH_SNAPSHOT_KEY / WH_SHARD_KEYS / WH_RYW_V1 / WH_REAL_FETCHER are
+# deliberately NOT defaulted: the wh tests drive those levers explicitly
+# through their own withEnv helpers, and unset-path assertions stay valid
+# even with these dummies present.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+env:
+  WHE_BEARER_TOKEN: dummy-whe-bearer-token                 # _shared/wh_entrypoint.ts checkAuth (lazy per-request read); auth tests set their own and restore
+  SUPABASE_URL: https://example.supabase.co                # warehouse-engine/index.ts boot reads (own-ref derivation); never contacted — fetches are stubbed
+  SUPABASE_SERVICE_ROLE_KEY: dummy-jwt-shape               # warehouse-engine/index.ts boot reads (own-key resolution); dummy value is itself a covered fail-closed branch
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: "Type-check the engine entrypoint + HTTP handler (FM P1 closure)"
+        run: deno check supabase/functions/warehouse-engine/index.ts supabase/functions/_shared/wh_entrypoint.ts
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: "Offline test suite from repo root"
+        run: deno test --no-check -q --allow-env --allow-read
