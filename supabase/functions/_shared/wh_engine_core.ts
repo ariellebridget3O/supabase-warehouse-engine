@@ -203,14 +203,17 @@ export type WhFanoutEnvelope = WhPartialEnvelope | { [key: string]: unknown };
 
 /** r69 (§3.1): widened to the THREE-ARG call — existing 2-arg fetcher impls
  *  (all pre-r69 tests) remain assignable (additive law); runFanout passes
- *  t.rpc through, undefined on the unset path. The ok-arm `envelope` widens
- *  to the raw wire object (AM-1). */
+ *  t.rpc through, undefined on the unset path. The ok-arm `envelope` is the
+ *  RAW wire as received, declared `unknown` (AM-1/F-N7): the select path
+ *  carries the engine shape, the rpc path the crash-gated flat wire — the
+ *  transport layer adds no shape claim; deep validation is the consumption
+ *  site's job (adaptWireEnvelope + the §6.3 gates). */
 export type WhShardFetcher = (
   shard: string,
   url: string,
   rpc?: WhRpcSpec,
 ) => Promise<
-  | { ok: true; envelope: WhFanoutEnvelope; estRows?: number }
+  | { ok: true; envelope: unknown; estRows?: number }
   | { ok: false; warning: { code?: string; httpStatus?: number; stamped?: boolean }; estRows?: number }
 >;
 
@@ -902,7 +905,7 @@ export function adaptWireEnvelope(
   wire: unknown,
   template: WireTemplateView,
   plan: WirePlanView,
-): WhPartialEnvelope | null {
+): Omit<WhPartialEnvelope, 'shard'> | null {
   if (wire === null || typeof wire !== 'object' || Array.isArray(wire)) return null;
   if (template === null || typeof template !== 'object' || template.aggs === null || typeof template.aggs !== 'object') return null;
   if (plan === null || typeof plan !== 'object' || plan.aggs === null || typeof plan.aggs !== 'object') return null;
@@ -1124,7 +1127,11 @@ async function runFanoutImpl(
         } else if (raced.r.ok) {
           outcome = {
             shard: t.shard, ok: true, latencyMs: timers.nowMs() - started,
-            estRows: raced.r.estRows ?? 0, envelope: raced.r.envelope,
+            // Raw-wire relay, verbatim (select path: engine shape; rpc path:
+            // the isWhRpcWireShape-gated flat wire) — no shape claim added
+            // here; deep validation is the consumption site's job
+            // (adaptWireEnvelope + the §6.3 gates). Narrow relay cast only.
+            estRows: raced.r.estRows ?? 0, envelope: raced.r.envelope as WhFanoutEnvelope,
           };
         } else {
           const cls = classifyFetchFailure(raced.r.warning);
