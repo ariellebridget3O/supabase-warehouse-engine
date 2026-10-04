@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — r121 OPT-1b: handshake fold (core leg)
+
+- **Engine core**: the per-query inventory handshake is retired from the critical path — eligibility is enforced shard-side per `wh_query` call (WH400/WH401 → `template_missing` at `classifyFetchFailure`, `detail` kept, `est_rows` re-attached from the directory row); the inventory GET survives as a 1-in-16 SAMPLED backstop (`K_SAMPLING = 7`, `sha256(qid utf8)[0] & 15` bucket, Web Crypto) with today's fail-closed exclusion semantics when fired.
+- **max_rows F15 goes manifest-side**: a plan limit strictly above the matched template's `ENGINE_TEMPLATE_MANIFEST.max_rows` refuses pre-fanout with ZERO shard POSTs (`==` passes; the sampled inventory `max_rows` column remains the registry-drift signal).
+- **`phases` response field**: `{pre_chain_ms, handshake_ms, fanout_ms}` on success envelopes only (omitted on errors) — `pre_chain_ms` is entrypoint-threaded (`ExecuteArgs.timings`), `handshake_ms` is 0 on unsampled calls, `fanout_ms` is the measured fanout block duration.
+- Accepted per design §1.3a: WH402/WH403/transport/429/5xx classes are non-exempt under `fail_fast` (honest 500 on unsampled calls) — rolling-deploy/key-rotation runbook note in DESIGN.md §8.
+- Battery re-pin follows in Leg 2 (design §5 ledger — retire/re-write/add counts); engine typecheck green (`make check`).
+
 ## 0.1.1 — migrate surface: adapted Management-API runner + lethal pins + docs retraction
 
 ### Added

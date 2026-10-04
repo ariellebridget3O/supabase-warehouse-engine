@@ -337,6 +337,19 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
 
   let knownVersion: number | undefined;
   try {
+    // r121 OPT-1b (design §1.7): pre_chain_ms is measured HERE — the
+    // entrypoint owns the pre-engine chain (the §4.6 snapshot-replay probe +
+    // the atomic directory read + snapshot signing + the replica-plane
+    // geo-mode read + the r49 read-dispatch fence consult), all of which
+    // precede the engine's in-core clock (executeWhQuery's `started`). The
+    // total is threaded INTO the engine via ExecuteArgs.timings.preChainMs
+    // and injected post-assembly onto the success envelope's
+    // phases.pre_chain_ms; error envelopes (the catch ladder below) omit
+    // phases entirely. The SAME timers instance is passed to the engine —
+    // resolved once from deps.timers (the injection point is unchanged;
+    // default real timers when unwired).
+    const timers = deps.timers ?? defaultWhEngineTimers();
+    const preChainStarted = timers.nowMs();
     // §4.6 snapshot replay: verify chain (sig -> TTL -> version) BEFORE the
     // expensive full-embed read. ANY failure => silent full embed (never an
     // error). A valid replay skips the directory read AND the re-attach —
@@ -423,6 +436,10 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
       }
     }
 
+    // r121 OPT-1b (design §1.7): the pre-chain span CLOSES here — after the
+    // r49 fence consult, before the engine's own in-core clock starts.
+    const preChainMs = timers.nowMs() - preChainStarted;
+
     const response = await executeWhQuery({
       req: parsed,
       columnTypes,
@@ -436,7 +453,14 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
       shardKeyType: head?.shard_key_type ?? 'none',
       directoryVersion: version,
       ...(head?.table_schema_version !== undefined ? { tableSchemaVersion: head.table_schema_version } : {}),
-      timers: deps.timers ?? defaultWhEngineTimers(),
+      // r121 OPT-1b (design §1.7): the same resolved timers instance drives
+      // the engine's clock (byte-identical to the previous inline
+      // `deps.timers ?? defaultWhEngineTimers()` expression), and the
+      // pre-chain measurement above rides into the engine as timings.
+      // (ExecuteArgs.timings — optional upstream; the engine defaults
+      // pre_chain_ms to 0 when absent.)
+      timers,
+      timings: { preChainMs },
       fetcher: deps.fetcher,
       // r44 §5.2: the handshake rides only when wired (optional dep — absent
       // => the ungated pre-r44 pipeline, keeping the stub path reachable).

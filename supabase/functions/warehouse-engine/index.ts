@@ -23,7 +23,12 @@
 //   * handshake -> the §5.2 default handshake (makeWhHandshake over the real
 //     fetch, contract §4.6 plane auth) with the SAME resolver feeding its
 //     shardServiceKey (r69 D6 single source of truth) — unreachable while
-//     the gate is false
+//     the gate is false. r121 OPT-1b: this dep now serves the SAMPLED
+//     inventory-audit backstop ONLY (1-in-16 by sha256(qid) bucket — the
+//     per-query sweep is folded into wh_query's per-call eligibility;
+//     manifest-side max_rows pre-refusal covers F15 with zero network).
+//     Wiring UNCHANGED — no env lever on the sampler (K_SAMPLING is a
+//     pinned constant in _shared/wh_engine_core.ts; _shared never reads env).
 //   * rpcMode -> the WH_REAL_FETCHER env-guard expression (the staged r60
 //     flip lever's exact 'on' value; passed into the core via deps — F-N8
 //     purity: the _shared modules never read env)

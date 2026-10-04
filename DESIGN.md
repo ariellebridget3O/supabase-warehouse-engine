@@ -71,3 +71,7 @@ All reads run through the one consumer-store client (`whe_store.ts`). 6 read sit
 - Flip conditions (pinned in the constant's comment): the real fetcher frozen in (QC2 compile design-frozen and wired), the PAT wall down, and live probes #1/#2/#3 GREEN (#1 platform auth round-trip, #2 directory read, #3 `wh_query` RPC round-trip against a seeded shard).
 - Flipping is a **code change on a reviewed diff** — never a deploy-time env. The env levers `WH_REAL_FETCHER` (exact `on` ⇒ rpcMode wire shape) and `WH_RYW_V1` (exact `on` ⇒ RYW `min_lsn` adjudication) compose with the gate but cannot bypass it: pre-flip, `WH_REAL_FETCHER=on` is inert.
 - `wh_entrypoint_test.ts` pins the constant `false` by source-text assertion — the battery itself enforces the doctrine.
+
+## 8. r121 OPT-1b runbook note — the fold's failure-surface shift
+
+With the per-query inventory handshake folded into `wh_query` per-call eligibility (r121), unsampled calls surface shard-side transport/auth/429/5xx failures as their honest non-exempt classes ⇒ **fail_fast 500** (the old degrade-200 masking is gone for every non-WH400/401 class). **Rolling deploy: one shard at a time** — a half-deployed fleet shows mixed WH-code vocabulary until every shard runs the 0015 wave. **Key rotation: rotate `WH_SHARD_KEYS` (config) FIRST, then deploy the engine** — a new engine against old shard keys reads as transport failure, not refusal.

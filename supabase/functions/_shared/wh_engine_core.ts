@@ -261,6 +261,41 @@ export interface WhEngineResponse {
   warnings: WhEngineWarning[];
   perShard: WhPerShardEntry[];
   latency_ms: number;
+  /** r121 OPT-1b (design §1.7): phase wall-clock decomposition — SUCCESS
+   *  envelopes ONLY (OMITTED on error envelopes; injected post-assembly).
+   *    * pre_chain_ms — ENTRYPOINT-THREADED: the fence consult + atomic
+   *      directory read precede the in-core clock, so the entrypoint measures
+   *      them and passes ExecuteArgs.timings.preChainMs (0 when absent).
+   *    * handshake_ms — the sampled inventory-backstop block duration
+   *      (0 when the sampler did not fire — the fold's steady state).
+   *    * fanout_ms — the measured fanout BLOCK duration (the runFanout await
+   *      wall over the worker pool, NOT max(perShard)). */
+  phases?: { pre_chain_ms: number; handshake_ms: number; fanout_ms: number };
+}
+
+// ---------- r121 OPT-1b: sampled inventory-backstop sampler (design §1.5) ----------
+
+/**
+ * K_SAMPLING — the pinned sample bucket of the OPT-1b handshake fold. The
+ * per-query inventory GET fires iff `(sha256(qid utf8)[0] & 15) ===
+ * K_SAMPLING` — a deterministic 1-in-16 function of the request qid (no
+ * isolate state, recycle-safe; qid is client-supplied, so clients CAN steer
+ * out of the bucket — P3, accepted by design). Named constant (never a
+ * literal inside the predicate) so the battery can pin the value and mutate
+ * it RED; 7 is the picked bucket — any fixed 0..15 value keeps the 1-in-16
+ * rate, 7 pins the audit vectors.
+ */
+export const K_SAMPLING = 7;
+
+/**
+ * The OPT-1b sampling predicate: FIRST byte of sha256(qid utf8) & 15.
+ * Web Crypto (`crypto.subtle.digest`) — a pure computation of the qid, not
+ * I/O and not env: the purity island law is untouched (async — callers
+ * await it; the enclosing executeWhQuery scope is async).
+ */
+export async function qidSampleBucket(qid: string): Promise<number> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(qid));
+  return new Uint8Array(digest)[0] & 15;
 }
 
 const IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
@@ -701,6 +736,20 @@ export function classifyFetchFailure(
   }
   // r69 AM-5/F-N2: the WH-code detail lift (both arms; order untouched).
   if (f.code !== undefined && WH_CODE_RE.test(f.code)) out.detail = f.code;
+  // r121 OPT-1b (design §1.3a, LOAD-BEARING): the shard-side per-call
+  // template refusal — WH400 (template missing OR state='draft',
+  // 0015:302-317) and WH401 ('retired') — maps to the §5.2-exempt
+  // `template_missing` class so the FOLDED eligibility path (no inventory
+  // GET on unsampled calls) still degrades+warns instead of fail_fast-500ing
+  // the refusal class. `detail` KEEPS the WH code (diagnostic value; the
+  // mapped exclusion record is battery-pinned). SCOPED to the generic-4xx /
+  // code-only `excluded` arms (the shard emits WH400/401 on the 400 class):
+  // a WH body code riding a 402/429/5xx/network class keeps its TRANSPORT
+  // class — never re-masked (more-honest law, design §1.3a). WH402
+  // (hash-shape) and WH403 (registry integrity) stay non-exempt.
+  if (out.code === 'excluded' && (f.code === 'WH400' || f.code === 'WH401')) {
+    return { code: 'template_missing', detail: f.code };
+  }
   return out;
 }
 
@@ -1223,6 +1272,15 @@ export interface ExecuteArgs {
   // simply the WRONG population once the primary moved (R3). The entrypoint
   // computes it from the combined fence read; never client-supplied.
   geoReadDispatch?: WhGeoReadDispatch;
+  // ---- r121 OPT-1b (design §1.7): ENTRYPOINT-THREADED pre-chain timing.
+  // The entrypoint measures its pre-engine chain (snapshot-replay probe +
+  // atomic directory read + snapshot signing + the r49 fence consult) with
+  // the SAME timers instance it passes below, and threads the total here;
+  // the engine injects it post-assembly onto the success envelope's
+  // phases.pre_chain_ms. Optional (absent ⇒ 0): legacy callers/tests
+  // unchanged. The value is computed UPSTREAM and passed in — the core
+  // never reads env and owns no clock outside args.timers (purity law).
+  timings?: { preChainMs: number };
 }
 
 // ---------- r47 read-plane gate ladder (impl plan §2; first match wins) ----------
@@ -1361,6 +1419,14 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     };
     if (grouped) base.rows = [];
     else base.result = finalizeScalarAggs(mergeScalarAggs(plan, []), plan);
+    // r121 OPT-1b (design §1.7): an empty-selection response is still a
+    // SUCCESS envelope — it carries phases (the handshake/fanout phases
+    // never ran: 0/0; pre_chain_ms is still the entrypoint-measured span).
+    base.phases = {
+      pre_chain_ms: args.timings?.preChainMs ?? 0,
+      handshake_ms: 0,
+      fanout_ms: 0,
+    };
     return base;
   };
 
@@ -1420,56 +1486,125 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
   const perShard: WhPerShardEntry[] = [];
   const okEnvelopes: WhPartialEnvelope[] = [];
 
-  // ---- r44 §5.2 discovery/verification handshake (engine ⇄ shard) ----
-  // Only when the dep is wired (the hasRealFetcher path — the stub path stays
-  // reachable) AND the request is on the PRIMARY PLACEMENTS population: the
-  // replica's template inventory is unaudited until the ddl-wave applies RPCs
-  // replica-first (geo doc §5.1 DDL-not-replicated law), so a template plan
-  // (non-empty derived hashes) NEVER rides the replica plane (G5 — resolveGeo
-  // Plane falls back first) and a won replica plane is select-path only:
-  // skip the inventory round-trip entirely. r49 R3: the engine-local/remote
-  // target is the PRIMARY itself (the template truth — the primary is where
-  // the ddl-wave lands first), not a partial-serving shard population; the
-  // inventory gate is a placements-fan-out mechanism and is skipped there.
+  // ---- r44 §5.2 discovery/verification handshake → r121 OPT-1b FOLD ----
+  // Plane scope UNCHANGED: only when the dep is wired (the hasRealFetcher
+  // path — the stub path stays reachable) AND the request is on the PRIMARY
+  // PLACEMENTS population (!onReplicaPlane && geoDispatch === null): the
+  // replica's template inventory is unaudited until the ddl-wave applies
+  // RPCs replica-first (geo doc §5.1 DDL-not-replicated law), so a template
+  // plan NEVER rides the replica plane (G5) and r49 R3's engine-local/remote
+  // target is the PRIMARY itself — the inventory gate is a placements-fan-
+  // out mechanism and is skipped on both.
+  //
+  // r121 OPT-1b (design_r121_opt1b_handshake_fold.md §1): the PER-QUERY
+  // inventory sweep is RETIRED from the critical path. Eligibility is
+  // enforced shard-side per wh_query call (0015:302-317: a missing/retired/
+  // draft template refuses WH400/WH401 BEFORE EXECUTE — an ineligible shard
+  // costs no shard compute; the RT was happening anyway) and maps to the
+  // exempt template_missing class at classifyFetchFailure. The inventory GET
+  // survives ONLY as the SAMPLED AUDIT BACKSTOP below (1-in-16 by qid
+  // bucket) + the manifest-side max_rows pre-refusal (F15 with ZERO
+  // network). Guards beyond the plane: the EMPTY-HASH guard
+  // (templateHashes.length > 0 — ends the vacuous select-path inventory
+  // audit; untemplated plans carry no template exposure) and planRef.limitK
+  // present. WHEN FIRED: today's fail-closed semantics UNCHANGED —
+  // inventory GET per selected shard (parallel), checkHandshake eligibility,
+  // ineligible ⇒ exclusion with warning (est_rows from the directory row),
+  // fanoutRows = eligible-shards-only. WHEN NOT FIRED: ZERO inventory GETs.
   const handshake = args.handshake;
   let fanoutRows = selected;
-  // r69 (AM-6/OQ-8): the handshake-matched template hash per eligible shard —
-  // consumed by the §3.2 rpc target construction (rpcMode plane only; the
-  // collection itself is inert bookkeeping on the unset path). On an eligible
-  // verdict matchedHash ≡ the first derived hash (plan order, deterministic).
-  const matchedHashByShard = new Map<string, string>();
-  if (handshake !== undefined && !onReplicaPlane && geoDispatch === null) {
-    const planRef: HandshakePlanRef = {
-      templateHashes: args.templateHashes ?? [],
-      limitK: typeof args.req.query.limit === 'number' ? args.req.query.limit : null,
-    };
-    const verdicts = await Promise.all(selected.map(async (row) => {
-      const t0 = args.timers.nowMs();
-      let inventory: TemplateInventoryRow[];
-      try {
-        inventory = await handshake.readTemplateInventory(row.shard);
-      } catch {
-        inventory = []; // belt-and-braces: a throwing dep fails closed (§5.2)
+  // r121 OPT-1b (design §1.7): handshake_ms — the sampled inventory-backstop
+  // BLOCK duration (0 when the sampler did not fire; measured below).
+  let handshakeMs = 0;
+  // r69 (AM-6/OQ-8) plan-side §5.2 inputs. matchedHash is NOT collected per
+  // shard anymore: the AM-6 law (matchedHash ≡ the FIRST derived hash —
+  // deterministic plan order, inventory-INDEPENDENT) lets the rpc target
+  // construction source args.templateHashes[0] directly (audit-B F10).
+  const planRef: HandshakePlanRef = {
+    templateHashes: args.templateHashes ?? [],
+    limitK: typeof args.req.query.limit === 'number' ? args.req.query.limit : null,
+  };
+  if (!onReplicaPlane && geoDispatch === null) {
+    // ---- r121 OPT-1b: manifest-side max_rows pre-refusal (design §1.2) ----
+    let manifestRefused = false;
+    // F15 preserved with ZERO network: a plan whose limit K strictly exceeds
+    // the matched template's pinned ENGINE_TEMPLATE_MANIFEST.max_rows is
+    // refused BEFORE any shard round trip (the old check read max_rows off
+    // the inventory GET — now a 1-in-16 backstop, so the refusal moved to
+    // the manifest the plan-honesty gate already trusts). Boundary: refuse
+    // iff K > max_rows STRICTLY (== passes — the shard's sentinel still
+    // re-caps at execution, defense in depth). Outcome shape = today's
+    // max_rows_exceeded path EXACTLY: exempt-code exclusion warnings
+    // (est_rows = the directory row estimate) + perShard error entries
+    // (latencyMs 0 — no RT happened) + fanoutRows = [] ⇒ ZERO shard POSTs;
+    // the empty merge assembles coverage 0/n. Never masks D2 below (the
+    // plan_untemplated throw still wins) and never masks the mapped
+    // template_missing class on unsampled calls (missing-in-manifest hashes
+    // died at plan time). Every derived hash's manifest row must serve K —
+    // with the pinned manifest (no overlapping merge_ops) at most one hash
+    // derives per plan, so this degenerates to the hashes[0] check.
+    if (planRef.limitK !== null && planRef.templateHashes.length > 0) {
+      const k = planRef.limitK;
+      const refused = planRef.templateHashes.some((h) => {
+        const mrow = manifestRowByHash(h);
+        return mrow !== null && mrow.max_rows < k;
+      });
+      if (refused) {
+        for (const row of selected) {
+          warnings.push({ shard: row.shard, code: 'max_rows_exceeded', est_rows: directoryRowEstimate(row), retried: false });
+          perShard.push({ shard: row.shard, ok: false, latencyMs: 0, error: 'max_rows_exceeded' });
+        }
+        fanoutRows = [];
+        manifestRefused = true;
       }
-      const latencyMs = args.timers.nowMs() - t0;
-      return { row, latencyMs, result: checkHandshake(planRef, inventory, args.tableSchemaVersion) };
-    }));
-    const eligible: WhDirectoryRow[] = [];
-    for (const v of verdicts) {
-      if (v.result.eligible) {
-        eligible.push(v.row);
-        if (v.result.matchedHash !== undefined) matchedHashByShard.set(v.row.shard, v.result.matchedHash);
-        continue;
-      }
-      const code = v.result.warning?.code ?? 'template_missing'; // invariant: !eligible ⇒ warning present
-      warnings.push({ shard: v.row.shard, code, est_rows: directoryRowEstimate(v.row), retried: false });
-      perShard.push({ shard: v.row.shard, ok: false, latencyMs: v.latencyMs, error: code });
     }
-    fanoutRows = eligible;
+    // ---- r121 OPT-1b: the SAMPLED inventory-audit backstop (design §1.5) ----
+    // Fires iff sha256(qid utf8)[0] & 15 === K_SAMPLING (deterministic per
+    // qid — no isolate state, recycle-safe; Web Crypto is a pure
+    // computation, not I/O). Sampled-only drift signals (inventory-side
+    // template_missing/schema_mismatch/max_rows_exceeded) keep today's
+    // fail-closed shape; the audit is deliberately REACTIVE between samples
+    // (per-call WH codes + the sampled sweep catch drift — accepted,
+    // design §1.5). Mutually exclusive with the manifest pre-refusal above
+    // (a refused plan fans out to nobody — the GET would be dead weight).
+    if (
+      !manifestRefused &&
+      handshake !== undefined &&
+      planRef.templateHashes.length > 0 &&
+      planRef.limitK !== null &&
+      (await qidSampleBucket(args.req.qid)) === K_SAMPLING
+    ) {
+      const hsStarted = args.timers.nowMs();
+      const verdicts = await Promise.all(selected.map(async (row) => {
+        const t0 = args.timers.nowMs();
+        let inventory: TemplateInventoryRow[];
+        try {
+          inventory = await handshake.readTemplateInventory(row.shard);
+        } catch {
+          inventory = []; // belt-and-braces: a throwing dep fails closed (§5.2)
+        }
+        const latencyMs = args.timers.nowMs() - t0;
+        return { row, latencyMs, result: checkHandshake(planRef, inventory, args.tableSchemaVersion) };
+      }));
+      const eligible: WhDirectoryRow[] = [];
+      for (const v of verdicts) {
+        if (v.result.eligible) {
+          eligible.push(v.row);
+          continue;
+        }
+        const code = v.result.warning?.code ?? 'template_missing'; // invariant: !eligible ⇒ warning present
+        warnings.push({ shard: v.row.shard, code, est_rows: directoryRowEstimate(v.row), retried: false });
+        perShard.push({ shard: v.row.shard, ok: false, latencyMs: v.latencyMs, error: code });
+      }
+      fanoutRows = eligible;
+      handshakeMs = args.timers.nowMs() - hsStarted;
+    }
   }
 
   // ---- r69 D2 (§2 AM-2/AM-4/OQ-4/F-N5): RPC-plane plan honesty, pre-fan-out.
-  // Fires ONLY here — the placements/primary plane post-handshake branch —
+  // Fires ONLY here — the placements/primary plane post-gate branch (r121
+  // OPT-1b: "post-handshake" renamed — the per-query handshake is folded;
+  // the sampled backstop + manifest pre-refusal above are its successors) —
   // and ONLY when rpcMode is on (F-N4: with rpcMode absent this block does
   // not exist and the pipeline below is byte-identical). Rejects: hashless
   // plans; where-carrying plans (the RPC ignores where — a where-filtered
@@ -1494,14 +1629,22 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
       );
     }
     rpcSpecByShard = new Map();
+    // r121 OPT-1b (design §1.3c / audit-B F10): the rpc target hash is
+    // sourced DIRECTLY from the first derived plan hash. AM-6 law
+    // (wh_handshake.ts:54-62): on an eligible verdict matchedHash ≡ the
+    // FIRST derived hash — deterministic plan order, INVENTORY-INDEPENDENT —
+    // so the per-shard handshake-verdict map was pure bookkeeping, and its
+    // orphaned "rpc target construction without a handshake-matched template
+    // hash" internal throw would now fire on every UNSAMPLED call (the
+    // verdict collection is a 1-in-16 backstop). DELETED. Multi-hash
+    // strictness assumption (pinned): the pinned ENGINE_TEMPLATE_MANIFEST
+    // has no overlapping merge_ops, so a plan derives at most ONE template
+    // hash — hashes[0]-only sourcing cannot under-serve a multi-template
+    // requirement (D2 above already guaranteed derived.length > 0 here). If
+    // a future manifest ever carries overlapping merge_ops, re-widen here
+    // AND in the manifest-side max_rows pre-refusal above.
+    const matched = derived[0];
     for (const row of fanoutRows) {
-      const matched = matchedHashByShard.get(row.shard);
-      if (matched === undefined) {
-        // Wiring-contract violation: rpcMode implies the post-flip wiring
-        // (real fetcher + handshake over the SAME key resolver). Fail closed
-        // — never fabricate a template hash for a shard.
-        throw new WhEngineError('internal', 'rpc target construction without a handshake-matched template hash (rpcMode wiring contract: the §5.2 handshake must be wired)');
-      }
       rpcSpecByShard.set(row.shard, {
         p_template_hash: matched,
         p_params: rpcParams(plan, args.req.query),
@@ -1526,10 +1669,17 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
           ? { shard: row.shard, url: compileShardRpcUrl(row.shard), rpc }
           : { shard: row.shard, url: compileShardUrl(row.shard, plan, args.req.query.where) };
       });
+  // r121 OPT-1b (design §1.7): fanout_ms = the measured fanout BLOCK
+  // duration — the runFanout await wall (worker-pool scheduling + ALL shard
+  // round trips), NOT max(perShard): the block wall keeps the phases
+  // decomposition additive under worker-pool queueing (a per-shard max would
+  // hide the queue wait the wall exposes).
+  const fanoutStarted = args.timers.nowMs();
   const outcomes = await runFanout(targets, args.fetcher, args.timers, {
     ...(args.window !== undefined ? { window: args.window } : {}),
     ...(args.shardTimeoutMs !== undefined ? { shardTimeoutMs: args.shardTimeoutMs } : {}),
   });
+  const fanoutMs = args.timers.nowMs() - fanoutStarted;
 
   for (const o of outcomes) {
     if (o.ok && o.envelope) {
@@ -1590,8 +1740,23 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
       okEnvelopes.push(envelope);
     } else {
       const w = o.warning ?? { code: 'excluded' };
+      // r121 OPT-1b (design §1.3b): mapped shard-side template refusals
+      // (WH400/WH401 → template_missing at classifyFetchFailure, detail
+      // KEPT) RE-ATTACH the directory's row estimate for the shard — the
+      // fold's exclusions must carry the same §4.4 degrade-vs-abort weight
+      // today's handshake exclusions had (the LETHAL-1b lane; the mapped
+      // record shape is battery-pinned). The lookup is over `selected` (the
+      // dispatched placements population — the mapped codes only arise on
+      // the rpc placements plane, where targets ⊆ selected); an
+      // unresolvable shard falls back to the transport estimate. Non-mapped
+      // failures keep o.estRows ?? 0.
+      const dirRow = w.code === 'template_missing' && (w.detail === 'WH400' || w.detail === 'WH401')
+        ? selected.find((r) => r.shard === o.shard)
+        : undefined;
       warnings.push({
-        shard: o.shard, code: w.code, est_rows: o.estRows, retried: false,
+        shard: o.shard, code: w.code,
+        est_rows: dirRow !== undefined ? directoryRowEstimate(dirRow) : (o.estRows ?? 0),
+        retried: false,
         ...(w.detail !== undefined ? { detail: w.detail } : {}),
       });
       perShard.push({
@@ -1674,5 +1839,21 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
   } else {
     response.result = merged === null ? finalizeScalarAggs(mergeScalarAggs(plan, []), plan) : finalizeScalarAggs(merged, plan);
   }
+  // r121 OPT-1b (design §1.7): phases — injected POST-ASSEMBLY onto the
+  // SUCCESS envelope only. Error envelopes are built by the entrypoint's
+  // status ladder from the thrown WhEngineError and can never carry this
+  // field (every throw above bypasses this assignment). pre_chain_ms is
+  // ENTRYPOINT-THREADED (the fence consult + atomic directory read precede
+  // the in-core clock — the entrypoint measures them and passes
+  // ExecuteArgs.timings.preChainMs; 0 when absent, e.g. legacy callers);
+  // handshake_ms is the sampled inventory-backstop block (0 when the
+  // sampler did not fire — the fold's steady state); fanout_ms is the
+  // measured fanout BLOCK duration (the runFanout await wall, documented
+  // at the measurement site — NOT max(perShard)).
+  response.phases = {
+    pre_chain_ms: args.timings?.preChainMs ?? 0,
+    handshake_ms: handshakeMs,
+    fanout_ms: fanoutMs,
+  };
   return response;
 }
