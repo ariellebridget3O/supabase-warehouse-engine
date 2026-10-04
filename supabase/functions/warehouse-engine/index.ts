@@ -41,11 +41,14 @@ import type { WhEngineDeps } from '../_shared/wh_entrypoint.ts';
 import { makeDirectoryReader, makeGeoDirectoryReader } from '../_shared/wh_directory_reader.ts';
 import { makeWhHandshake } from '../_shared/wh_handshake.ts';
 import {
+  makeOwnRefBypassRawFetch,
   makeProxiedRawFetch,
   makeRpcShardFetcher,
   makeShardKeyResolver,
   parseShardKeyEnv,
   parseWhProxyMapValue,
+  raceWhProxyKvBoot,
+  WH_PROXY_KV_BOOT_TIMEOUT_MS,
 } from '../_shared/wh_shard_channel.ts';
 import type { WhProxyRawFetch } from '../_shared/wh_shard_channel.ts';
 import { fetchFenceConfig, ownProjectRefFromSupabaseUrl } from '../_shared/geo_write_fence.ts';
@@ -56,7 +59,11 @@ import { db } from '../_shared/whe_store.ts';
 // boot-once KV read below needs ONE awaited PostgREST round-trip at isolate
 // boot (⟫B4: boot-once like parseShardKeyEnv, not per-request like
 // readGeoMode). The await is fail-closed: any KV fault logs ONE fixed string
-// and boots with the lever INERT — Deno.serve below still starts.
+// and boots with the lever INERT — Deno.serve below still starts. The read
+// is TIMEOUT-RACED (raceWhProxyKvBoot, r123 fresh-eyes P3 fix): a HANGING
+// PostgREST at boot degrades to the KV-absent state (lever inert + the
+// fixed-string timeout defect log) after WH_PROXY_KV_BOOT_TIMEOUT_MS
+// instead of wedging module evaluation forever.
 const deps: WhEngineDeps = await (async () => {
   // r69 §3.3 (D4/D5/D6): the shard SERVICE-KEY channel — parsed ONCE at
   // isolate boot, wired ONCE, feeding BOTH the handshake plane auth AND the
@@ -119,13 +126,14 @@ const deps: WhEngineDeps = await (async () => {
   // WH_RYW_V1 activation expressions) + the DEDICATED WH_PROXY_TOKEN secret
   // (NEVER WHE_BEARER_TOKEN — the snapshotKey doctrine) + a well-formed
   // wh_shard_proxy_map value, re-validated ENGINE-SIDE by parseWhProxyMapValue
-  // (defense in depth — the FM 0019 validator mirrored: exactly {url, refs},
-  // strict proxy-fn URL shape, 20-char refs, host-ref ∈ refs, NO JWT-shaped
-  // string anywhere — the token NEVER rides config). ANY miss ⇒ the lever is
-  // INERT: proxyRawFetch stays undefined, the rawFetch dep below is the
-  // default platform fetch (byte-identical unset path — mirror of the
-  // rpcMode expression's unset law), and ONE fixed-string boot defect log
-  // fires (echo law: never value fragments, never the KV content).
+  // (defense in depth — the FM 0019/0027 validator mirrored: exactly {url,
+  // refs}, NON-EMPTY refs, strict proxy-fn URL shape, 20-char refs, host-ref
+  // ∈ refs, NO JWT-shaped string anywhere — the token NEVER rides config).
+  // ANY miss ⇒ the lever is INERT: proxyRawFetch stays undefined, the
+  // rawFetch dep below is the default platform fetch (byte-identical unset
+  // path — mirror of the rpcMode expression's unset law), and ONE
+  // fixed-string boot defect log fires (echo law: never value fragments,
+  // never the KV content).
   // OFF is the shipped default: with the env not 'on' this block reads NO
   // other env, performs NO KV round-trip, and boots exactly as pre-r123.
   // The activation expression is INLINE (mirror of the rpcMode expression —
@@ -137,20 +145,59 @@ const deps: WhEngineDeps = await (async () => {
       console.error('warehouse-engine wh_proxy lever defect: WH_PROXY_TOKEN unset — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
     } else {
       try {
-        const { data, error } = await client
-          .from('config')
-          .select('value')
-          .eq('key', 'wh_shard_proxy_map')
-          .maybeSingle();
-        if (error !== null || data === null) {
-          console.error('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map row absent or unreadable — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+        // r123 fresh-eyes P3 fix: the boot KV read is TIMEOUT-RACED — a
+        // hanging PostgREST yields the `null` sentinel after
+        // WH_PROXY_KV_BOOT_TIMEOUT_MS (lever inert + the fixed-string
+        // timeout defect log inside the callback) instead of wedging module
+        // evaluation. A read that rejects still propagates UNCHANGED into
+        // the catch's fixed-string log (raceWhProxyKvBoot swallows nothing).
+        const raced = await raceWhProxyKvBoot(
+          client
+            .from('config')
+            .select('value')
+            .eq('key', 'wh_shard_proxy_map')
+            .maybeSingle(),
+          WH_PROXY_KV_BOOT_TIMEOUT_MS,
+          () => {
+            console.error('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map boot read timed out (hanging PostgREST) — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+            return null;
+          },
+        );
+        if (raced === null) {
+          // the timeout defect log already fired inside the callback —
+          // stays inert (the KV-absent state).
         } else {
-          // Validate ONCE (one boot, one defect log on any shape fault — the
-          // validator owns the per-class fixed-string log, value fragments
-          // NEVER echoed). null ⇒ inert: proxyRawFetch stays undefined.
-          const proxyMap = parseWhProxyMapValue((data as { value: unknown }).value);
-          if (proxyMap !== null) {
-            proxyRawFetch = makeProxiedRawFetch({ proxyUrl: proxyMap.url, proxyToken });
+          const { data, error } = raced;
+          if (error !== null || data === null) {
+            console.error('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map row absent or unreadable — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+          } else {
+            // Validate ONCE (one boot, one defect log on any shape fault — the
+            // validator owns the per-class fixed-string log, value fragments
+            // NEVER echoed). null ⇒ inert: proxyRawFetch stays undefined.
+            const proxyMap = parseWhProxyMapValue((data as { value: unknown }).value);
+            // r123 P0 fix (the live-e2e RED closure): the lever arms ONLY as
+            // the OWN-REF DIRECT carve-out wrapper (makeOwnRefBypassRawFetch)
+            // and ONLY with a KNOWN own ref — the SUPABASE_URL subdomain
+            // (ownProjectRefFromSupabaseUrl, the SAME authoritative source the
+            // shard-key resolver uses above; the co-hosted law). The engine's
+            // own shard is intra-project and must NEVER ride the cross-account
+            // proxy: the v14 live e2e drew a relayed 401 "Invalid API key"
+            // from the own host's public edge for the own-ref service
+            // credential presented from the proxy egress, while the SAME
+            // credential succeeds on the isolate-internal direct path. An
+            // unparseable SUPABASE_URL keeps the lever INERT (fail-closed —
+            // "own never proxies" is unprovable without the own-ref
+            // identity); the bypass arm itself ALSO disables on '' (AM-8
+            // mirror, belt-and-braces).
+            if (proxyMap !== null && ownRef === '') {
+              console.error('warehouse-engine wh_proxy lever defect: SUPABASE_URL unparseable — the own-ref DIRECT carve-out cannot be guaranteed — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+            } else if (proxyMap !== null) {
+              proxyRawFetch = makeOwnRefBypassRawFetch({
+                ownRef,
+                proxiedRawFetch: makeProxiedRawFetch({ proxyUrl: proxyMap.url, proxyToken }),
+              });
+              console.log('warehouse-engine wh_proxy lever armed: own-ref DIRECT bypass active — the engine OWN host keeps the default platform fetch (co-hosted law), remote shards ride the proxy');
+            }
           }
         }
       } catch {
@@ -168,10 +215,13 @@ const deps: WhEngineDeps = await (async () => {
     // static flipped to the deletion pin, §5). Still never REACHED while
     // hasRealFetcher=false (the handler rejects /query before any fan-out).
     // r123 WH_PROXY lever: the rawFetch dep rides the acct2 proxy ONLY when
-    // the boot block above armed it (env 'on' + token + well-formed KV) —
-    // the spread adds NOTHING otherwise, so the inert path is byte-identical
-    // to pre-r123 (default platform fetch, the seam default in
-    // wh_shard_channel.ts). The handshake plane above stays DIRECT either way.
+    // the boot block above armed it (env 'on' + token + well-formed KV + a
+    // known own ref) — and then as the OWN-REF DIRECT carve-out wrapper: the
+    // engine's OWN host keeps the default platform fetch (the co-hosted law;
+    // the r123 P0), remote shards ride the proxy. The spread adds NOTHING
+    // otherwise, so the inert path is byte-identical to pre-r123 (default
+    // platform fetch, the seam default in wh_shard_channel.ts). The
+    // handshake plane above stays DIRECT either way.
     fetcher: makeRpcShardFetcher({
       resolveKey: resolveShardKey,
       ...(proxyRawFetch !== undefined ? { rawFetch: proxyRawFetch } : {}),

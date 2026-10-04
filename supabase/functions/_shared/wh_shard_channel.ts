@@ -118,10 +118,13 @@ export function parseShardKeyEnv(
 // `wh_shard_proxy_map` KV value (the FM 0019 validator MIRRORED here —
 // defense in depth; the engine never trusts a value it did not shape-check)
 // plus the `proxiedRawFetch` transform (§1.4): (url, init) → POST <proxyUrl>
-// with a JSON spec carrying the target url/method/headers/body verbatim.
-// Purity law intact: BOTH pieces are pure — the SHELL (warehouse-engine/
-// index.ts) owns every env read and the ONE boot-once KV read (⟫B4) and
-// wires this with the WH_PROXY_FETCHER / WH_PROXY_TOKEN envs.
+// with a JSON spec carrying the target url/method/headers/body verbatim,
+// WRAPPED in the OWN-REF DIRECT carve-out (r123 P0 fix — the co-hosted law:
+// the engine's own shard is intra-project and NEVER rides the cross-account
+// proxy; remote shards only). Purity law intact: BOTH pieces are pure — the
+// SHELL (warehouse-engine/index.ts) owns every env read and the ONE boot-once
+// KV read (⟫B4, timeout-raced — see raceWhProxyKvBoot) and wires this with
+// the WH_PROXY_FETCHER / WH_PROXY_TOKEN envs.
 //
 // ECHO LAW (r57, wh_shard_channel.ts:20-23): every defect log below is a
 // FIXED string — the KV value is NEVER echoed, never value fragments
@@ -147,9 +150,10 @@ export interface WhProxyMapValue {
 
 /**
  * parseWhProxyMapValue — the ENGINE-SIDE mirror of the FM `wh_shard_proxy_map`
- * validator (fm db/migrations/0019_geo_b2_prestage.sql:175-220, ⟫A5):
+ * validator (fm db/migrations/0019_geo_b2_prestage.sql:175-220, ⟫A5; the
+ * non-empty-refs arm token-equivalent to the FM 0027 validator):
  *   * value must be a JSON object with EXACTLY the members `{url, refs}`
- *     (extra members REJECTED; url: string; refs: array of strings);
+ *     (extra members REJECTED; url: string; refs: NON-EMPTY array of strings);
  *   * NO JWT-shaped string (`^eyJ`) anywhere in the value — the proxy token
  *     NEVER rides the config KV (the r69 §3.3 doctrine made ENFORCED);
  *   * `url` must match ^https://[a-z0-9]{20}\.supabase\.co/functions/v1/proxy$
@@ -190,6 +194,14 @@ export function parseWhProxyMapValue(
     defect('wh_shard_proxy_map defect class bad-url: url does not match the acct2 proxy-fn URL shape — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
     return null;
   }
+  // FM 0027 token-equivalence (r123 fresh-eyes P3): the FM validator requires
+  // refs NON-EMPTY — reject the empty array HERE explicitly so the mirrors
+  // stay token-equivalent (host-ref ∈ refs below already closed every
+  // reachable path transitively; this is the explicit-formality mirror).
+  if (refs.length === 0) {
+    defect('wh_shard_proxy_map defect class empty-refs: refs must be a NON-EMPTY array — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+    return null;
+  }
   if (refs.some((entry) => !WH_PROXY_REF_RE.test(entry))) {
     defect('wh_shard_proxy_map defect class bad-ref: a refs entry is not a 20-char lowercase project ref — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
     return null;
@@ -203,6 +215,48 @@ export function parseWhProxyMapValue(
     return null;
   }
   return { url, refs };
+}
+
+/** The boot-once KV-read timeout (r123 fresh-eyes P3 fix): a HANGING
+ *  PostgREST at isolate boot must not wedge module evaluation (Deno.serve
+ *  would never start) with the lever ON. 10s — a healthy PostgREST answers
+ *  in milliseconds; a hang degrades to the KV-absent state (lever inert +
+ *  ONE fixed-string defect log, shell-owned). */
+export const WH_PROXY_KV_BOOT_TIMEOUT_MS = 10_000;
+
+/**
+ * raceWhProxyKvBoot (r123 fresh-eyes P3 fix): the boot-once
+ * `wh_shard_proxy_map` KV read raced against a wall-clock timeout.
+ *   * read settles (resolve OR reject) within timeoutMs ⇒ its outcome
+ *     propagates UNCHANGED (a rejection still reaches the shell's try/catch
+ *     and its fixed-string defect log — nothing is swallowed here);
+ *   * read neither resolves nor rejects within timeoutMs ⇒ resolves with
+ *     `timedOut()` — the caller's timeout sentinel (the shell: `null` +
+ *     the fixed-string timeout defect log inside the callback), so a
+ *     hanging PostgREST degrades to the lever-inert state instead of
+ *     wedging module evaluation. The losing read's eventual settlement is
+ *     IGNORED (Promise.race already attached handlers — no unhandled
+ *     rejection).
+ * The timeout timer is ALWAYS cleared once the race settles — a read that
+ * wins must not leave a dangling timer (offline-test sanitizer law).
+ * Purity: a pure race over the caller's promise — the read itself stays
+ * shell-owned (the ONE db() chain, ⟫B4). The kvRead param is PromiseLike
+ * (not Promise) because supabase-js query builders are thenables, not
+ * Promises; the raced result is `T | U` (the timeout sentinel is a DISTINCT
+ * type — the shell discriminates on null, never on a faked read shape).
+ */
+export function raceWhProxyKvBoot<T, U>(
+  kvRead: PromiseLike<T>,
+  timeoutMs: number,
+  timedOut: () => U,
+): Promise<T | U> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<U>((resolve) => {
+    timer = setTimeout(() => resolve(timedOut()), timeoutMs);
+  });
+  return Promise.race([kvRead, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }
 
 /** The rawFetch seam type (RpcShardFetcherDeps.rawFetch, above) restated
@@ -286,6 +340,63 @@ export function makeProxiedRawFetch(deps: ProxiedRawFetchDeps): WhProxyRawFetch 
       body: JSON.stringify(spec),
     });
   };
+}
+
+export interface OwnRefBypassRawFetchDeps {
+  /** The engine's OWN project_ref (ownProjectRefFromSupabaseUrl over
+   *  SUPABASE_URL — the co-hosted law; the SHELL owns the env read and
+   *  already holds this value for the shard-key resolver). '' DISABLES the
+   *  bypass arm (AM-8 mirror: an empty own ref never matches — every target
+   *  stays on the proxied transport; the shell additionally refuses to ARM
+   *  the lever with an unknown own ref, so this factory arm is the
+   *  belt-and-braces backstop). */
+  ownRef: string;
+  /** The lever transform (makeProxiedRawFetch output) for every NON-own
+   *  host. */
+  proxiedRawFetch: WhProxyRawFetch;
+  /** The DEFAULT platform fetch for the OWN host (prod: global fetch;
+   *  tests: fakes). Injectable for the offline battery — the prod default
+   *  is the same `fetch` the unwrapped fetcher seam uses. */
+  directFetch?: WhProxyRawFetch;
+}
+
+/**
+ * makeOwnRefBypassRawFetch (r123 P0 fix — the live-e2e RED closure): wraps
+ * the WH_PROXY lever transform with the OWN-REF DIRECT carve-out. The
+ * engine's OWN shard is INTRA-PROJECT (the co-hosted law — engine and own
+ * shard share the isolate host), so its traffic must NEVER ride the
+ * cross-account proxy: the r123 live e2e (v14 lever ON) showed the own-ref
+ * shard fetch through the acct2 proxy drawing a RELAYED 401 "Invalid API
+ * key" from the own host's public edge for the own-ref
+ * SUPABASE_SERVICE_ROLE_KEY, while the SAME credential succeeds on the
+ * isolate-internal direct path (the pre-r123 behavior). The carve-out:
+ *   * TARGET host is the engine's OWN project host — the target url
+ *     BYTE-EXACTLY starts with `https://<ownRef>.supabase.co/` ⇒ the
+ *     DEFAULT platform fetch receives (url, init) VERBATIM. The match is
+ *     the ⟫A7 raw-exact stance: no URL parse, no normalization, and the
+ *     trailing `/` in the needle is LOAD-BEARING (kills the r69 M2
+ *     prefix-mutant class — `https://<ownRef>.supabase.co.evil.io/` and a
+ *     ref-EXTENDED spelling never match). A case/trailing-dot/port
+ *     variation is a MISS and stays on the proxy (fail-closed conservative
+ *     — the engine builds shard URLs canonically from lowercase directory
+ *     refs, exactly as parseWhProxyMapValue argues);
+ *   * EVERY other host (the remote shards — the acct2 egress-pool purpose)
+ *     ⇒ the proxied transform, byte-identical to the unwrapped lever.
+ * NEVER-THROW SEAM CONTRACT preserved EXACTLY: the wrapper catches NOTHING
+ * and adds no fallible parse (a raw prefix test, never `new URL`) —
+ * transport rejections from EITHER transport propagate to the fetcher's
+ * arm-0 catch (the `network` warning), unchanged.
+ */
+export function makeOwnRefBypassRawFetch(deps: OwnRefBypassRawFetchDeps): WhProxyRawFetch {
+  const direct = deps.directFetch ??
+    ((url: string, init: { method: string; headers: Record<string, string>; body?: string }) => fetch(url, init));
+  // '' ownRef disables the arm (AM-8 mirror) — the needle stays null and can
+  // never match (belt-and-braces; the shell refuses to arm on '' too).
+  const ownHostPrefix = deps.ownRef === '' ? null : `https://${deps.ownRef}.supabase.co/`;
+  return (url, init) =>
+    ownHostPrefix !== null && url.startsWith(ownHostPrefix)
+      ? direct(url, init)
+      : deps.proxiedRawFetch(url, init);
 }
 
 // ---------- the real fetcher (D7/D8/D9, §3.4) ----------

@@ -37,11 +37,14 @@ import type {
 import { checkHandshake, deriveTemplateHashes, ENGINE_TEMPLATE_MANIFEST } from './wh_handshake.ts';
 import type { DerivePlanView, HandshakePlanRef, TemplateInventoryRow, WhShardHandshake } from './wh_handshake.ts';
 import {
+  makeOwnRefBypassRawFetch,
   makeProxiedRawFetch,
   makeRpcShardFetcher,
   makeShardKeyResolver,
   parseShardKeyEnv,
   parseWhProxyMapValue,
+  raceWhProxyKvBoot,
+  WH_PROXY_KV_BOOT_TIMEOUT_MS,
 } from './wh_shard_channel.ts';
 import { deepEq, show } from './wh_testutil.ts';
 
@@ -1681,6 +1684,238 @@ Deno.test('r123 ⟫B5 burst pin: RATE_LIMITED-shaped 429 (+Retry-After) → engi
   }
   eqTrue('rate-limit burst: NO exception (the per-shard degrade arm — never a /query hard-fail by itself)', !threw);
   eq('warning = {httpStatus:429} EXACTLY — RATE_LIMITED can never match ^WH[0-9]{3}$ so the code field stays ABSENT (no D8 misroute; audit-B verified)', out && out.ok === false ? out.warning : undefined, { httpStatus: 429 });
+});
+
+// =============================================================================
+// r123 P0/P3 fixes (the live-e2e RED closure + the fresh-eyes P3s).
+// =============================================================================
+// P0: makeOwnRefBypassRawFetch — the OWN-REF DIRECT carve-out (the co-hosted
+// law: the engine's own shard is intra-project and NEVER rides the
+// cross-account proxy; the v14 live e2e drew a relayed 401 "Invalid API key"
+// for the own-ref credential through the acct2 proxy while the same
+// credential succeeds direct). The bypass is EXACT — only the engine's own
+// host bypasses — and preserves the never-throw seam. The SHELL wires it with
+// the authoritative self-ref source it ALREADY holds (ownRef =
+// ownProjectRefFromSupabaseUrl(SUPABASE_URL) — geo_write_fence.ts, the same
+// value feeding the shard-key resolver; the co-hosted law). P3s:
+// raceWhProxyKvBoot (hanging PostgREST ⇒ KV-absent, never a wedged boot) and
+// the empty-refs reject (FM 0027 token-equivalence). The lever-gated shell
+// wiring itself is pinned statically in wh_entrypoint_test.ts.
+
+const WH_OWN_REF = 'blnkbdwpxjizgpggcdqj'; // the engine's OWN host ref (the r123 live e2e FM self-shard)
+const WH_OWN_TARGET_RPC_URL = `https://${WH_OWN_REF}.supabase.co/rest/v1/rpc/wh_query`;
+
+Deno.test('r123 P3 parseWhProxyMapValue: EMPTY refs array => empty-refs class (FM 0027 token-equivalence — non-empty required BOTH sides)', () => {
+  const defects: string[] = [];
+  const v = parseWhProxyMapValue({ url: WH_PROXY_URL, refs: [] }, (m) => defects.push(m));
+  eqTrue('empty refs: rejected', v === null);
+  eq('the FIXED empty-refs log (echo law)', defects, [
+    'wh_shard_proxy_map defect class empty-refs: refs must be a NON-EMPTY array — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)',
+  ]);
+  // the mirror stays token-equivalent WITHOUT widening: a non-empty valid
+  // value is still accepted (the happy-path cell above pins that arm).
+});
+
+Deno.test('r123 P0 ownRefBypass: OWN host => the DEFAULT platform fetch receives (url, init) VERBATIM — the proxied transform is NOT invoked', async () => {
+  const proxiedCalls: RawCall[] = [];
+  const directCalls: RawCall[] = [];
+  const bypass = makeOwnRefBypassRawFetch({
+    ownRef: WH_OWN_REF,
+    proxiedRawFetch: makeProxiedRawFetch({
+      proxyUrl: WH_PROXY_URL,
+      proxyToken: WH_PROXY_TOKEN,
+      fetchImpl: fakeRaw({ calls: proxiedCalls, status: 200, body: JSON.stringify(w1Wire()) }),
+    }),
+    directFetch: fakeRaw({ calls: directCalls, status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(w1Wire()) }),
+  });
+  const out = await bypass(WH_OWN_TARGET_RPC_URL, { method: 'POST', headers: { apikey: 'sk-own' }, body: '{"p":1}' });
+  eqTrue('the own-host fetch resolves via the DIRECT transport', (await out.text()).length > 0);
+  eq('the proxied transform invoked ZERO times (the own-ref P0 regression: own traffic NEVER rides the proxy)', proxiedCalls.length, 0);
+  eq('the direct transport invoked EXACTLY once', directCalls.length, 1);
+  eq('direct call url = the TARGET url verbatim (no proxy rewrite)', directCalls[0]!.url, WH_OWN_TARGET_RPC_URL);
+  eq('direct init VERBATIM (method)', directCalls[0]!.init.method, 'POST');
+  eq('direct init VERBATIM (shard headers ride unchanged — the own service key stays on the isolate-internal path)', directCalls[0]!.init.headers, { apikey: 'sk-own' });
+  eq('direct init VERBATIM (body)', directCalls[0]!.init.body, '{"p":1}');
+});
+
+Deno.test('r123 P0 ownRefBypass: REMOTE host => the proxied transform invoked (spec POST to the proxy fn) — the carve-out is EXACT', async () => {
+  const proxiedCalls: RawCall[] = [];
+  const directCalls: RawCall[] = [];
+  const bypass = makeOwnRefBypassRawFetch({
+    ownRef: WH_OWN_REF,
+    proxiedRawFetch: makeProxiedRawFetch({
+      proxyUrl: WH_PROXY_URL,
+      proxyToken: WH_PROXY_TOKEN,
+      fetchImpl: fakeRaw({ calls: proxiedCalls, status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(w1Wire()) }),
+    }),
+    directFetch: fakeRaw({ calls: directCalls, status: 200, body: '' }),
+  });
+  const out = await bypass(WH_TARGET_RPC_URL, { method: 'POST', headers: { apikey: 'sk-remote' }, body: '{"p":1}' });
+  eqTrue('the remote fetch resolves through the proxy transform', (await out.text()).length > 0);
+  eq('the direct transport invoked ZERO times (remote shards ride the acct2 egress pool — the lever purpose)', directCalls.length, 0);
+  eq('the proxied transform invoked EXACTLY once — at the PROXY url', proxiedCalls.length, 1);
+  eq('proxied call url = the acct2 proxy fn', proxiedCalls[0]!.url, WH_PROXY_URL);
+  eq('the spec carries the REMOTE target verbatim', JSON.parse(proxiedCalls[0]!.init.body!).url, WH_TARGET_RPC_URL);
+});
+
+Deno.test('r123 P0 ownRefBypass: the carve-out is EXACT — lookalike hosts stay on the proxy (M2 prefix family: ref-extension, host-suffix, case, port, trailing-dot)', async () => {
+  // Every lookalike below is a byte-EXACT miss on the needle
+  // `https://<ownRef>.supabase.co/` (the trailing `/` is load-bearing — the
+  // r69 M2 prefix-mutant class). A miss ⇒ PROXY (fail-closed conservative):
+  // the bypass never grants a host the exact byte comparison did not name.
+  const cases: [string, string][] = [
+    ['ref-EXTENDED spelling (M2: ownRef prefix of a longer ref)', `https://${WH_OWN_REF}x.supabase.co/rest/v1/rpc/wh_query`],
+    ['host-SUFFIX lookalike (⟫A1: not self-host either)', `https://${WH_OWN_REF}.supabase.co.evil.io/rest/v1/rpc/wh_query`],
+    ['CASE variation (DNS-identical but byte-miss — engine builds urls lowercase)', `https://${WH_OWN_REF.toUpperCase()}.supabase.co/rest/v1/rpc/wh_query`],
+    ['explicit PORT (default-443 byte shape only)', `https://${WH_OWN_REF}.supabase.co:8443/rest/v1/rpc/wh_query`],
+    ['TRAILING-DOT host (⟫A7 raw-exact stance)', `https://${WH_OWN_REF}.supabase.co./rest/v1/rpc/wh_query`],
+  ];
+  for (const [name, url] of cases) {
+    const proxiedCalls: RawCall[] = [];
+    const directCalls: RawCall[] = [];
+    const bypass = makeOwnRefBypassRawFetch({
+      ownRef: WH_OWN_REF,
+      proxiedRawFetch: makeProxiedRawFetch({ proxyUrl: WH_PROXY_URL, proxyToken: WH_PROXY_TOKEN, fetchImpl: fakeRaw({ calls: proxiedCalls, status: 200, body: '' }) }),
+      directFetch: fakeRaw({ calls: directCalls, status: 200, body: '' }),
+    });
+    await bypass(url, { method: 'GET', headers: { apikey: 'sk' } });
+    eqTrue(`lookalike ${name}: PROXIED (not bypassed)`, proxiedCalls.length === 1 && proxiedCalls[0]!.url === WH_PROXY_URL);
+    eqTrue(`lookalike ${name}: the direct transport NEVER fired`, directCalls.length === 0);
+  }
+});
+
+Deno.test('r123 P0 ownRefBypass: ownRef "" DISABLES the arm (AM-8 mirror) — every host proxied; the shell ALSO refuses to arm on "" (static pin)', async () => {
+  const proxiedCalls: RawCall[] = [];
+  const directCalls: RawCall[] = [];
+  const bypass = makeOwnRefBypassRawFetch({
+    ownRef: '',
+    proxiedRawFetch: makeProxiedRawFetch({ proxyUrl: WH_PROXY_URL, proxyToken: WH_PROXY_TOKEN, fetchImpl: fakeRaw({ calls: proxiedCalls, status: 200, body: '' }) }),
+    directFetch: fakeRaw({ calls: directCalls, status: 200, body: '' }),
+  });
+  await bypass(WH_OWN_TARGET_RPC_URL, { method: 'GET', headers: {} });
+  eqTrue('empty ownRef: the OWN-host url goes to the PROXY (the arm can never match)', proxiedCalls.length === 1 && proxiedCalls[0]!.url === WH_PROXY_URL);
+  eqTrue('empty ownRef: the direct transport NEVER fired', directCalls.length === 0);
+  // Note: the shell never CONSTRUCTS the wrapper with ownRef '' — the arming
+  // gate treats an unparseable SUPABASE_URL as a lever defect (inert, ONE
+  // fixed-string log). This factory arm is the belt-and-braces backstop.
+});
+
+Deno.test('r123 P0 ownRefBypass: never-throw seam preserved on BOTH transports — rejections reach the fetcher arm-0 network warning (nothing swallowed by the wrapper)', async () => {
+  // own host, DIRECT transport rejects
+  {
+    const bypass = makeOwnRefBypassRawFetch({
+      ownRef: WH_OWN_REF,
+      proxiedRawFetch: makeProxiedRawFetch({ proxyUrl: WH_PROXY_URL, proxyToken: WH_PROXY_TOKEN, fetchImpl: fakeRaw({ status: 200, body: '' }) }),
+      directFetch: fakeRaw({ reject: true }),
+    });
+    const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-own-key', rawFetch: bypass });
+    let out: Awaited<ReturnType<typeof fetcher>> | undefined;
+    let threw = false;
+    try {
+      out = await fetcher(WH_OWN_REF, WH_OWN_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+    } catch {
+      threw = true;
+    }
+    eqTrue('own host + rejecting DIRECT transport: NO exception escapes the fetcher', !threw);
+    eq('the SEAM contract catch classifies it (arm-0 network)', out && out.ok === false ? out.warning : undefined, { code: 'network' });
+  }
+  // remote host, PROXY transport rejects (the bypass must not add catching)
+  {
+    const bypass = makeOwnRefBypassRawFetch({
+      ownRef: WH_OWN_REF,
+      proxiedRawFetch: makeProxiedRawFetch({ proxyUrl: WH_PROXY_URL, proxyToken: WH_PROXY_TOKEN, fetchImpl: fakeRaw({ reject: true }) }),
+      directFetch: fakeRaw({ status: 200, body: '' }),
+    });
+    const fetcher = makeRpcShardFetcher({ resolveKey: () => 'sk-remote-key', rawFetch: bypass });
+    let out: Awaited<ReturnType<typeof fetcher>> | undefined;
+    let threw = false;
+    try {
+      out = await fetcher('shard-a', WH_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+    } catch {
+      threw = true;
+    }
+    eqTrue('remote host + rejecting PROXY transport: NO exception escapes the fetcher', !threw);
+    eq('arm-0 network unchanged behind the bypass', out && out.ok === false ? out.warning : undefined, { code: 'network' });
+  }
+});
+
+Deno.test('r123 P0 ownRefBypass INTEGRATION: the shell wiring shape — ONE resolver instance + the bypass wrapper; own shard DIRECT with the OWN key, remote shard PROXIED with the remote key', async () => {
+  const proxiedCalls: RawCall[] = [];
+  const directCalls: RawCall[] = [];
+  // D6 single source of truth, exactly as the shell wires it: the resolver
+  // feeds BOTH the fetcher's key resolution AND (transitively) the target
+  // identity — the own-ref DIRECT carve-out keys off the same own ref.
+  const resolveKey = makeShardKeyResolver({
+    ownRef: WH_OWN_REF,
+    ownKey: 'sk-own-service-key',
+    remoteKeys: new Map([['shardaexampleexampl1', 'sk-remote-service-key']]),
+  });
+  const bypass = makeOwnRefBypassRawFetch({
+    ownRef: WH_OWN_REF,
+    proxiedRawFetch: makeProxiedRawFetch({
+      proxyUrl: WH_PROXY_URL,
+      proxyToken: WH_PROXY_TOKEN,
+      fetchImpl: fakeRaw({ calls: proxiedCalls, status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(w1Wire()) }),
+    }),
+    directFetch: fakeRaw({ calls: directCalls, status: 200, headers: { 'content-type': 'application/json' }, body: JSON.stringify(w1Wire()) }),
+  });
+  const fetcher = makeRpcShardFetcher({ resolveKey, rawFetch: bypass });
+  // the OWN shard: direct, own key, zero proxy involvement (the P0 regression cell)
+  const ownOut = await fetcher(WH_OWN_REF, WH_OWN_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+  eqTrue('own shard: 200 envelope via the DIRECT transport', ownOut.ok === true);
+  eq('own shard: direct call rides the OWN service key (isolate-internal path)', directCalls[0]!.init.headers['Authorization'], 'Bearer sk-own-service-key');
+  eqTrue('own shard: the proxy was NEVER contacted', proxiedCalls.length === 0);
+  // a REMOTE shard: proxied, remote key (the acct2 egress-pool purpose)
+  const remoteOut = await fetcher('shardaexampleexampl1', WH_TARGET_RPC_URL, { p_template_hash: W1H, p_params: {} });
+  eqTrue('remote shard: 200 envelope through the PROXY', remoteOut.ok === true);
+  eqTrue('remote shard: the direct transport NEVER fired for it', directCalls.length === 1);
+  const spec = JSON.parse(proxiedCalls[0]!.init.body!) as { headers: Record<string, string> };
+  eq('remote shard: the spec carries the REMOTE service key verbatim', spec.headers['Authorization'], 'Bearer sk-remote-service-key');
+});
+
+Deno.test('r123 P3 raceWhProxyKvBoot: a KV read that NEVER settles => the timedOut() KV-absent sentinel resolves (lever inert path, no wedged boot)', async () => {
+  const never = new Promise<{ data: unknown; error: unknown }>(() => {}); // the hanging-PostgREST fake
+  let timedOutFired = 0;
+  const out = await raceWhProxyKvBoot(
+    never,
+    5, // short injectable timeout — the 10s policy is pinned separately
+    () => {
+      timedOutFired++;
+      return { data: null, error: null };
+    },
+  );
+  eqTrue('the timeout arm resolves with the KV-ABSENT shape (the shell absent-row arm owns the inert log)', out.data === null && out.error === null);
+  eq('the timedOut callback fired EXACTLY once', timedOutFired, 1);
+});
+
+Deno.test('r123 P3 raceWhProxyKvBoot: a read that settles FIRST wins — value verbatim, timedOut NEVER fires, the 10s timer CLEARED (no dangling op)', async () => {
+  const read = new Promise<{ data: unknown; error: unknown }>((resolve) => {
+    setTimeout(() => resolve({ data: { value: 'kv' }, error: null }), 5);
+  });
+  const out = await raceWhProxyKvBoot(read, WH_PROXY_KV_BOOT_TIMEOUT_MS, () => {
+    throw new Error('timedOut must NOT fire when the read wins');
+  });
+  eq('the read value verbatim', out.data, { value: 'kv' });
+  eq('the read error verbatim', out.error, null);
+  // the finally-cleared 10s timer is what lets this test finish without the
+  // sanitizer flagging a pending op — the clear is LOAD-BEARING here.
+});
+
+Deno.test('r123 P3 raceWhProxyKvBoot: a read that REJECTS before the timeout propagates UNCHANGED (the shell catch arm — nothing swallowed into the sentinel)', async () => {
+  const boom = new Promise<{ data: unknown; error: unknown }>((_, reject) => {
+    setTimeout(() => reject(new Error('postgrest reset by peer')), 5);
+  });
+  let threw = false;
+  try {
+    await raceWhProxyKvBoot(boom, WH_PROXY_KV_BOOT_TIMEOUT_MS, () => ({ data: null, error: null }));
+  } catch {
+    threw = true;
+  }
+  eqTrue('the rejection propagates (the shell try/catch keeps its fixed-string log arm)', threw);
+});
+
+Deno.test('r123 P3: WH_PROXY_KV_BOOT_TIMEOUT_MS is the shipped 10s policy (a hang degrades, never wedges)', () => {
+  eq('the boot-read timeout const', WH_PROXY_KV_BOOT_TIMEOUT_MS, 10_000);
 });
 
 // -----------------------------------------------------------------------------

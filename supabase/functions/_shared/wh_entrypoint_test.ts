@@ -632,8 +632,9 @@ function staticPins(): void {
   // platform fetch: the byte-identical unset path (mirror of the rpcMode
   // expression's unset law). The KV read is the DIRECT db() chain — NEVER
   // getConfig() (drops unknown keys) — boot-once in the shell IIFE (⟫B4),
-  // shape re-validated engine-side via parseWhProxyMapValue (defense in
-  // depth — the FM 0019 validator mirror), token from the DEDICATED
+  // TIMEOUT-RACED (the r123 fresh-eyes P3), shape re-validated engine-side
+  // via parseWhProxyMapValue (defense in depth — the FM 0019/0027 validator
+  // mirror), token from the DEDICATED
   // WH_PROXY_TOKEN (never WHE_BEARER_TOKEN — the snapshotKey doctrine).
   ok('index.ts r123 WH_PROXY lever: conditional rawFetch wiring + boot-once DIRECT KV read (byte-identical default fetch when inert)',
     indexSrc.includes('...(proxyRawFetch !== undefined ? { rawFetch: proxyRawFetch } : {})') &&
@@ -645,6 +646,35 @@ function staticPins(): void {
     indexSrc.includes('makeProxiedRawFetch(') &&
     !indexSrc.includes('getConfig()'),
     'lever wiring missing, unconditional, or the KV read is not the direct db() chain');
+  // r123 P0 fix (the live-e2e RED closure): the lever arms ONLY as the
+  // OWN-REF DIRECT carve-out wrapper (makeOwnRefBypassRawFetch) — the
+  // engine's own shard keeps the default platform fetch (the co-hosted law:
+  // intra-project traffic never rides the cross-account proxy; the v14 e2e
+  // drew a relayed 401 "Invalid API key" for the own-ref credential through
+  // the acct2 proxy), remote shards ride the proxy — and ONLY with a KNOWN
+  // own ref: the SUPABASE_URL subdomain via ownProjectRefFromSupabaseUrl,
+  // the SAME authoritative source the shard-key resolver already uses (no
+  // new env — the co-hosted law IS the self-ref source). An unparseable
+  // SUPABASE_URL keeps the lever INERT (fail-closed — "own never proxies"
+  // is unprovable without the own-ref identity). The boot KV read is
+  // TIMEOUT-RACED (raceWhProxyKvBoot @ WH_PROXY_KV_BOOT_TIMEOUT_MS — a
+  // hanging PostgREST degrades to the KV-absent state instead of wedging
+  // module evaluation; the fresh-eyes P3). The ordering pin proves the
+  // wrapper is constructed BETWEEN the lever env check and the conditional
+  // spread — the bypass exists ONLY when the lever is ON (lever off ⇒
+  // proxyRawFetch stays undefined ⇒ the default platform fetch).
+  ok('index.ts r123 P0 own-ref bypass: carve-out wrapper + known-own-ref gate + boot KV timeout-race, all INSIDE the lever block',
+    indexSrc.includes('makeOwnRefBypassRawFetch({') &&
+    indexSrc.includes('proxiedRawFetch: makeProxiedRawFetch({ proxyUrl: proxyMap.url, proxyToken }),') &&
+    indexSrc.includes("if (proxyMap !== null && ownRef === '')") &&
+    indexSrc.includes('warehouse-engine wh_proxy lever armed: own-ref DIRECT bypass active — the engine OWN host keeps the default platform fetch (co-hosted law), remote shards ride the proxy') &&
+    indexSrc.includes('warehouse-engine wh_proxy lever defect: SUPABASE_URL unparseable — the own-ref DIRECT carve-out cannot be guaranteed — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)') &&
+    indexSrc.includes('raceWhProxyKvBoot(') &&
+    indexSrc.includes('WH_PROXY_KV_BOOT_TIMEOUT_MS') &&
+    indexSrc.includes('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map boot read timed out (hanging PostgREST) — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)') &&
+    indexSrc.indexOf("Deno.env.get('WH_PROXY_FETCHER') === 'on'") < indexSrc.indexOf('makeOwnRefBypassRawFetch({') &&
+    indexSrc.indexOf('makeOwnRefBypassRawFetch({') < indexSrc.indexOf('...(proxyRawFetch !== undefined ? { rawFetch: proxyRawFetch } : {})'),
+    'own-ref bypass wiring missing, ungated, or outside the lever block');
   ok('index.ts wires the extracted handler', indexSrc.includes('handleWhEngineRequest(req, deps)'), 'wiring');
   ok('index.ts uses the shared directory reader', indexSrc.includes('makeDirectoryReader'), 'reader');
   // r120 OPT-1: the reader's fetchAtomic edge is the ONE atomic rpc POST —
