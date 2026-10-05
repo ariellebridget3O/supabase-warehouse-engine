@@ -49,6 +49,7 @@ The handler locates the `/warehouse-engine` marker inside `url.pathname` and rou
 | `query.select` | aggregate list, ops `sum|count|min|max|avg`, optional `col` + `alias` |
 | `query.where` | optional; ops `eq|neq|gt|gte|lt|lte|between|is` |
 | `query.groupBy` | optional group keys (grouped ⇒ `rows` response shape; absent ⇒ scalar `result` shape) |
+| `query.join` | optional join descriptor `{"table":"wh_probe_dim","type":"inner","on":{"left":"region","right":"region"}}` — strictly validated WHEN PRESENT (absent/null ⇒ absent; every request without it parses byte-identically); see §`query.join` below |
 | `query.limit` | optional non-negative integer or `null` |
 | `having` / `orderBy` / `offset` / `distinct` | **neutral values dropped; non-neutral rejected 400** (e.g. `OFFSET > 0` names the `409 page_unavailable` class — rejected at plan time) |
 | `read_plane` | exact `primary` (default) or `replica` |
@@ -58,11 +59,36 @@ The handler locates the `/warehouse-engine` marker inside `url.pathname` and rou
 | `idempotency_key` / write-batch markers | mark the body a **write plan** — fence gate pre-parse (below) |
 | `write_epoch` | additive optional carry, adjudicated by the fence's G-W4 when the fence is open |
 
+### `query.join` — co-located agg-join (r129)
+
+Optional descriptor inside the `query` object (camelCase `groupBy` composes with it — grouped rows shape). Wire grammar (the only join binding live today, template class W6):
+
+```json
+{
+  "table": "wh_probe_dim",
+  "type": "inner",
+  "on": { "left": "region", "right": "region" }
+}
+```
+
+Strict parse law (`wh_engine_core.ts:536-583`; every violation a fixed-string `400 malformed`, never an echo of the input):
+
+- `table` — plain identifier (`IDENT_RE`) and must **differ** from the query table (self-join is not v1).
+- `type` — the literal `"inner"` only.
+- `on` — object with **only** `left`/`right` keys, both plain identifiers. Unknown keys inside `join` OR inside `join.on` are rejected (tighter than the outer query object's ignore, which is untouched).
+
+Plan-time gates (all `400` via the entrypoint ladder — no 500 fall-through):
+
+- **`join_template_required`** — a join request must derive the join-class template (W6, the manifest row carrying the `join` binding) over the `wh_query` RPC plane; non-join-class templates never serve join plans (derivation is join-aware: non-join plans EXCLUDE join-class rows, join plans derive ONLY them).
+- **`join_key_mismatch`** — the request's `on.left`/`on.right` must EQUAL the selected template's declared manifest `join.{left,right}` (the template body hardcodes the keys — a wrong bind would silently return a WRONG oracle).
+- **`join_not_colocated`** — fail-closed colocation gate: the dim relation must be broadcast-reference (`is_reference === true` on every dim placement — undefined/false ⇒ reject) and EXACTLY ONE serving-or-draining dim placement must exist on every selected ref.
+
+**The bare-count law (col-strict adapter law):** the join plan's row-count agg must be a BARE count — `{"op":"count","alias":"n"}` with **no `col`**. The adapter matches a plan agg to a template encoding only when the (op, col) pair is identical — a bare `count(*)` never matches a col-scoped encoding and vice versa. W6's `n` encoding is bare, so a col-scoped count (e.g. `count(id)`) makes the plan unservable ⇒ every shard returns `envelope_invalid`/excluded ⇒ the request fails 400 (proven live r130).
+
 ### Processing order (exact)
 
 1. Body must be a JSON **object** ⇒ else `400 malformed` (`qid: null`).
-2. **Deploy gate first:** `hasRealFetcher` is `false` at HEAD (`FLIP_hasRealFetcher`, `wh_entrypoint.ts:102`) ⇒ **every `/query` returns the pinned 500 before any directory work**:
-   `{"v":1,"qid":…,"error":{"code":"internal","message":"real shard fetcher lands after live probes #1/#2 (PAT-gated design freeze for the QC2 compile)"}}` — a deployed stub must never serve plausible empty 200s.
+2. **`hasRealFetcher` is `true` since r118** (`FLIP_hasRealFetcher`, `wh_entrypoint.ts:105`) — `/query` is live and proceeds to the fence + directory work. The historical pre-flip deploy gate (a pinned 500 "real shard fetcher lands after live probes #1/#2" before ANY work) is retired; the flip constant remains the rollback site (flipping is a reviewed code change, never an env).
 3. **Write-plan fence (pre-parse):** fenced ⇒ `503 {"v":1,"qid","error":{"code":"read_only_mode","message":…}}`; an **unwired fence dep** ⇒ `500 internal` (G-W1 fail-closed — the engine cannot vouch the write, and never masquerades unreadable config as 503).
 4. Parse gates (§request table) ⇒ `400 malformed` on any violation.
 5. RYW lever check (§`min_lsn`).
@@ -83,13 +109,16 @@ The engine envelope (grouped plans carry `rows`, scalar plans carry `result`):
   "partial": false,
   "rows":    [{"k": [ …group keys… ], "aggs": { "<alias>": … }}],
   "warnings": [ {"shard": …, "code": …, "est_rows": 0, "retried": false} ],
-  "perShard": [ … ],
+  "perShard": [ {"shard": …, "ok": true, "latencyMs": …, "error": null, "partial_rows": …, "partial_bytes": …} ],
   "latency_ms": 12,
+  "phases": { "pre_chain_ms": …, "handshake_ms": …, "fanout_ms": … },
   "directory_snapshot": "<signed, full-embed only, WH_SNAPSHOT_KEY set>"
 }
 ```
 
-`directory_snapshot` is attached **only** on a fresh full embed when `WH_SNAPSHOT_KEY` is set — a valid replay skips the re-attach (the client's copy is still current).
+- **`phases`** (r121) — `{pre_chain_ms, handshake_ms, fanout_ms}` sub-span timings on **success envelopes only** (omitted on errors). `pre_chain_ms` is the pre-chain wall (fence consult + atomic directory read), `handshake_ms` is `0` on unsampled calls (the inventory GET survives only as a 1-in-16 sampled backstop), `fanout_ms` is the measured fanout block duration.
+- **`perShard[]` additive keys (r129)** — each ok-entry additionally carries `partial_rows` (the partial's row count) and `partial_bytes` (the UTF-8 byte length of `JSON.stringify(envelope.partial)` — the serialization convention of record). **Ok-arms only**: error arms carry NEITHER key and stay byte-identical to their pre-r129 shapes.
+- `directory_snapshot` is attached **only** on a fresh full embed when `WH_SNAPSHOT_KEY` is set — a valid replay skips the re-attach (the client's copy is still current).
 
 ### Error-code map (WhEngineError → HTTP status)
 
@@ -101,6 +130,9 @@ The engine envelope (grouped plans carry `rows`, scalar plans carry `result`):
 | `page_unavailable` | 409 | pagination beyond v0 (e.g. `OFFSET > 0`) |
 | `quorum_unmet` | 409 | merge quorum not reached |
 | `plan_untemplated` | 400 | plan-honesty 4xx (rpcMode plane only — no template covers the plan) |
+| `join_template_required` | 400 | a `query.join` request derived a NON-join-class template — join plans require the join-class template (W6) over the RPC plane |
+| `join_key_mismatch` | 400 | the request's `join.on.{left,right}` do not equal the selected join template's declared manifest `join` binding |
+| `join_not_colocated` | 400 | colocation gate fail-closed: the dim relation is not broadcast-reference (`is_reference !== true` somewhere) or lacks exactly one serving-or-draining placement on a selected ref |
 | anything else | 500 | internal |
 
 Error envelopes carry `directory_version` whenever known, plus `perShard` and `latency_ms` when available:

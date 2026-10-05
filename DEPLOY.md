@@ -74,10 +74,10 @@ SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="<shard-ref>" \
   bash scripts/migrate.sh --shard
 ```
 
-**Then seed the W1–W5 query templates** per `db/shard-templates/manifest.json` (the body-of-record with pinned sha256 `template_hash`es — do not reformat those files). Lint first, then render the seed wave and apply it through the runner's `--file` mode:
+**Then seed the W1–W6 query templates** per `db/shard-templates/manifest.json` (the body-of-record with pinned sha256 `template_hash`es — do not reformat those files; W6 = the r129 join class, additive `join:{dim,left,right}` manifest key). Lint first, then render the seed wave and apply it through the runner's `--file` mode:
 
 ```bash
-python3 scripts/lint_shard_templates.py          # must report: 5/5 templates PASS
+python3 scripts/lint_shard_templates.py          # must report: 6/6 templates PASS
 python3 scripts/render_wh_seed_wave.py \
   --templates-dir db/shard-templates --out seed_wave.sql   # add --with-cold only if facts_blocks DDL (shard 0016) is applied
 SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="<shard-ref>" \
@@ -101,6 +101,7 @@ Optional, same endpoint (separate calls or one array):
 
 - `WH_SNAPSHOT_KEY` — a **dedicated** HMAC key (`openssl rand -hex 32`); enables signed `directory_snapshot` mode. **Never** equal to `WHE_BEARER_TOKEN`.
 - `WH_SHARD_KEYS` — multi-shard only: `[{"name":"WH_SHARD_KEYS","value":"{\"<project-ref>\":\"<shard-service-role-key>\"}"}]`. Absent/empty is a NORMAL state (the own-ref arm still works); a malformed value fails closed to an empty map with one defect-class boot log.
+- `WH_PROXY_FETCHER` / `WH_PROXY_TOKEN` — the acct2 proxy rawFetch lever (r123; current live state is **ON**). Activation requires ALL THREE of `WH_PROXY_FETCHER` exactly `on` + the DEDICATED `WH_PROXY_TOKEN` secret (never `WHE_BEARER_TOKEN`) + a validated `wh_shard_proxy_map` config KV value; any miss ⇒ the lever is inert + one boot defect log. **`WH_PROXY_FETCHER=off` is the v13-parity instant rollback** — the default platform fetch on every leg (the engine's own ref is always direct regardless, the own-ref DIRECT carve-out).
 
 `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` are **auto-injected** by the Supabase edge runtime — do not set them. (CLI equivalent for single secrets: `npx supabase secrets set WHE_BEARER_TOKEN=… --project-ref $WHE_PROJECT_REF`.)
 
@@ -137,15 +138,30 @@ npx -y supabase functions deploy warehouse-engine \
 curl -fsS "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/health"
 #    → 200 {"v":1,"ok":true,"directory_version":1,"engine_build":"<sha7>"}
 
-# 6b. authed /query — expect the PINNED pre-flip 500 (ships disabled):
+# 6b. authed /query — POST /query is LIVE (flipped r118):
+#     a seeded directory (§3's seed wave + placements) answers 200; an
+#     unseeded one answers the fail-closed 404. Both prove bearer auth +
+#     secret wiring end-to-end.
 curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/query" \
   -H "Authorization: Bearer $WHE_BEARER_TOKEN" -H "apikey: $WHE_PROJECT_REF.anon-key-or-any-value" \
-  -H "Content-Type: application/json" -d '{"qid":"smoke-1","table":"wh_probe_agg","query":{"select":[{"op":"count"}]}}'
-#    → 500 {"v":1,"qid":"smoke-1","error":{"code":"internal",
-#         "message":"real shard fetcher lands after live probes #1/#2 …"}}
+  -H "Content-Type: application/json" -d '{"qid":"smoke-1","table":"wh_probe_agg","query":{"select":[{"op":"min","col":"amount"},{"op":"max","col":"amount"}]}}'
+#    seeded   → 200 {"v":1,"qid":"smoke-1","directory_version":N,"coverage":…,"result":…,"perShard":…,"latency_ms":…}
+#               (scalar W2-class plan; r130 live-verified: p50 1907.9475ms, n=20, v20 lever-ON era)
+#    unseeded → 404 {"v":1,"qid":"smoke-1","error":{"code":"tier_warm","message":…}} (no serving rows yet)
+#    a wrong token gives 401 …"auth_kind":"invalid_token" instead; a missing secret gives
+#    500 "server has no WHE_BEARER_TOKEN secret set" — the auth-wiring ladder, unchanged by the flip.
+
+# 6c. optional join probe — the r129 co-located agg-join (W6 class; needs the
+#     dim seeded + colocated per API.md §query.join, and the bare-count law:
+#     the n agg MUST be a bare count, never count(id)):
+curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/query" \
+  -H "Authorization: Bearer $WHE_BEARER_TOKEN" -H "apikey: $WHE_PROJECT_REF.anon-key-or-any-value" \
+  -H "Content-Type: application/json" -d '{"qid":"smoke-join","table":"wh_probe_agg","query":{"select":[{"op":"sum","col":"amount","alias":"x"},{"op":"count","col":"amount","alias":"c"},{"op":"count","alias":"n"}],"groupBy":["region"],"join":{"table":"wh_probe_dim","type":"inner","on":{"left":"region","right":"region"}}}}'
+#    seeded+colocated → 200 grouped rows envelope (r130 live-verified: p50 1898.7205ms, n=20, v20 lever-ON era);
+#    violations answer the 400 join ladder — join_not_colocated / join_template_required / join_key_mismatch.
 ```
 
-6b is the *good* outcome: it proves bearer auth + secret wiring end-to-end (a wrong token gives `401 … auth_kind:"invalid_token"` instead; a missing secret gives `500 "server has no WHE_BEARER_TOKEN secret set"`).
+6b proves the full live path: bearer auth + secret wiring (the 401/500 auth arms) AND the flipped-on engine (200 seeded / 404 tier_warm unseeded — the pinned pre-flip 500 is retired history). 6c proves the join plane end-to-end when the dim is seeded.
 
 ## Troubleshooting
 
@@ -157,6 +173,6 @@ curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-eng
 | `GET /health` → `500 {"v":1,"ok":false,…}` | Migration `0013` not applied (version probe fails) — migrations-before-smoke, §2. |
 | Mgmt API 401 / "no organizations found" | `SUPABASE_ACCESS_TOKEN` holds the wrong token (bearer ≠ PAT) — §Token discipline. |
 | Deploy tries a local bundle / Docker | Missing `--use-api` — §5. |
-| `POST /query` → 404 `tier_warm` (post-flip era) | Directory has no serving rows for the table — check placements + `v_warehouse_directory`. |
+| `POST /query` → 404 `tier_warm` | Directory has no serving rows for the table — check placements + `v_warehouse_directory` (the normal state until §3's shard migrations + seed wave are applied). |
 | `WH_SHARD_KEYS` malformed | Boot logs ONE defect line (`WH_SHARD_KEYS defect class …`), then every remote shard warns `shard_key_missing`. Value shape: `{"<project-ref>":"<service-role-key>"}` — §4. |
 | `400 … WH_RYW_V1=on` in the message | A `min_lsn`-pinned request with the RYW lever OFF — planner-honest fail-closed; set `WH_RYW_V1=on` only when the stamp feed exists. |

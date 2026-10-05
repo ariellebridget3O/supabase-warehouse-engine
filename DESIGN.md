@@ -11,7 +11,7 @@ The `wh_*` modules are a **pure library island**: no `Deno.env`, no DB client im
   - `_shared/wh_entrypoint.ts:205` — the ONE env read inside a `wh_*` module: `checkAuth` reads the bearer secret (`WHE_BEARER_TOKEN`; FM name `FLEET_TOKEN` retired). Handler-side auth is by-design the shell-adjacent exception. (`whe_store.ts` — the non-island seam, §2 — additionally reads the platform-injected `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` pair.)
   - `_shared/wh_shard_channel.ts:213` — the default `rawFetch` is the platform `fetch`; injectable, overridable in tests.
 - Timers are injected too (`defaultWhEngineTimers`, `wh_engine_core.ts`), so the whole merge/quorum/latency surface is deterministically testable offline.
-- **The shell owns the `WH_*` levers**: `warehouse-engine/index.ts` is the only place `WH_SHARD_KEYS`, `WH_SNAPSHOT_KEY`, `WH_RYW_V1`, `WH_REAL_FETCHER` are read; `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` are read by the shell *and* by the `whe_store` seam (§2). Each value is threaded into the core as a plain dep (purity law F-N8).
+- **The shell owns the `WH_*` levers**: `warehouse-engine/index.ts` is the only place `WH_SHARD_KEYS`, `WH_SNAPSHOT_KEY`, `WH_RYW_V1`, `WH_REAL_FETCHER`, `WH_PROXY_FETCHER` (+ its dedicated `WH_PROXY_TOKEN`) are read; `SUPABASE_URL` / `SUPABASE_SERVICE_ROLE_KEY` are read by the shell *and* by the `whe_store` seam (§2). Each value is threaded into the core as a plain dep (purity law F-N8).
 
 ## 2. The consumer-store seam (`whe_store.ts`)
 
@@ -28,7 +28,7 @@ FM's `_shared/supabase-client.ts` is **not copied whole**: it drags `types.ts` a
 
 - The offline battery is **hermetic** ("no DB, no PAT, no network"): tests inject fakes at the dep level; the DB-adjacent logic (pagination, version coercion, ≤1-row tripwire) lives in pure `wh_directory_reader.ts`; the real shell is imported **as text** and never executed by tests.
 - Every unwired dep fails **closed or degrades byte-identically** — the gate ladders (G1..G6 read plane, G-W1..W5 write plane) own all fail-closed decisions, never the wiring layer.
-- Static source-text pins in `wh_entrypoint_test.ts` require the shell to keep exact wiring expressions (`parseShardKeyEnv(Deno.env.get('WH_SHARD_KEYS'))`, `rpcMode: Deno.env.get('WH_REAL_FETCHER') === 'on'`, `rywGateEnabled: rywGateEnabledFromEnv(Deno.env.get('WH_RYW_V1'))`, `hasRealFetcher: FLIP_hasRealFetcher` with the constant `false`).
+- Static source-text pins in `wh_entrypoint_test.ts` require the shell to keep exact wiring expressions (`parseShardKeyEnv(Deno.env.get('WH_SHARD_KEYS'))`, `rpcMode: Deno.env.get('WH_REAL_FETCHER') === 'on'`, `rywGateEnabled: rywGateEnabledFromEnv(Deno.env.get('WH_RYW_V1'))`, `hasRealFetcher: FLIP_hasRealFetcher` with the constant `true` — the r118 flip, battery source-pinned at `wh_entrypoint_test.ts:655`).
 
 ## 4. Geo GATE decision — gate, don't parameterize
 
@@ -47,7 +47,7 @@ FM's `_shared/supabase-client.ts` is **not copied whole**: it drags `types.ts` a
 ## 5. Deployment topology
 
 - **Engine host** = its own Supabase project (free-tier friendly). Runs the edge function + the consumer-store schema (`db/migrations/0013` catalog + `0014` loader RPCs + `0016` roll-off seal).
-- **Shard projects** each run `db/shard-migrations/0015_wh_query_rpc.sql` (the `wh_query` RPC + registry + hash law `WH403`) + shard `0016_seal_roll_off.sql` (`facts_blocks`/`unpack_block`/`facts_events`, seal functions) + the W1–W5 template seed rendered from `db/shard-templates/` per `manifest.json`.
+- **Shard projects** each run `db/shard-migrations/0015_wh_query_rpc.sql` (the `wh_query` RPC + registry + hash law `WH403`) + shard `0016_seal_roll_off.sql` (`facts_blocks`/`unpack_block`/`facts_events`, seal functions) + the W1–W6 template seed rendered from `db/shard-templates/` per `manifest.json` (W6 = the r129 join class, additive `join:{dim,left,right}` manifest key).
 - **Single-project shape** (the default): the engine host IS the only shard — the own-ref arm resolves `SUPABASE_URL`'s subdomain with the engine's own service key, so 0015/0016/seed are applied to the same project. The `db/migrations/` vs `db/shard-migrations/` split exists precisely so project-side migration runners never glob the shard-side 0015 onto the wrong host (0015's header documents the contract).
 - **Two partial unique indexes** in 0013 encode the cross-writer placement invariant (storage constraints, not app locks) — the free-tier guardrail instead of extra services.
 - `v_warehouse_directory` is the normative routing predicate spelled ONCE server-side; every consumer (engine, loaders, watchdogs) reads this view — no engine-side WHERE drift.
@@ -65,12 +65,12 @@ All reads run through the one consumer-store client (`whe_store.ts`). 6 read sit
 | 5 | `warehouse_tables` `is_reference` | `.select('is_reference').eq('logical_name',…).maybeSingle()` | coverage-null replica fail-closed |
 | 6 | `config` fence keys | `.select('key,value').in('key', FENCE_CONFIG_KEYS)` — ONE round trip, 3 keys | write-plane fence G-W1..W5 + legacy read dispatch R3 |
 
-## 7. "Ships disabled" — the flip doctrine
+## 7. The flip doctrine (executed r118)
 
-- `FLIP_hasRealFetcher = false` (`wh_entrypoint.ts:102`) is the SINGLE flip site. Pre-flip, `POST /query` answers the pinned 500 **before any directory work** — a deployed stub must never serve plausible-looking empty 200s.
-- Flip conditions (pinned in the constant's comment): the real fetcher frozen in (QC2 compile design-frozen and wired), the PAT wall down, and live probes #1/#2/#3 GREEN (#1 platform auth round-trip, #2 directory read, #3 `wh_query` RPC round-trip against a seeded shard).
-- Flipping is a **code change on a reviewed diff** — never a deploy-time env. The env levers `WH_REAL_FETCHER` (exact `on` ⇒ rpcMode wire shape) and `WH_RYW_V1` (exact `on` ⇒ RYW `min_lsn` adjudication) compose with the gate but cannot bypass it: pre-flip, `WH_REAL_FETCHER=on` is inert.
-- `wh_entrypoint_test.ts` pins the constant `false` by source-text assertion — the battery itself enforces the doctrine.
+- `FLIP_hasRealFetcher = true` (`wh_entrypoint.ts:105`) is the SINGLE flip site — **flipped r118** (commit `bcc238a`) after the pinned conditions were met: the real fetcher frozen in (QC2 compile design-frozen and wired), the PAT wall down, and the live probes GREEN. History kept as doctrine: pre-flip, `POST /query` answered the pinned 500 **before any directory work** — a deployed stub must never serve plausible-looking empty 200s; that law lives on as the reason the gate exists and the reason it is a code constant, not an env.
+- Flipping is a **code change on a reviewed diff** — never a deploy-time env — so the constant is the instant rollback site: reverting it to `false` in a reviewed diff puts the pinned-500 gate back up. The env levers compose with the gate but cannot bypass or revert it: `WH_REAL_FETCHER` (exact `on` ⇒ rpcMode wire shape; OFF = the direct PostgREST template plane) and `WH_RYW_V1` (exact `on` ⇒ RYW `min_lsn` adjudication).
+- **Transport lever (lever-ON era):** the live deployment runs `WH_PROXY_FETCHER=on` (r123) — shard fan-out rides the acct2 proxy rawFetch; the engine's OWN ref is always the platform fetch verbatim (the own-ref DIRECT carve-out, r123 P0 — the co-hosted law needs no proxy hop). Activation requires ALL THREE of lever `on` + the dedicated `WH_PROXY_TOKEN` secret + an engine-side-validated `wh_shard_proxy_map` KV value; any miss ⇒ inert + one boot defect log (`warehouse-engine/index.ts:168-169`). `WH_PROXY_FETCHER=off` = the default platform fetch on every leg — the **v13-parity instant rollback**, byte-identical to the unset path, no code change.
+- `wh_entrypoint_test.ts` pins the constant `true` by source-text assertion (`:655`) — the battery itself enforces the doctrine in the flipped state (the pre-r118 stub-message pin flipped to a DELETION pin at the flip).
 
 ## 8. r121 OPT-1b runbook note — the fold's failure-surface shift
 
