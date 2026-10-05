@@ -165,7 +165,7 @@ Deno.test('migrate.sh source — env contract: WHE_PROJECT_REF + SUPABASE_ACCESS
 // recomputes each row's digest from the ACTUAL file bytes so file+manifest
 // drift fails the battery even where the python lint does not run.
 // -----------------------------------------------------------------------------
-Deno.test('manifest recompute — sha256(W1..W6 file bytes) == manifest.template_hash (lint-templates invariant inside CI)', async () => {
+Deno.test('manifest recompute — sha256(W1..W7 file bytes) == manifest.template_hash (lint-templates invariant inside CI)', async () => {
   const manifestBytes = await Deno.readFile(new URL('../../../db/shard-templates/manifest.json', import.meta.url));
   const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as Array<{ slug: string; file: string; template_hash: string }>;
   // r129 re-pin (design_r128_joinplans.md §2.3 — the W6 provenance cell this
@@ -173,9 +173,12 @@ Deno.test('manifest recompute — sha256(W1..W6 file bytes) == manifest.template
   // templates_test row): W6_colocated_join_agg APPENDED at index 5 — the
   // append-only law (W1..W5 keep their pinned order) — and the per-row
   // sha256 recompute loop below AUTO-covers W6 (lethal, never weakened).
-  eq('manifest has exactly 6 template rows (W1..W5 + r129 W6_colocated_join_agg)', manifest.length, 6);
-  eq('manifest slugs are the pinned six, in order (W6 appended at index 5)', manifest.map((r) => r.slug),
-    ['W1_grouped_sum_count', 'W2_scalar_minmax', 'W3_scalar_avg_pair', 'W4_topk', 'W5_cold_agg', 'W6_colocated_join_agg']);
+  // r133 re-pin (design_r132_w7_family.md §2.2): W7_dim_tier_join_agg
+  // APPENDED at index 6 (same append-only law; QC6-family member) — the
+  // recompute loop below AUTO-covers W7 (lethal, never weakened).
+  eq('manifest has exactly 7 template rows (W1..W5 + W6 + r133 W7_dim_tier_join_agg)', manifest.length, 7);
+  eq('manifest slugs are the pinned seven, in order (W6 appended at index 5, W7 at index 6)', manifest.map((r) => r.slug),
+    ['W1_grouped_sum_count', 'W2_scalar_minmax', 'W3_scalar_avg_pair', 'W4_topk', 'W5_cold_agg', 'W6_colocated_join_agg', 'W7_dim_tier_join_agg']);
   eq('every row\'s file is the slug + .sql (no stray file/slug drift inside the manifest)',
     manifest.every((r) => r.file === `${r.slug}.sql`), true);
   for (const row of manifest) {

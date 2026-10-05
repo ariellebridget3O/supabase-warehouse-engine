@@ -268,17 +268,22 @@ export interface EngineTemplateRow {
   aggs: Record<string, { op: string; col?: string }>;
   encoding: Record<string, string>;
   // r129 (design_r128_joinplans §2.3): the additive OPTIONAL join binding —
-  // present ONLY on the join-class row(s) (W6_colocated_join_agg): the dim
-  // relation + the hardcoded SQL join keys the template body executes.
+  // present ONLY on the join-class rows (W6_colocated_join_agg base + the
+  // r133 W7_dim_tier_join_agg tier2 twin): the dim relation + the hardcoded
+  // SQL join keys the template bodies execute.
   // DERIVATION PARTITION KEY: deriveTemplateHashes derives a row for a plan
-  // iff (row carries join) === (plan is a join plan), so the join class
-  // never co-derives with the plain classes (the ≤1-template-per-opset
-  // law, wh_shard_channel_test.ts:1331-1375) and a join request can never
-  // fall back to W1. The KEY BINDING check (wh_engine_core plan time,
+  // iff (row carries join) === (plan is a join plan) AND — r133
+  // (design_r132_w7_family §2.2) — for join plans, row.join.variant ===
+  // request join.variant (absent↔absent W6, 'tier2'↔'tier2' W7). W6/W7
+  // merge_ops are IDENTICAL, so the VARIANT (not merge-op disjointness) is
+  // what keeps the ≤1-template-per-opset law true and keeps W6/W7 from ever
+  // co-deriving. The KEY BINDING check (wh_engine_core plan time,
   // audit-B AB-P2) compares the request's on.{left,right} against
-  // join.{left,right} here — fail-closed when the row carries no binding.
-  // Additive optional: every pre-r129 row literal stays unchanged.
-  join?: { dim: string; left: string; right: string };
+  // join.{left,right} here — fail-closed when the row carries no binding —
+  // and the r133 DIM BINDING gate (same plan block) compares request
+  // join.table against join.dim. Additive optional: every pre-r129 row
+  // literal stays unchanged.
+  join?: { dim: string; left: string; right: string; variant?: 'tier2' };
 }
 
 /**
@@ -296,6 +301,12 @@ export interface EngineTemplateRow {
  * stores hash+kind+body and needs NO new column). The row deep-equals the
  * statics leg's db/shard-templates/manifest.json entry (qc_class QC6
  * rides the lint QC_CLASSES extension). timeout_ms <as W1> = 8000.
+ * r133 (design_r132_w7_family §2.2): W7_dim_tier_join_agg APPENDED at
+ * index 6 (append-only law — the index-addressed pins address 0-5) with
+ * the SAME join binding + the additive `variant:'tier2'` discriminator
+ * (engine-side manifest only). aggs/encoding/merge_ops IDENTICAL to W6 —
+ * the col-strict adapter sees the SAME (op,col) tuples; the co-derivation
+ * split rides the variant partition. timeout_ms <as W1> = 8000.
  */
 export const ENGINE_TEMPLATE_MANIFEST: readonly EngineTemplateRow[] = [
   {
@@ -406,6 +417,31 @@ export const ENGINE_TEMPLATE_MANIFEST: readonly EngineTemplateRow[] = [
     encoding: { x: 'text', c: 'number', n: 'number' },
     join: { dim: 'wh_probe_dim', left: 'region', right: 'region' },
   },
+  // r133 (design_r132_w7_family §2.2): the tier2 join class — APPENDED at
+  // index 6 (append-only law; the index-addressed pins address 0-5).
+  // template_hash = sha256 of db/shard-templates/W7_dim_tier_join_agg.sql
+  // (the body IS the contract — W6's body + the ONE delta line
+  // `and d.tier = 2` on the ON clause, 482 bytes LF-only no-trailing-NL);
+  // the `join` binding carries the additive variant:'tier2' discriminator —
+  // the derivation partition key that keeps W6/W7 from ever co-deriving.
+  {
+    slug: 'W7_dim_tier_join_agg',
+    file: 'W7_dim_tier_join_agg.sql',
+    template_hash: 'e6d40cbe1d5da2587492c07076b97ec1e716deaf5cefa2b3098038bee98b79bb',
+    logical_table: 'wh_probe_agg',
+    qc_class: 'QC6',
+    kind: 'rows',
+    merge_ops: ['groupby', 'sum', 'count', 'count_col'],
+    group_keys: ['region'],
+    params_schema: {},
+    timeout_ms: 8000,
+    max_rows: 1000,
+    schema_version: 1,
+    state: 'active',
+    aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+    encoding: { x: 'text', c: 'number', n: 'number' },
+    join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
+  },
 ];
 
 /** Manifest resolution by template hash (first match; the registry PK is the
@@ -484,15 +520,17 @@ export interface DerivePlanView {
   table: string;
   groupKeys?: readonly unknown[];
   aggs: Record<string, { op: string; col?: string }>;
-  /** r129 (design_r128_joinplans §2.3): PRESENCE-ONLY join marker — the
-   *  request's query.join descriptor (parsed shape {table,type,on}) when
-   *  the plan is a join plan. Derivation consumes ONLY presence: a join
-   *  plan derives ONLY manifest rows carrying the additive join binding,
-   *  a non-join plan EXCLUDES them (the join-class partition — keeps the
-   *  ≤1-template-per-opset law true under W6, whose merge_ops ⊇ W1's).
+  /** r129 (design_r128_joinplans §2.3): the request's query.join descriptor
+   *  (parsed shape {table,type,on,variant?}) when the plan is a join plan —
+   *  a join plan derives ONLY manifest rows carrying the additive join
+   *  binding, a non-join plan EXCLUDES them (the join-class partition).
    *  Typed `unknown` deliberately: the descriptor's own shape is parse-
-   *  space; derivation never reads its fields (key binding is the plan
-   *  block's job in wh_engine_core, against the MANIFEST side). */
+   *  space, and derivation reads EXACTLY ONE field of it — r133
+   *  (design_r132_w7_family §2.2) the `variant` discriminator (absent ↔
+   *  absent, 'tier2' ↔ 'tier2'), which partitioned the join class once W6
+   *  and W7 (identical merge_ops) coexisted. Every other field stays
+   *  parse-space (key + dim binding are the plan block's job in
+   *  wh_engine_core, against the MANIFEST side). */
   join?: unknown;
 }
 
@@ -512,6 +550,15 @@ export interface DerivePlanView {
  *     would co-derive on every plain W1 plan (REDing the pinned
  *     ≤1-template census) and a join request lacking a count-col would
  *     derive W1+W6 with derived[0]=W1, 400ing a LEGAL join request.
+ *   * r133 VARIANT PARTITION (design_r132_w7_family §2.2): WITHIN the join
+ *     class, a plan derives ONLY rows whose manifest join.variant EQUALS
+ *     the request's (absent↔absent = W6, 'tier2'↔'tier2' = W7). W6/W7
+ *     merge_ops are IDENTICAL, so the variant — NOT merge-op disjointness —
+ *     is the sole co-derivation discriminator (two join-class rows with
+ *     the same op-set can never both derive; derived[0] stays
+ *     deterministic). Zero matches after the partition → an empty
+ *     derivation → the D2-owned plan_untemplated outcome (the dim binding
+ *     is NOT a derivation input — the plan gate solely owns it).
  * The set is manifest-bounded BY CONSTRUCTION (plan-honesty can never
  * self-reject); the SAME set feeds plan-honesty, the §5.2 handshake, F14,
  * and "non-empty ⟺ the query could ride the wh_query RPC branch".
@@ -538,12 +585,25 @@ export function deriveTemplateHashes(
   // r129 JOIN-CLASS PARTITION (design_r128_joinplans §2.3): presence-only —
   // see the DerivePlanView.join doc + the header bullet above.
   const planIsJoin = plan.join !== undefined;
+  // r133 VARIANT PARTITION (design_r132_w7_family §2.2): the ONE descriptor
+  // field derivation reads — 'tier2' when the parsed request carried it,
+  // undefined otherwise (absent ↔ absent). Any non-tier2 value never
+  // reaches here (parse rejects it); garbage unit views normalize to
+  // undefined (the W6 class), never to a match against W7.
+  const planVariant = planIsJoin && plan.join !== null && typeof plan.join === 'object' &&
+      (plan.join as { variant?: unknown }).variant === 'tier2'
+    ? 'tier2'
+    : undefined;
   const out: string[] = [];
   for (const row of ENGINE_TEMPLATE_MANIFEST) {
     if (row.state !== 'active') continue;
     if (row.logical_table !== plan.table) continue;
     if (row.kind !== planKind) continue;
     if (planIsJoin !== (row.join !== undefined)) continue;
+    // r133: within the join class, the VARIANT decides — W6 (variant
+    // absent) serves absent-variant plans only, W7 ('tier2') serves tier2
+    // plans only; W6/W7 (identical merge_ops) can never co-derive.
+    if (planIsJoin && (row.join?.variant ?? undefined) !== planVariant) continue;
     if (!planOpsSubset(planOps, row.merge_ops)) continue;
     if (tableSchemaVersion !== undefined && row.schema_version !== tableSchemaVersion) continue;
     out.push(row.template_hash);

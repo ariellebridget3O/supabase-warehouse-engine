@@ -170,11 +170,17 @@ export interface WhWhereEntry {
  *  table must be a plain identifier differing from the query table; on.* are
  *  plain identifiers). Adds NO expression surface — every existing parse
  *  reject fires UNCHANGED. Plan-time validation (join-class template
- *  selection, key binding, colocation gate) lives in executeWhQuery. */
+ *  selection, dim binding, key binding, colocation gate) lives in
+ *  executeWhQuery.
+ *  r133 (design_r132_w7_family §2.1): the additive OPTIONAL `variant`
+ *  discriminator — absent = the pre-r133 W6 behavior byte-for-byte; present
+ *  = the literal "tier2" ONLY (v21 enum, additive-extendable). Derivation
+ *  consumes it as the join-class co-derivation split (wh_handshake.ts). */
 export interface WhJoinDescriptor {
   table: string;
   type: 'inner';
   on: { left: string; right: string };
+  variant?: 'tier2';
 }
 
 /** Normalized v1 request (§4.3). Neutral clauses (having=null/orderBy=null|[]/
@@ -189,6 +195,12 @@ export interface WhEngineRequest {
     where?: WhWhereEntry[];
     groupBy?: string[];
     limit?: number | null;
+    // r133 (design_r132_w7_family §3): the additive OPTIONAL fetch_rows
+    // clamp — an explicit-named ALIAS of the limit law (NOT a batching
+    // mechanism). Mutually exclusive with limit at parse (two names for one
+    // clamp is a consumer error); effectiveK = fetch_rows ?? limit (absent
+    // both = the manifest max_rows path, today's whole-table behavior).
+    fetch_rows?: number | null;
     // r129 (design_r128_joinplans §2.1): the additive OPTIONAL join
     // descriptor (WhJoinDescriptor above). Absent unless the request
     // carried a strictly-valid query.join.
@@ -551,8 +563,11 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
     }
     const j = query.join as Record<string, unknown>;
     for (const k of Object.keys(j)) {
-      if (k !== 'table' && k !== 'type' && k !== 'on') {
-        malformed('query.join carries unknown keys (only table|type|on are allowed — join descriptors are strictly validated)');
+      // r133 (design_r132_w7_family §2.1): `variant` joins the KNOWN inner
+      // keys — every other key is still REJECTED (the r129 `using` arm + the
+      // F-A4 arms stay byte-valid).
+      if (k !== 'table' && k !== 'type' && k !== 'on' && k !== 'variant') {
+        malformed('query.join carries unknown keys (only table|type|on|variant are allowed — join descriptors are strictly validated)');
       }
     }
     if (typeof j.table !== 'string' || !IDENT_RE.test(j.table)) {
@@ -579,7 +594,21 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
     if (typeof on.right !== 'string' || !IDENT_RE.test(on.right)) {
       malformed('query.join.on.right must be a plain identifier');
     }
-    join = { table: j.table, type: 'inner', on: { left: on.left, right: on.right } };
+    // r133 (design_r132_w7_family §2.1): the additive OPTIONAL variant
+    // discriminator — when present it must be the literal "tier2" (the v21
+    // enum, open for additive extension only); absent => not kept (the W6
+    // path is byte-identical). Checked LAST in the block — every existing
+    // reject above fires UNCHANGED for requests that already fail earlier
+    // (validation order is load-bearing, §2.1).
+    if (j.variant !== undefined && j.variant !== 'tier2') {
+      malformed('query.join.variant must be "tier2"');
+    }
+    join = {
+      table: j.table,
+      type: 'inner',
+      on: { left: on.left, right: on.right },
+      ...(j.variant !== undefined ? { variant: 'tier2' as const } : {}),
+    };
   }
 
   // limit: absent => not kept; null => kept (no truncation); integer >= 0 => kept
@@ -591,6 +620,25 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
     limit = query.limit as number | null;
   }
 
+  // r133 (design_r132_w7_family §3): the OPTIONAL fetch_rows clamp — the
+  // explicit-named alias of limit. BOTH present => malformed (two names for
+  // one clamp is a consumer error, not a precedence question — the
+  // effectiveK law is fetch_rows ?? limit); when present it must be null
+  // (absent-like: the ?? law falls through) or a POSITIVE integer (0/negative
+  // refuse — a zero-row fetch is not a clamp, it is a no-op masquerading as
+  // one). Message follows the limit parse convention verbatim (r57 law:
+  // fixed-string, names the var, never echoes the value).
+  if (query.fetch_rows !== undefined && query.limit !== undefined) {
+    malformed('query.fetch_rows and query.limit are mutually exclusive');
+  }
+  let fetchRows: number | null | undefined;
+  if (query.fetch_rows !== undefined) {
+    if (query.fetch_rows !== null && (typeof query.fetch_rows !== 'number' || !Number.isInteger(query.fetch_rows) || (query.fetch_rows as number) < 1)) {
+      malformed('query.fetch_rows must be a positive integer or null');
+    }
+    fetchRows = query.fetch_rows as number | null;
+  }
+
   return {
     v: 1,
     qid: r.qid,
@@ -600,6 +648,7 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
       ...(where ? { where } : {}),
       ...(groupBy ? { groupBy } : {}),
       ...(limit !== undefined ? { limit } : {}),
+      ...(fetchRows !== undefined ? { fetch_rows: fetchRows } : {}),
       ...(join !== undefined ? { join } : {}),
     },
     coverage_mode: (r.coverage_mode as 'best_effort' | 'fail_fast') ?? 'best_effort',
@@ -937,31 +986,62 @@ export function gatePartialAgainstPlan(plan: WhMergePlan, rawEnvelope: unknown):
  * hashes against THIS constant). Derivation is JOIN-AWARE (deriveTemplate
  * Hashes, wh_handshake.ts): non-join plans EXCLUDE join-class rows and join
  * plans derive ONLY them, so W6 (merge_ops ⊇ W1's) can never co-derive with
- * W1 and the ≤1-template-per-opset invariant holds. Battery provenance:
- * pinned by wh_shard_channel_test.ts:696-699 (exact contents) and the FILE
- * provenance cell :1377-1403 (eligible set === manifest.json hashes in
- * manifest order) — the battery leg re-pins both for W6; this constant +
+ * W1 and the ≤1-template-per-opset invariant holds.
+ * r133 (design_r132_w7_family §2.2): W7_dim_tier_join_agg joins the set —
+ * the SECOND join-class row (variant 'tier2', same null-guarded body shape
+ * as W6 + the `and d.tier = 2` constant). W7's merge_ops are IDENTICAL to
+ * W6's, so the ≤1-template-per-opset invariant now rests on the VARIANT
+ * PARTITION (join requests derive ONLY the join-class row whose manifest
+ * join.variant equals the request's — absent↔absent, 'tier2'↔'tier2'),
+ * NOT on merge-op disjointness. Battery provenance:
+ * pinned by wh_shard_channel_test.ts:705-715 (exact contents) and the FILE
+ * provenance cell :1424-1448 (eligible set === manifest.json hashes in
+ * manifest order) — the battery leg re-pins both for W7; this constant +
  * comment is the engine-side duty.
  */
 export const WH_RPC_ELIGIBLE_HASHES: readonly string[] = [
   'a934e7e062f59cff5a856afdc7aa743ec9be11c068c7e861ea856c36b40bdbfd', // W1_grouped_sum_count ["groupby","sum","count"]
   'a095adaa148253aee8d1cc8e976f01b3579beeea5082f3862df4a908c20b2659', // W2_scalar_minmax ["min","max","count_col"]
   'bca9dd2c591ed48a0fa5367179dd5deb1d752ed9141c23e6ad53083becf8ecac', // W3_scalar_avg_pair ["avg_pair"]
-  '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576', // W6_colocated_join_agg ["groupby","sum","count","count_col"] (r129 join class)
+  '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576', // W6_colocated_join_agg ["groupby","sum","count","count_col"] (r129 join class, variant absent)
+  'e6d40cbe1d5da2587492c07076b97ec1e716deaf5cefa2b3098038bee98b79bb', // W7_dim_tier_join_agg ["groupby","sum","count","count_col"] (r133 join class, variant tier2)
 ];
 
+/** r133 (design_r132_w7_family §3): the EFFECTIVE-K law — `fetch_rows ??
+ *  limit`, null when neither is a number (absent both = the manifest
+ *  max_rows path, today's whole-table behavior). fetch_rows and limit are
+ *  mutually exclusive at parse, so at most one is ever a number; `null`
+ *  values fall through the `??`-style read (explicit no-truncation). The
+ *  THREE consumption sites (planRef.limitK for the pre-refusal + sampled
+ *  backstop + handshake (c), the final grouped rows slice, and rpcParams'
+ *  $2 emission) MUST read K through THIS helper — the rows slice is its own
+ *  edit site (audit A P2-1: threading planRef alone would leave it reading
+ *  query.limit directly and a fetch_rows request would silently return up
+ *  to shards×K rows). */
+export function effectiveLimitK(query: WhEngineRequest['query']): number | null {
+  if (typeof query.fetch_rows === 'number') return query.fetch_rows;
+  return typeof query.limit === 'number' ? query.limit : null;
+}
+
 /**
- * rpcParams (r69 §3.2): the v1 pin — `{}` PLUS the request's `limit` when it
- * is a NUMBER (AM-7: explicit `limit:null` (no-truncation) is ABSENT —
+ * rpcParams (r69 §3.2): the v1 pin — `{}` PLUS the request's effective K when
+ * it is a NUMBER (AM-7: explicit `limit:null` (no-truncation) is ABSENT —
  * mirroring the limitK precedent above; shard-side `p_params.limit=null` is
  * NEVER sent). NO where ever reaches p_params in v1 (AM-2: where-carrying
  * template plans are rejected 4xx pre-fan-out); span params (id_min/id_max)
- * stay DEFERRED (OQ-4 upheld-conditional — a span-to-params mapper is new
- * translation logic with zero drilled precedent, deferred to the span-pruning
- * wave). `plan` rides the signature for that wave's mapper; v1 never reads it.
+ * stay KILLED-BY-DECISION r132 (design_r132_w7_family.md §4 — decide-once:
+ * zero consumer demand, no resource pressure, translation-surface cost with
+ * zero drilled precedent; re-open triggers are banked in §4 — the mapper is
+ * NOT deferred-to-a-wave anymore, it is CLOSED). `plan` rides the signature
+ * for that wave's mapper; v21 never reads it.
+ * r133 (design_r132_w7_family §3): the effective-K law — the emission shape
+ * is UNCHANGED `{}` or `{limit: N}`; the N source widens from `query.limit`
+ * to `effectiveK = fetch_rows ?? limit` (fetch_rows rides $2 identically;
+ * zero body changes, zero re-seeding — the placeables law is untouched).
  */
 export function rpcParams(_plan: WhMergePlan, query: WhEngineRequest['query']): Record<string, unknown> {
-  return typeof query.limit === 'number' ? { limit: query.limit } : {};
+  const k = effectiveLimitK(query);
+  return typeof k === 'number' ? { limit: k } : {};
 }
 
 /** The matched TEMPLATE def view adaptWireEnvelope consumes — F-N1: kind +
@@ -1525,10 +1605,10 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
   // validation, immediately after the fact-side E11 pruning (the colocation
   // gate is defined over the SELECTED shard set S). Fires ONLY when the
   // request carries query.join — every non-join request skips this block
-  // byte-identically (additive law). Order is fixed: template-class → key
-  // binding (§2.1 audit-B AB-P2) → colocation gate; all three are plan/
-  // parse-class rejects mapped to 400 by the entrypoint ladder (never a
-  // 500-fallthrough) and all three throw BEFORE any network I/O.
+  // byte-identically (additive law). Order is fixed: template-class → dim
+  // binding (r133) → key binding (§2.1 audit-B AB-P2) → colocation gate; all
+  // four are plan/parse-class rejects mapped to 400 by the entrypoint ladder
+  // (never a 500-fallthrough) and all four throw BEFORE any network I/O.
   const joinReq = args.req.query.join;
   if (joinReq !== undefined) {
     // (a) template-class gate: a join request MUST select a join-class
@@ -1543,6 +1623,25 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
       throw new WhEngineError(
         'join_template_required',
         'join_template_required: the derived template is not join-class — a query.join request requires the join-class template (a manifest row carrying the join binding) served over the wh_query RPC plane',
+      );
+    }
+    // (a2) r133 DIM BINDING GATE (design_r132_w7_family §2.4, census P1 —
+    // K-W7c's SOLE site): the request's join.table must EQUAL the matched
+    // (variant-partitioned) template's declared manifest join.dim. With ONE
+    // join class the mismatch was unreachable-in-practice; with TWO (W6 base
+    // / W7 tier2) it is the wrong-dim silent-execution hazard — the body
+    // executes its HARDCODED dim, so a mismatched request would silently
+    // bind nothing and pass a WRONG oracle. A template WAS selected (it
+    // serves a different dim) — semantically distinct from D2's
+    // empty-derivation plan_untemplated: the code is join_template_required.
+    // Derivation does VARIANT (wh_handshake.ts); THIS gate solely owns the
+    // dim — exactly ONE comparison site exists (the K-W7c mutant removes it
+    // and the battery arms above RED: pre-fix proven, commit-before-mutant).
+    // Fixed-string reject, no echo of either table name (r57 law).
+    if (matchedJoinRow !== null && matchedJoinRow.join !== undefined && joinReq.table !== matchedJoinRow.join.dim) {
+      throw new WhEngineError(
+        'join_template_required',
+        'join_template_required: request join.table does not equal the selected join template\'s declared manifest join.dim binding',
       );
     }
     // (b) key binding (design §2.1 audit-B AB-P2): the request's on.{left,
@@ -1727,7 +1826,12 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
   // construction source args.templateHashes[0] directly (audit-B F10).
   const planRef: HandshakePlanRef = {
     templateHashes: args.templateHashes ?? [],
-    limitK: typeof args.req.query.limit === 'number' ? args.req.query.limit : null,
+    // r133 (design_r132_w7_family §3): effectiveK = fetch_rows ?? limit —
+    // the pre-refusal below + the sampled-backstop firing predicate + the
+    // handshake (c) clamp all read THIS value, so fetch_rows clamps exactly
+    // like an equal limit today (M-J4: the pre-refusal leg is unconditional
+    // over the K source).
+    limitK: effectiveLimitK(args.req.query),
   };
   if (!onReplicaPlane && geoDispatch === null) {
     // ---- r121 OPT-1b: manifest-side max_rows pre-refusal (design §1.2) ----
@@ -1746,12 +1850,17 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     // plan_untemplated throw still wins) and never masks the mapped
     // template_missing class on unsampled calls (missing-in-manifest hashes
     // died at plan time). Every derived hash's manifest row must serve K —
-    // with the pinned manifest (no overlapping merge_ops) at most one hash
-    // derives per plan, so this degenerates to the hashes[0] check. r129
-    // amendment: the invariant stays true under W6 because derivation is
-    // JOIN-AWARE (wh_handshake.ts) — non-join plans EXCLUDE join-class rows
-    // (manifest join key) and join plans derive ONLY them, so W6 (whose
-    // merge_ops ⊇ W1's) can never co-derive with W1 on any one plan.
+    // with the pinned manifest at most one hash derives per plan, so this
+    // degenerates to the hashes[0] check. r129 amendment: the invariant
+    // holds under W6 because derivation is JOIN-AWARE (wh_handshake.ts) —
+    // non-join plans EXCLUDE join-class rows (manifest join key) and join
+    // plans derive ONLY them. r133 AMENDMENT (design_r132_w7_family §2.2,
+    // audit A P2-3): under W7 the no-co-derivation invariant rests on the
+    // VARIANT PARTITION — W6/W7 merge_ops are IDENTICAL, so merge-op
+    // disjointness no longer holds; derivation discriminates on join-class
+    // presence AND manifest join.variant === request join.variant
+    // (absent↔absent, 'tier2'↔'tier2'), which keeps at-most-one derivation
+    // per plan true.
     if (planRef.limitK !== null && planRef.templateHashes.length > 0) {
       const k = planRef.limitK;
       const refused = planRef.templateHashes.some((h) => {
@@ -1854,7 +1963,12 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     // AND in the manifest-side max_rows pre-refusal above. r129 amendment:
     // the no-overlap assumption remains true under W6 for the same
     // join-aware-derivation reason pinned at the max_rows site above (join
-    // plans derive ONLY join-class rows; non-join plans never do).
+    // plans derive ONLY join-class rows; non-join plans never do). r133
+    // AMENDMENT (design_r132_w7_family §2.2): under W7 the no-co-derivation
+    // invariant rests on the VARIANT PARTITION — W6/W7 merge_ops are
+    // IDENTICAL, so the invariant is variant-only: join requests derive the
+    // ONE join-class row matching request join.variant (absent↔absent W6,
+    // 'tier2'↔'tier2' W7); non-join plans exclude the class entirely.
     const matched = derived[0];
     for (const row of fanoutRows) {
       rpcSpecByShard.set(row.shard, {
@@ -2065,8 +2179,15 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
         directoryVersion: args.directoryVersion,
       });
     }
-    const limit = args.req.query.limit;
-    response.rows = limit === null || limit === undefined ? fin : fin.slice(0, limit);
+    // r133 (design_r132_w7_family §3, audit A P2-1): the slice reads K via
+    // effectiveLimitK — fetch_rows ?? limit. This is its OWN edit site (it
+    // does NOT read planRef.limitK): threading the plan ref alone would
+    // leave a fetch_rows request silently returning up to shards×K rows
+    // (one untrimmed K per shard, trimmed only here at the end). The
+    // truncation battery arm pins merged rows ≤ effectiveK on a multi-shard
+    // wave (wh_join_test.ts fetch_rows block).
+    const limitK = effectiveLimitK(args.req.query);
+    response.rows = limitK === null ? fin : fin.slice(0, limitK);
   } else {
     response.result = merged === null ? finalizeScalarAggs(mergeScalarAggs(plan, []), plan) : finalizeScalarAggs(merged, plan);
   }

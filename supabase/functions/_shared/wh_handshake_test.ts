@@ -102,6 +102,11 @@ const W5H = '9a8e922d064539e3418fd77dbc17479fe6a9b69bafe0f182128c675ef1f95234'; 
 // (the body IS the contract). APPENDED in manifest order — never widened
 // silently; the eligible-set provenance lives in wh_shard_channel_test.ts.
 const W6H = '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576'; // ["groupby","sum","count","count_col"] + join{dim,left,right}
+// r133 (design_r132_w7_family.md §2.2 — the W7 provenance cell): the tier2
+// join-class hash = sha256 of db/shard-templates/W7_dim_tier_join_agg.sql
+// (W6's body + the ONE delta line `and d.tier = 2`, 482 bytes). APPENDED at
+// manifest index 6 — never widened silently.
+const W7H = 'e6d40cbe1d5da2587492c07076b97ec1e716deaf5cefa2b3098038bee98b79bb'; // ["groupby","sum","count","count_col"] + join{dim,left,right,variant:'tier2'}
 
 function invRow(hash: string, opts: Partial<TemplateInventoryRow> = {}): TemplateInventoryRow {
   return {
@@ -588,14 +593,38 @@ const MANIFEST_LITERAL: EngineTemplateRow[] = [
     encoding: { x: 'text', c: 'number', n: 'number' },
     join: { dim: 'wh_probe_dim', left: 'region', right: 'region' },
   },
+  // r133 (design_r132_w7_family.md §2.2): the tier2 join class —
+  // hand-transcribed from the manifest.json W7 entry (16 fields; the ONLY
+  // row carrying join.variant 'tier2'). QC6 family member (zero lint
+  // change); aggs/encoding/merge_ops IDENTICAL to W6.
+  {
+    slug: 'W7_dim_tier_join_agg',
+    file: 'W7_dim_tier_join_agg.sql',
+    template_hash: W7H,
+    logical_table: 'wh_probe_agg',
+    qc_class: 'QC6',
+    kind: 'rows',
+    merge_ops: ['groupby', 'sum', 'count', 'count_col'],
+    group_keys: ['region'],
+    params_schema: {},
+    timeout_ms: 8000,
+    max_rows: 1000,
+    schema_version: 1,
+    state: 'active',
+    aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+    encoding: { x: 'text', c: 'number', n: 'number' },
+    join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
+  },
 ];
 
-Deno.test('manifest pin: ENGINE_TEMPLATE_MANIFEST deep-equals the hand-transcribed literal (W1-W5 + r129 W6, all fields)', () => {
+Deno.test('manifest pin: ENGINE_TEMPLATE_MANIFEST deep-equals the hand-transcribed literal (W1-W5 + r129 W6 + r133 W7, all fields)', () => {
   eq('engine manifest === literal copy', ENGINE_TEMPLATE_MANIFEST, MANIFEST_LITERAL);
   // r129 re-pin (census §3.3): LENGTH 5 → 6, W6 APPENDED at index 5 —
   // provenance = design_r128_joinplans.md §2.3 (never widen silently).
-  eq('exactly six templates (W1-W5 + W6)', ENGINE_TEMPLATE_MANIFEST.length, 6);
-  eq('the six pinned hashes are present (W6 appended in manifest order)', ENGINE_TEMPLATE_MANIFEST.map((r) => r.template_hash), [W1H, W2H, W3H, W4H, W5H, W6H]);
+  // r133 re-pin (design_r132_w7_family.md §2.2): LENGTH 6 → 7, W7 APPENDED
+  // at index 6 — same append-only law.
+  eq('exactly seven templates (W1-W5 + W6 + W7)', ENGINE_TEMPLATE_MANIFEST.length, 7);
+  eq('the seven pinned hashes are present (W6 at index 5, W7 appended at index 6)', ENGINE_TEMPLATE_MANIFEST.map((r) => r.template_hash), [W1H, W2H, W3H, W4H, W5H, W6H, W7H]);
 });
 
 Deno.test('manifest pin: file equality when --allow-read grants db/shard-templates (fallback = literal pin, provenance noted)', () => {
@@ -820,6 +849,46 @@ Deno.test('LETHAL 3b (manifest boundary): limit 1000 == manifest max_rows 1000 p
   eq('unsampled: the sampled backstop never ran', invCalls, []);
   eq('no warnings, merged', [res.warnings, res.coverage], [[], '1/1']);
   eq('group merged (hand-computed: eu s=100n c=1)', res.rows, [{ k: ['eu'], aggs: { s: 100n, c: 1 } }]);
+});
+
+Deno.test('LETHAL 3c (r133 fetch_rows boundary, design_r132_w7_family §3/§6.6): fetch_rows 1001 rides effectiveK into the manifest pre-refusal — refused with ZERO POSTs, and 1000 == max_rows passes', async () => {
+  // The pre-refusal reads planRef.limitK — which r133 threads from
+  // effectiveLimitK (fetch_rows ?? limit) — so the fetch_rows clamp needs NO
+  // new code in the pre-refusal itself (M-J4's living arm lives here AND in
+  // wh_join_test.ts). Hand-derived: identical shape to LETHAL 3, K from
+  // fetch_rows.
+  const fetchCalls: string[] = [];
+  const invCalls: string[] = [];
+  const res = await executeWhQuery({
+    ...execBase(parseWhEngineRequest({
+      v: 1,
+      qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+      table: 'orders',
+      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], fetch_rows: 1001 },
+    }), [dirRow('S1')]),
+    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }]), fetchCalls),
+    handshake: fakeHandshake({ S1: [invRow(W1H)] }, invCalls),
+    templateHashes: [W1H],
+  });
+  eq('fetch_rows 1001 > max_rows 1000: the pre-refusal reads effectiveK and refuses EXACTLY like an equal limit', res.warnings, [{ shard: 'S1', code: 'max_rows_exceeded', est_rows: 0, retried: false }]);
+  eq('perShard latencyMs == 0 EXACTLY (no round trip happened — hand-computed law)', res.perShard, [{ shard: 'S1', ok: false, latencyMs: 0, error: 'max_rows_exceeded' }]);
+  eq('ZERO shard POSTs + ZERO inventory GETs (the engine-side error home is CLOSED for fetch_rows)', [fetchCalls, invCalls], [[], []]);
+  // Boundary twin: fetch_rows 1000 == max_rows 1000 passes (refuse iff
+  // K > max_rows STRICTLY) — the wave fans out and merges.
+  const fetchCalls2: string[] = [];
+  const res2 = await executeWhQuery({
+    ...execBase(parseWhEngineRequest({
+      v: 1,
+      qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+      table: 'orders',
+      query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], fetch_rows: 1000 },
+    }), [dirRow('S1')]),
+    fetcher: countingFetch((s) => genv(s, [{ k: ['eu'], s: '100', c: 1 }], { templateHash: W1H }), fetchCalls2),
+    handshake: fakeHandshake({ S1: [invRow(W1H, { max_rows: 1000 })] }, []),
+    templateHashes: [W1H],
+  });
+  eq('fetch_rows 1000 == max_rows 1000: the boundary PASSES (strictly-greater refuses), the shard IS fetched', [fetchCalls2, res2.coverage], [['S1'], '1/1']);
+  eq('merged output (hand-computed: eu s=100n c=1)', res2.rows, [{ k: ['eu'], aggs: { s: 100n, c: 1 } }]);
 });
 
 Deno.test('LETHAL 4 (F14 arm A end-to-end): partial claiming W2 cannot serve a [sum,count] plan — merge_mismatch, merge NEVER called with it', async () => {

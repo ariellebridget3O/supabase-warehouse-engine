@@ -140,6 +140,12 @@ const W1H = 'a934e7e062f59cff5a856afdc7aa743ec9be11c068c7e861ea856c36b40bdbfd';
 // IS the contract) — the join-class row APPENDED at manifest index 5
 // (provenance: design_r128_joinplans.md §2.3; never widened silently).
 const W6H = '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576';
+// r133 (design_r132_w7_family.md §2.2): W7 = sha256 of
+// db/shard-templates/W7_dim_tier_join_agg.sql (W6's body + the ONE delta
+// line `and d.tier = 2` on the ON clause; 482 bytes LF-only no-trailing-NL)
+// — the tier2 join-class row APPENDED at manifest index 6 (provenance:
+// design_r132_w7_family.md §2.2; never widened silently).
+const W7H = 'e6d40cbe1d5da2587492c07076b97ec1e716deaf5cefa2b3098038bee98b79bb';
 
 /** E15 — the canonical join oracle ported verbatim (§6.5). The numbers are
  *  the audit-B-confirmed hand constants; the fixture's meta.source pins the
@@ -336,6 +342,12 @@ Deno.test('r129 join parse: absent byte-identical (re-pin), valid descriptor nor
   eq('valid join descriptor normalizes to the strict {table,type,on} shape', parsed.query.join, { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' } });
   const nulled = parseWhEngineRequest({ ...joinReqBody(), query: { ...(joinReqBody().query as Record<string, unknown>), join: null } });
   eq('join:null => absent (the null-lenient precedent)', nulled.query.join, undefined);
+  // r133 (design_r132_w7_family §2.1): variant normalizes additively —
+  // absent stays absent (the W6 path byte-identical), present rides as the
+  // literal "tier2".
+  const tier2 = parseWhEngineRequest({ ...joinReqBody(), query: { ...(joinReqBody().query as Record<string, unknown>), join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' } } });
+  eq('valid variant "tier2" normalizes into the descriptor (additive-optional)', tier2.query.join, { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' });
+  eqTrue('variant-absent descriptor carries NO variant key (deepEq is exact-key-set — the W6 emit shape unchanged)', parsed.query.join !== undefined && !('variant' in parsed.query.join));
 });
 
 Deno.test('r129 join parse: every malformed variant is a fixed-string malformed (strict descriptor law)', () => {
@@ -352,6 +364,18 @@ Deno.test('r129 join parse: every malformed variant is a fixed-string malformed 
   throwsEngine('non-object join.on (a string) => malformed — the on object guard fires before on.* lookups', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: 'region=region' })), 'malformed', 'query.join.on must be an object');
   throwsEngine('unknown key INSIDE join.on (bogus) => malformed — on is strictly validated like join itself', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region', bogus: 1 } })), 'malformed', 'query.join.on carries unknown keys');
   throwsEngine('bad IDENT on.right ("region; DROP") => malformed — on.right is IDENT_RE, no expression surface', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region; DROP' } })), 'malformed', 'query.join.on.right must be a plain identifier');
+  // r133 (design_r132_w7_family §2.1): the additive OPTIONAL variant
+  // discriminator — present must be the literal "tier2"; ANY other value is
+  // a fixed-string malformed (r57 law: names the var, never echoes the
+  // value); the check is LAST in the block so every existing reject above
+  // fires UNCHANGED.
+  throwsEngine('variant "tier3" (unknown enum value) => malformed', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier3' })), 'malformed', 'query.join.variant must be "tier2"');
+  throwsEngine('variant non-string (7) => malformed — the enum is the literal "tier2" ONLY', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 7 })), 'malformed', 'query.join.variant must be "tier2"');
+  throwsEngine('variant null => malformed (inner keys are strict — the on:null precedent)', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: null })), 'malformed', 'query.join.variant must be "tier2"');
+  // validation-order law: a request that fails an EARLIER reject still
+  // reports THAT reject when variant is also bad (variant is checked LAST).
+  throwsEngine('validation order: unknown key + bad variant => the UNKNOWN-KEY reject fires first', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, using: 'region', variant: 'tier3' })), 'malformed', 'query.join carries unknown keys');
+  throwsEngine('validation order: bad type + bad variant => the TYPE reject fires first', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'left', on: { left: 'region', right: 'region' }, variant: 'tier3' })), 'malformed', 'query.join.type must be the literal "inner"');
   // r57 no-echo law: the reject names the var/position only — never the value.
   let msg = '';
   try {
@@ -493,6 +517,56 @@ Deno.test('r129 join-aware derivation partition: join plans derive ONLY the join
     deriveTemplateHashes({ ...w1Shaped, join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' } } }, 1),
   ], [[W1H], [W6H]]);
   eqTrue('a join request lacking the count-col is still LEGAL (subset semantics): {x} => [W6H]', deepEq(deriveTemplateHashes({ table: 'wh_probe_agg', groupKeys: [{ col: 'region', type: 'text' }], aggs: { x: { op: 'sum', col: 'amount' } }, join: {} }, 1), [W6H]));
+  // r133 W7 LEGS (design_r132_w7_family §6.2): the VARIANT discriminator —
+  // W6/W7 merge_ops are IDENTICAL, so the variant (not the op-set) picks
+  // the class member; W6 and W7 can NEVER co-derive.
+  const tier2Join = { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' as const };
+  eq('tier2-join (variant present) over the FULL {x,c,n} op-set => [W7H] ONLY (the variant partition — W6 is variant-absent)', deriveTemplateHashes({ ...groupedView, join: tier2Join }, 1), [W7H]);
+  eq('base-join (variant absent) over the SAME op-set => [W6H] ONLY (absent ↔ absent — W7 is variant-tier2)', deriveTemplateHashes({ ...groupedView, join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' } } }, 1), [W6H]);
+  eq('tier2-join over the {sum,count} op-set => [W7H] (subset semantics ride the variant class too)', deriveTemplateHashes({ ...w1Shaped, join: tier2Join }, 1), [W7H]);
+  eqTrue('non-join plans NEVER derive W7 (the join-class partition is unchanged)', deepEq(deriveTemplateHashes(groupedView, 1), []));
+});
+
+// =============================================================================
+// §6.3 (r133) — the join.dim BINDING GATE (design_r132_w7_family §2.4, census
+// P1 — K-W7c). The gate is the SOLE dim-binding site: derivation does the
+// VARIANT (wh_handshake.ts), THIS gate does the dim. A join request whose
+// join.table does not equal the matched (variant-partitioned) template's
+// manifest join.dim is rejected join_template_required — a template WAS
+// selected, it just serves a different dim (semantically distinct from D2's
+// empty-derivation plan_untemplated). With ONE join class the mismatch was
+// unreachable-in-practice; with TWO (W6 base / W7 tier2) it is the wrong-dim
+// silent-execution hazard: the body executes its HARDCODED dim and a
+// mismatched request would silently bind nothing and pass a WRONG oracle.
+// K-W7c: the mutant removes exactly this comparison — the arms below are the
+// pre-fix RED evidence (written BEFORE the gate; run RED; then the gate; run
+// GREEN — commit-before-mutant law).
+// =============================================================================
+Deno.test('r133 join.dim binding gate (K-W7c, design_r132_w7_family §2.4): a wrong-dim join request is rejected join_template_required BEFORE any network', async () => {
+  const seen: SeenCall[] = [];
+  const fetcher = recordingFetch({ 'shard-a': envA, 'shard-b': envB }, seen);
+  // Wrong-dim request: join.table 'wh_probe_dim2' is a plain identifier that
+  // differs from the query table (parse-legal) but does NOT equal the
+  // manifest join binding of the injected derived row (templateHashes
+  // injection, wh_join_test.ts:442 precedent — :442/:448 era). The keys
+  // still match (region/region) and the colocation population is provided —
+  // WITHOUT the dim gate the request would silently execute W6's hardcoded
+  // dim and fan out (the pre-fix RED: no throw, coverage 2/2).
+  const wrongDimBase = parseWhEngineRequest({ ...joinReqBody(), query: { ...(joinReqBody().query as Record<string, unknown>), join: { table: 'wh_probe_dim2', type: 'inner', on: { left: 'region', right: 'region' } } } });
+  await rejectsEngine('join.table wh_probe_dim2 vs the W6 manifest join.dim wh_probe_dim (injected [W6H]) => join_template_required (K-W7c)', () =>
+    executeWhQuery(joinExecArgs({ fetcher, templateHashes: [W6H], reqOverride: wrongDimBase })), 'join_template_required', 'join.dim binding');
+  // The tier2 twin: the VARIANT matches (the request IS W7-class) but the
+  // dim binding still fails — variant-only derivation is deliberately NOT a
+  // dim check (zero-derivation stays D2-owned); the gate solely owns the dim.
+  const wrongDimTier2 = parseWhEngineRequest({ ...joinReqBody(), query: { ...(joinReqBody().query as Record<string, unknown>), join: { table: 'wh_probe_dim2', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' } } });
+  await rejectsEngine('tier2-variant join.table wh_probe_dim2 vs the W7 manifest join.dim wh_probe_dim (injected [W7H]) => join_template_required (the variant does NOT vouch the dim)', () =>
+    executeWhQuery(joinExecArgs({ fetcher, templateHashes: [W7H], reqOverride: wrongDimTier2 })), 'join_template_required', 'join.dim binding');
+  eq('both dim-gate rejects fired BEFORE any network: zero shard POSTs', seen, []);
+  // Positive control: the RIGHT dim passes the gate and the wave completes —
+  // the gate is not over-firing on the legal tier2 path.
+  const rightDimTier2 = parseWhEngineRequest({ ...joinReqBody(), query: { ...(joinReqBody().query as Record<string, unknown>), join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' } } });
+  const resOk = await executeWhQuery(joinExecArgs({ fetcher: recordingFetch({ 'shard-a': envA, 'shard-b': envB }, []), templateHashes: [W7H], reqOverride: rightDimTier2 }));
+  eq('right-dim tier2 request passes the gate: coverage 2/2 (the tier2 path is UNCHANGED by the dim gate)', [resOk.coverage, resOk.partial], ['2/2', false]);
 });
 
 // =============================================================================
@@ -556,7 +630,29 @@ Deno.test('r129 manifest statics: the W6 row deep-equals the 16-field transcript
     encoding: { x: 'text', c: 'number', n: 'number' },
     join: { dim: 'wh_probe_dim', left: 'region', right: 'region' },
   });
-  eq('append-only + partition laws', [ENGINE_TEMPLATE_MANIFEST[5] === w6, ENGINE_TEMPLATE_MANIFEST.filter((r) => r.join !== undefined).length, ENGINE_TEMPLATE_MANIFEST.length], [true, 1, 6]);
+  // r133 re-pin (design_r132_w7_family §2.2): the join-row count 1 → 2 (W7
+  // APPENDED at index 6, manifest length 6 → 7 — the append-only + partition
+  // laws EXTENDED, never weakened).
+  const w7 = manifestRowByHash(W7H);
+  eq('manifestRowByHash(W7H) deep-equals the hand-transcribed W7 row (16 fields incl. join {dim,left,right,variant:"tier2"})', w7, {
+    slug: 'W7_dim_tier_join_agg',
+    file: 'W7_dim_tier_join_agg.sql',
+    template_hash: W7H,
+    logical_table: 'wh_probe_agg',
+    qc_class: 'QC6',
+    kind: 'rows',
+    merge_ops: ['groupby', 'sum', 'count', 'count_col'],
+    group_keys: ['region'],
+    params_schema: {},
+    timeout_ms: 8000,
+    max_rows: 1000,
+    schema_version: 1,
+    state: 'active',
+    aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+    encoding: { x: 'text', c: 'number', n: 'number' },
+    join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
+  });
+  eq('append-only + partition laws (r133: W6 index 5 unchanged, W7 index 6, TWO join-carrying rows, SEVEN rows)', [ENGINE_TEMPLATE_MANIFEST[5] === w6, ENGINE_TEMPLATE_MANIFEST[6] === w7, ENGINE_TEMPLATE_MANIFEST.filter((r) => r.join !== undefined).length, ENGINE_TEMPLATE_MANIFEST.length], [true, true, 2, 7]);
 });
 
 Deno.test('r129 W6 body compliance TEXT pins (design §2.3 rows-kind law, lint-templates parity) over db/shard-templates/W6_colocated_join_agg.sql', async () => {
@@ -570,6 +666,25 @@ Deno.test('r129 W6 body compliance TEXT pins (design §2.3 rows-kind law, lint-t
   const digest = await crypto.subtle.digest('SHA-256', bodyBytes);
   const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
   eq('sha256(body bytes) === the manifest template_hash (the body IS the contract)', hex, W6H);
+});
+
+Deno.test('r133 W7 body compliance TEXT pins (design_r132_w7_family §2.3 rows-kind law + the K-W7b tier-predicate TEXT pin) over db/shard-templates/W7_dim_tier_join_agg.sql', async () => {
+  const bodyBytes = await Deno.readFile(new URL('../../../db/shard-templates/W7_dim_tier_join_agg.sql', import.meta.url));
+  const body = new TextDecoder().decode(bodyBytes);
+  eqTrue('effective text ends `limit $2` (final line, no trailing semicolon — the F2 sentinel interplay)', body.trimEnd().endsWith('limit $2'));
+  eqTrue('_pre_trim window present (same shape as W1/W6 — the sentinel re-cap interplay unchanged)', body.includes('count(*) over () as _pre_trim'));
+  eqTrue('zero double-quote characters anywhere in the body (single quotes only — mirrors W6)', !body.includes('"'));
+  eqTrue('no row-aggregate wrapper (jsonb_agg|array_agg|string_agg banned in rows-kind bodies — the lint ROWS_AGG_BAN parity)', !/\b(jsonb_agg|array_agg|string_agg)\s*\(/i.test(body));
+  eqTrue('the hardcoded SQL join keys match the manifest join binding (t.region = d.region — what key binding protects)', body.includes('join public.wh_probe_dim d on t.region = d.region'));
+  // K-W7b TEXT arm (design §6 K-W7b): the tier predicate is the body's ONE
+  // delta line vs W6 — a mutant that drops `and d.tier = 2` emits the 49-row
+  // W6 oracle against the 17-row tier2 expectation → this pin + the live
+  // ladder RED. Byte law: W6 + 15 bytes = 482, LF-only, no trailing NL.
+  eqTrue('the tier predicate `and d.tier = 2` is present on the ON clause (the K-W7b discriminator — tier filter is a template CONSTANT)', body.includes('on t.region = d.region and d.tier = 2'));
+  eq('W7 byte law: EXACTLY 482 bytes = W6 (467) + the 15-byte ` and d.tier = 2` delta, single LF-only tail, no trailing newline', [bodyBytes.length, body.endsWith('limit $2'), body.includes('\r')], [482, true, false]);
+  const digest = await crypto.subtle.digest('SHA-256', bodyBytes);
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  eq('sha256(body bytes) === the manifest template_hash (the body IS the contract)', hex, W7H);
 });
 
 Deno.test('r129 E15 fixture provenance: canonical oracle port (path + sha256 self-pinned), the hand constants ride the fixture', () => {
@@ -586,6 +701,71 @@ Deno.test('r129 rpcParams: join plans ride the EXISTING param law — {} + optio
   eq('join plan with limit 10 => {limit:10} (the existing $2 alias)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { limit: 10 } })).query), { limit: 10 });
   const noJoin = parseWhEngineRequest({ v: 1, qid: 'q', table: 'wh_probe_agg', query: { select: [{ op: 'sum', col: 'amount', alias: 'x' }], groupBy: ['region'] } });
   eqTrue('the join descriptor adds NO param (rpcParams identical with and without query.join)', deepEq(rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody()).query), rpcParams(JOIN_PLAN, noJoin.query)));
+  // r133 (design_r132_w7_family §3): fetch_rows rides $2 IDENTICALLY — the
+  // emission shape {limit: N} is UNCHANGED, the N source is effectiveK.
+  eq('join plan with fetch_rows 10 => {limit:10} (the same $2 alias — emission shape unchanged)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { fetch_rows: 10 } })).query), { limit: 10 });
+  eq('join plan with fetch_rows null (no limit) => {} (the ?? law falls through — p_params.limit is NEVER null, AM-7 holds)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { fetch_rows: null } })).query), {});
+});
+
+// =============================================================================
+// §6.6 (r133) — fetch_rows arms: parse (OPTIONAL int, mutually exclusive with
+// limit, positive-integer-or-null) + the effectiveK chain end-to-end (the
+// manifest pre-refusal reads planRef.limitK = effectiveK — M-J4's living
+// arm; the boundary == law; and the P2-1 TRUNCATION arm — the rows slice is
+// its OWN edit site, a missed threading returns shards×K rows silently).
+// =============================================================================
+Deno.test('r133 fetch_rows parse: OPTIONAL int, mutually exclusive with limit, positive-integer-or-null (fixed-string malformed, r57 law)', () => {
+  const base = { v: 1, qid: 'q-fetch-parse', table: 'wh_probe_agg' };
+  const q = (extra: Record<string, unknown>) => ({ ...base, query: { select: [{ op: 'count' }], ...extra } });
+  // valid: normalized additively — fetch_rows rides, limit ABSENT.
+  const fr = parseWhEngineRequest(q({ fetch_rows: 25 }));
+  eq('fetch_rows 25 parses; normalized query carries fetch_rows 25 and NO limit key', [fr.query.fetch_rows, 'limit' in fr.query], [25, false]);
+  eqTrue('fetch_rows null is kept (the explicit no-truncation alias of limit:null — effectiveK falls through the ?? law)', parseWhEngineRequest(q({ fetch_rows: null })).query.fetch_rows === null);
+  eqTrue('fetch_rows absent: the normalized query carries NO fetch_rows key (byte-identical pre-r133 emit)', !('fetch_rows' in parseWhEngineRequest(q({})).query));
+  // mutual exclusion — BOTH keys present is a consumer error, not a precedence question.
+  throwsEngine('fetch_rows 25 + limit 10 BOTH present => malformed', () => parseWhEngineRequest(q({ fetch_rows: 25, limit: 10 })), 'malformed', 'query.fetch_rows and query.limit are mutually exclusive');
+  throwsEngine('fetch_rows 25 + limit:null BOTH present => malformed (presence, not value, triggers exclusion)', () => parseWhEngineRequest(q({ fetch_rows: 25, limit: null })), 'malformed', 'query.fetch_rows and query.limit are mutually exclusive');
+  // malformed variants (the limit parse convention: non-negative integer or null — fetch_rows tightens to POSITIVE).
+  throwsEngine('fetch_rows non-integer (2.5) => malformed', () => parseWhEngineRequest(q({ fetch_rows: 2.5 })), 'malformed', 'query.fetch_rows must be a positive integer or null');
+  throwsEngine('fetch_rows 0 => malformed (a zero-row fetch is a no-op masquerading as a clamp)', () => parseWhEngineRequest(q({ fetch_rows: 0 })), 'malformed', 'query.fetch_rows must be a positive integer or null');
+  throwsEngine('fetch_rows negative (-5) => malformed', () => parseWhEngineRequest(q({ fetch_rows: -5 })), 'malformed', 'query.fetch_rows must be a positive integer or null');
+  throwsEngine('fetch_rows string ("25") => malformed', () => parseWhEngineRequest(q({ fetch_rows: '25' })), 'malformed', 'query.fetch_rows must be a positive integer or null');
+});
+
+Deno.test('r133 fetch_rows effectiveK chain end-to-end: pre-refusal (M-J4), boundary ==, and the P2-1 truncation arm', async () => {
+  // (a) M-J4 living arm: fetch_rows 1001 > manifest max_rows 1000 => the
+  // manifest-side pre-refusal fires (it reads planRef.limitK = effectiveK —
+  // NO code change needed there, the K source flows) with ZERO shard POSTs.
+  // Hand-derived shape (the LETHAL 3 law, wh_handshake_test.ts):
+  // warnings {shard, max_rows_exceeded, est_rows 0, retried false} ×2,
+  // perShard {ok false, latencyMs 0 EXACTLY, error} ×2, coverage 0/2.
+  const overReq = parseWhEngineRequest({ ...joinReqBody(), query: { ...(joinReqBody().query as Record<string, unknown>), fetch_rows: 1001 } });
+  const seenOver: SeenCall[] = [];
+  const resOver = await executeWhQuery(joinExecArgs({ fetcher: recordingFetch({}, seenOver), templateHashes: [W6H], reqOverride: overReq }));
+  eq('fetch_rows 1001 > max_rows 1000: max_rows_exceeded warnings ×2 (est_rows 0 — no directory estimate)', resOver.warnings, [
+    { shard: 'shard-a', code: 'max_rows_exceeded', est_rows: 0, retried: false },
+    { shard: 'shard-b', code: 'max_rows_exceeded', est_rows: 0, retried: false },
+  ]);
+  eq('fetch_rows 1001: perShard latencyMs == 0 EXACTLY (no round trip — hand-computed law), fanout dead', resOver.perShard, [
+    { shard: 'shard-a', ok: false, latencyMs: 0, error: 'max_rows_exceeded' },
+    { shard: 'shard-b', ok: false, latencyMs: 0, error: 'max_rows_exceeded' },
+  ]);
+  eq('fetch_rows 1001: coverage 0/2 partial and the recording fetcher saw ZERO POSTs (M-J4: the pre-refusal is unconditional over the K source)', [resOver.coverage, resOver.partial, seenOver], ['0/2', true, []]);
+  // (b) boundary == passes: fetch_rows 1000 == max_rows 1000 (refuse iff
+  // K > max_rows STRICTLY) — the wave fans out and completes.
+  const eqReq = parseWhEngineRequest({ ...joinReqBody(), query: { ...(joinReqBody().query as Record<string, unknown>), fetch_rows: 1000 } });
+  const seenEq: SeenCall[] = [];
+  const resEq = await executeWhQuery(joinExecArgs({ fetcher: recordingFetch({ 'shard-a': envA, 'shard-b': envB }, seenEq), templateHashes: [W6H], reqOverride: eqReq }));
+  eq('fetch_rows 1000 == max_rows 1000: the boundary PASSES and both shards are POSTed (2/2)', [resEq.coverage, seenEq.length], ['2/2', 2]);
+  // (c) P2-1 TRUNCATION arm (audit A P2-1 — design §6.6): 2 shards × 2
+  // regions merge to 2 groups; fetch_rows 1 => response.rows EXACTLY 1.
+  // The slice reads effectiveLimitK directly (its OWN edit site) — a missed
+  // threading would return shards×K = 2 rows SILENTLY.
+  const truncReq = parseWhEngineRequest({ ...joinReqBody(), query: { ...(joinReqBody().query as Record<string, unknown>), fetch_rows: 1 } });
+  const resTrunc = await executeWhQuery(joinExecArgs({ fetcher: recordingFetch({ 'shard-a': smallEnvA, 'shard-b': smallEnvB }, []), templateHashes: [W6H], reqOverride: truncReq }));
+  eq('fetch_rows 1 on a 2-shard wave merging 2 groups: response.rows is EXACTLY the first row (merged rows ≤ effectiveK)', resTrunc.rows, [{ k: ['g00'], aggs: { x: 140n, c: 4, n: 5 } }]);
+  const resUnclamped = await executeWhQuery(joinExecArgs({ fetcher: recordingFetch({ 'shard-a': smallEnvA, 'shard-b': smallEnvB }, []), templateHashes: [W6H] }));
+  eqTrue('same wave WITHOUT fetch_rows returns both rows (the clamp, not the merge, did the trimming)', resUnclamped.rows?.length === 2);
 });
 
 // =============================================================================
