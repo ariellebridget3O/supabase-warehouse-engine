@@ -861,18 +861,20 @@ Deno.test('r133 W7 fanout: the FULL E16 tier2 oracle through the real pipeline (
 });
 
 // =============================================================================
-// §6.6 — rpcParams arms: {} + optional limit; the join descriptor adds NO
-// new params (span params stay DEFERRED — design §2.3).
+// §6.6 — rpcParams arms (r139 R4 re-pin): join plans are GROUPED ⇒ p_params
+// is {} for ALL K; the join descriptor adds NO new params (span params stay
+// DEFERRED — design §2.3).
 // =============================================================================
-Deno.test('r129 rpcParams: join plans ride the EXISTING param law — {} + optional limit, NOTHING new', () => {
-  eq('join plan without limit => {} (p_params empty)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody()).query), {});
-  eq('join plan with limit 10 => {limit:10} (the existing $2 alias)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { limit: 10 } })).query), { limit: 10 });
+Deno.test('r139 R4 rpcParams (r129 re-pin): join plans are GROUPED — ALL K arms => {} (per-shard LIMIT retired); the join descriptor still adds NOTHING', () => {
+  eq('join plan without limit => {} (p_params empty — byte-identical to the pre-r139 unclamped wire)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody()).query), {});
+  eq('join plan with limit 10 => {} (r139 R4 (a): join waves slice POST-merge — the $2 alias is retired for grouped plans)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { limit: 10 } })).query), {});
   const noJoin = parseWhEngineRequest({ v: 1, qid: 'q', table: 'wh_probe_agg', query: { select: [{ op: 'sum', col: 'amount', alias: 'x' }], groupBy: ['region'] } });
   eqTrue('the join descriptor adds NO param (rpcParams identical with and without query.join)', deepEq(rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody()).query), rpcParams(JOIN_PLAN, noJoin.query)));
-  // r133 (design_r132_w7_family §3): fetch_rows rides $2 IDENTICALLY — the
-  // emission shape {limit: N} is UNCHANGED, the N source is effectiveK.
-  eq('join plan with fetch_rows 10 => {limit:10} (the same $2 alias — emission shape unchanged)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { fetch_rows: 10 } })).query), { limit: 10 });
-  eq('join plan with fetch_rows null (no limit) => {} (the ?? law falls through — p_params.limit is NEVER null, AM-7 holds)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { fetch_rows: null } })).query), {});
+  // r139 R4 (a): limit and fetch_rows retire TOGETHER for grouped waves —
+  // one K source (effectiveLimitK), one law; the clamp is the post-merge
+  // slice (supersedes the r133 emission-shape pin on join plans).
+  eq('join plan with fetch_rows 10 => {} (the same retire — the alias law keeps ONE K source)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { fetch_rows: 10 } })).query), {});
+  eq('join plan with fetch_rows null (no limit) => {} (AM-7 holds: never null — and here never present)', rpcParams(JOIN_PLAN, parseWhEngineRequest(joinReqBody({ query: { fetch_rows: null } })).query), {});
 });
 
 // =============================================================================

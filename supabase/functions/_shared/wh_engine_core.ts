@@ -1145,13 +1145,28 @@ export function effectiveLimitK(query: WhEngineRequest['query']): number | null 
  * zero consumer demand, no resource pressure, translation-surface cost with
  * zero drilled precedent; re-open triggers are banked in §4 — the mapper is
  * NOT deferred-to-a-wave anymore, it is CLOSED). `plan` rides the signature
- * for that wave's mapper; v21 never reads it.
+ * for that wave's mapper; v21 never read it (r139 R4 does — it keys the
+ * grouped-wave retire on `plan.groupKeys`, the SAME discriminator the
+ * execute branches already use).
  * r133 (design_r132_w7_family §3): the effective-K law — the emission shape
  * is UNCHANGED `{}` or `{limit: N}`; the N source widens from `query.limit`
  * to `effectiveK = fetch_rows ?? limit` (fetch_rows rides $2 identically;
  * zero body changes, zero re-seeding — the placeables law is untouched).
+ * r139 R4 (a) client-side-slice-only, sub-decision A1: for GROUPED plans
+ * (`plan.groupKeys !== undefined` — W1 + join W6/W7) the emission is `{}`
+ * for ALL K — the per-shard LIMIT row-selection threading is RETIRED.
+ * The r138 s8 live datum: any $2-trim of a grouped wave stamps the shard
+ * `more:true` sentinel ⇒ invariant-5 excludes every partial ⇒ coverage
+ * collapses (fetch_rows:10 was 0/3 unmergeable live). The clamp remains
+ * pure client-side math: the post-merge slice (the finalize grouped
+ * branch) is the law. limit and fetch_rows retire TOGETHER (one K source
+ * — the alias law). Scalar plans keep the byte-shape `{}`/`{limit: N}`
+ * (inert on the W2/W3 bodies, but byte-pinned); A1 keeps effectiveLimitK,
+ * planRef.limitK, the pre-POST max_rows_exceeded band, the sampled
+ * backstop and handshake (c) byte-identical.
  */
-export function rpcParams(_plan: WhMergePlan, query: WhEngineRequest['query']): Record<string, unknown> {
+export function rpcParams(plan: WhMergePlan, query: WhEngineRequest['query']): Record<string, unknown> {
+  if (plan.groupKeys !== undefined) return {}; // r139 R4 (a)/A1: grouped waves slice POST-merge only — per-shard $2 threading retired (s8: the sentinel makes trimmed grouped partials unmergeable)
   const k = effectiveLimitK(query);
   return typeof k === 'number' ? { limit: k } : {};
 }

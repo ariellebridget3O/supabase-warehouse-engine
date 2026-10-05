@@ -1227,18 +1227,34 @@ Deno.test('r138 B1: the advisory lethal block — armed-and-SILENT on match; FIR
 });
 
 // -----------------------------------------------------------------------------
-// r138 B2 (d3 §2 B2 — FB-3 cite fix): the fetch_rows 10-of-50 EXACT offline
-// live-mirror. 3 shards × hand-built 50-region W1 grouped partials
-// (regions r00..r49, zero-padded so region-asc == index-asc). Shard j's
-// per-region values are pure index arithmetic: x_j(r) = (r+1)(j+1) [sum,
-// scale-0 text], c_j(r) = 2r + j [count_col], n_j(r) = 10 + r + j [count(*)].
-// Merged GLOBAL 3-band values: x(r) = 6(r+1), c(r) = 6r+3, n(r) = 33+3r.
-// Under fetch_rows:10 the shard-side $2 LIMIT trims EACH shard to its first
-// 10 regions region-asc (r00..r09 — the SAME region set on every band: the
-// offline emulation of the live uniform construction; the live A3 band s8
-// re-proves it against the real corpus). Hand-computed expectations, zero
-// impl derivation: r00 {x:6, c:3, n:33} · r09 {x:60, c:57, n:60} · r49
-// {x:300, c:297, n:180}.
+// r139 B2 (re-pin of r138 d3 §2 B2 under R4 (a) client-side-slice-only):
+// the fetch_rows 10-of-50 EXACT offline live-mirror, now modeling the
+// UNTRIMMED wire. rpcParams (r139) stops threading a per-shard LIMIT into
+// grouped waves — shards receive p_params:{} — so each shard's partial
+// carries its FULL 50-region group set (r00..r49, zero-padded so
+// region-asc == index-asc); the merge folds 3/3 and the finalize
+// POST-merge slice cuts rows to K. (The recording-fake no-limit-key wire
+// witness lives on the channel plane — wh_shard_channel r139 R4 re-pin;
+// here the untrimmed fixture IS the p_params:{} wire model.)
+//
+// Fixture arithmetic (hand-verified, independent of the implementation):
+// 3 shards × 50 regions; shard j (0-based) carries per-region r:
+//   x_j(r) = (r+1)(j+1) [sum, scale-0 text] · c_j(r) = 2r + j [count_col]
+//   · n_j(r) = 10 + r + j [count(*)].
+// Merged GLOBAL 3-band values (Σ over j = 0,1,2):
+//   x(r) = (r+1)·(1+2+3) = 6(r+1) · c(r) = 2r·3 + (0+1+2) = 6r+3
+//   · n(r) = (10+r)·3 + (0+1+2) = 33+3r.
+// Spot checks (by hand): r00 {x:6, c:3, n:33} (1+2+3 / 0+1+2 / 10+11+12);
+// r09 {x:60, c:57, n:60} (10+20+30 / 18+19+20 / 19+20+21); r49
+// {x:300, c:297, n:180} (50+100+150 / 98+99+100 / 59+60+61).
+// WHY the r138 trimmed-fixture row VALUES survive the fixture flip: the
+// bands are UNIFORM across shards — every shard carries EVERY region with
+// the same j-shaped value, so a merge fold per region is a PER-REGION
+// CONSTANT. Trimming removes whole regions, never part of a fold; the
+// fixture flip (10-region → 50-region partials) changes only WHICH regions
+// merge, not any region's value. The post-merge slice of the 50-group
+// global merge at 10 (canonical key-ascending order) is therefore
+// byte-IDENTICAL to the r138 trimmed-fixture pins: r00..r09, unchanged.
 // -----------------------------------------------------------------------------
 const B2_AGGS = { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } };
 function b2RegionLabel(r: number): string {
@@ -1267,30 +1283,35 @@ function b2Req(withClamp: boolean): ReturnType<typeof parseWhEngineRequest> {
   }));
 }
 
-Deno.test('r138 B2: fetch_rows 10-of-50 EXACT — merged rows are EXACTLY the first 10 regions region-asc with GLOBAL 3-band values; perShard partial_rows 10 ×3; the unclamped twin returns all 50', async () => {
-  // The shard-side-trimmed wave: each shard's partial carries EXACTLY its
-  // first 10 regions (r00..r09) — what the live shard returns under LIMIT 10.
+Deno.test('r139 B2: fetch_rows 10-of-50 EXACT — shards ride p_params:{} (UNTRIMMED partials, perShard partial_rows 50 ×3) and the POST-merge slice serves EXACTLY the first 10 regions region-asc with GLOBAL 3-band values; the unclamped twin returns all 50', async () => {
+  // The untrimmed wave: each shard's partial carries ALL 50 regions —
+  // exactly what p_params:{} fetches post-r139 (modeling the retired $2
+  // trimmed 10-region partial here would be the vacuous-green class the
+  // r138 lesson bans: the offline emulation must model the real wire).
   const clamped = await executeWhQuery({
     ...E1_EXECUTE,
     req: b2Req(true),
-    fetcher: (async (shard: string) => ({ ok: true, envelope: b2Env(shard, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) })) as WhShardFetcher,
+    fetcher: (async (shard: string) => ({ ok: true, envelope: b2Env(shard, Array.from({ length: 50 }, (_, i) => i)) })) as WhShardFetcher,
   });
   // Hand-computed merged expectation for r = 0..9 (x = 6(r+1), c = 6r+3,
-  // n = 33+3r) — arithmetic independent of the implementation.
-  eq('B2: merged rows are EXACTLY the 10 clamped regions region-asc with GLOBAL 3-band values (hand-computed)', clamped.rows, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(b2ExpectedRow));
+  // n = 33+3r — per-region constants; the header arithmetic) — independent
+  // of the implementation and IDENTICAL to the r138 trimmed-fixture pins.
+  eq('B2: merged rows are EXACTLY the first 10 regions region-asc with GLOBAL 3-band values (hand-computed, POST-merge slice)', clamped.rows, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(b2ExpectedRow));
   eq('B2: literal spot pin r00 = {x:6n, c:3, n:33}', clamped.rows?.[0], { k: ['r00'], aggs: { x: 6n, c: 3, n: 33 } });
   eq('B2: literal spot pin r09 = {x:60n, c:57, n:60}', clamped.rows?.[9], { k: ['r09'], aggs: { x: 60n, c: 57, n: 60 } });
-  eq('B2: exactly 10 merged rows (the clamp, not the merge, did the trimming)', clamped.rows?.length, 10);
-  eq('B2: the designed truncation is COMPLETE — shard-side trim keeps the same region set, coverage 3/3 partial:false (more never rides)', [clamped.coverage, clamped.partial, clamped.warnings], ['3/3', false, []]);
-  eq('B2: perShard partial_rows 10 ×3 (each shard trimmed to its own K)', clamped.perShard.map((p) => p.partial_rows), [10, 10, 10]);
+  eq('B2: exactly 10 merged rows — the POST-merge slice (not the merge, not a shard trim) did the cutting', clamped.rows?.length, 10);
+  eq('B2: coverage 3/3 partial:false — untrimmed partials merge clean (p_params:{} provokes no more:true sentinel)', [clamped.coverage, clamped.partial, clamped.warnings], ['3/3', false, []]);
+  eq('B2: perShard partial_rows 50 ×3 (the untrimmed echo — shards receive p_params:{})', clamped.perShard.map((p) => p.partial_rows), [50, 50, 50]);
 
-  // The unclamped twin wave: same shards, no fetch_rows ⇒ all 50 regions.
+  // The no-slice control twin: byte-identical fetch path post-r139 (both
+  // waves ride p_params:{}); no fetch_rows ⇒ the finalize slice is a no-op
+  // and all 50 regions survive.
   const unclamped = await executeWhQuery({
     ...E1_EXECUTE,
     req: b2Req(false),
     fetcher: (async (shard: string) => ({ ok: true, envelope: b2Env(shard, Array.from({ length: 50 }, (_, i) => i)) })) as WhShardFetcher,
   });
-  eq('B2 twin: 50 merged rows region-asc', unclamped.rows?.length, 50);
+  eq('B2 twin: 50 merged rows region-asc (identical fetch path — only the slice differs)', unclamped.rows?.length, 50);
   eq('B2 twin: literal spot pin r49 = {x:300n, c:297, n:180} (the unclamped tail)', unclamped.rows?.[49], { k: ['r49'], aggs: { x: 300n, c: 297, n: 180 } });
   eq('B2 twin: the r00 band value is IDENTICAL under both waves (global values, not per-shard)', unclamped.rows?.[0], clamped.rows?.[0]);
   eq('B2 twin: full coverage, no warnings', [unclamped.coverage, unclamped.partial, unclamped.warnings], ['3/3', false, []]);

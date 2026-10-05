@@ -714,14 +714,28 @@ Deno.test('r69 WH_RPC_ELIGIBLE_HASHES: W1/W2/W3 + r129 W6 + r133 W7 join-class (
   eqTrue('W5-class (unguarded dataset param) not eligible', !WH_RPC_ELIGIBLE_HASHES.includes(W5H));
 });
 
-Deno.test('r69 rpcParams: numeric limit echoes; limit:null and absent are ABSENT (AM-7)', () => {
-  eq('limit 25 => {limit:25}', rpcParams(RPC_PLAN, { ...RPC_REQ.query, limit: 25 }), { limit: 25 });
-  eq('limit null => {} (p_params.limit is NEVER null)', rpcParams(RPC_PLAN, { ...RPC_REQ.query, limit: null }), {});
-  eq('limit absent => {}', rpcParams(RPC_PLAN, RPC_REQ.query), {});
-  // r133 (design_r132_w7_family §3): fetch_rows rides $2 identically — the
-  // emission shape is UNCHANGED, the N source widens to effectiveK.
-  eq('fetch_rows 25 => {limit:25} (the same emission shape — the N source is effectiveK)', rpcParams(RPC_PLAN, { ...RPC_REQ.query, fetch_rows: 25 }), { limit: 25 });
-  eq('fetch_rows null => {} (the ?? law falls through — AM-7 holds)', rpcParams(RPC_PLAN, { ...RPC_REQ.query, fetch_rows: null }), {});
+// The scalar twin plan (NO groupKeys — the W2/W3 shape): pins that the r139
+// R4 retire is WAVE-CLASS-KEYED, not blanket (A1: scalar emission keeps the
+// pre-r139 byte-shape; the scalar bodies have no $2 so the emission is inert,
+// but the byte-pins stay).
+const SCALAR_PLAN: WhMergePlan = { table: 'wh_probe_agg', aggs: RPC_PLAN.aggs };
+
+Deno.test('r139 R4 rpcParams (r69 re-pin): grouped waves return {} for ALL K arms — per-shard LIMIT threading retired; the scalar twin keeps the byte-shape', () => {
+  // r139 R4 (a)/A1: RPC_PLAN is GROUPED (groupKeys [region]) ⇒ p_params is
+  // {} for ANY K — limit and fetch_rows retire TOGETHER (one K source,
+  // effectiveLimitK — the alias law). The s8 datum (r138 live): a $2-trim
+  // of a grouped wave stamps `more:true` ⇒ invariant-5 excludes the
+  // partial ⇒ coverage collapse; the clamp is now the POST-merge slice.
+  eq('grouped + limit 25 => {} (the retire — no per-shard row-selection)', rpcParams(RPC_PLAN, { ...RPC_REQ.query, limit: 25 }), {});
+  eq('grouped + limit null => {} (AM-7 survives: p_params.limit is NEVER null)', rpcParams(RPC_PLAN, { ...RPC_REQ.query, limit: null }), {});
+  eq('grouped + limit absent => {} (byte-identical to the pre-r139 unclamped wire)', rpcParams(RPC_PLAN, RPC_REQ.query), {});
+  eq('grouped + fetch_rows 25 => {} (the same retire — effectiveK unifies both sources)', rpcParams(RPC_PLAN, { ...RPC_REQ.query, fetch_rows: 25 }), {});
+  eq('grouped + fetch_rows null => {} (the ?? law falls through — AM-7 holds)', rpcParams(RPC_PLAN, { ...RPC_REQ.query, fetch_rows: null }), {});
+  // The scalar twin: A1 keeps the emission byte-shape for non-grouped plans
+  // (a blanket {} would be the R2 regression class the census banned).
+  eq('scalar twin + limit 25 => {limit:25} (byte-shape kept under A1)', rpcParams(SCALAR_PLAN, { ...RPC_REQ.query, limit: 25 }), { limit: 25 });
+  eq('scalar twin + fetch_rows 25 => {limit:25} (the r133 effectiveK source, shape unchanged)', rpcParams(SCALAR_PLAN, { ...RPC_REQ.query, fetch_rows: 25 }), { limit: 25 });
+  eq('scalar twin + limit absent => {} (AM-7 unchanged)', rpcParams(SCALAR_PLAN, RPC_REQ.query), {});
 });
 
 // =============================================================================
@@ -885,7 +899,8 @@ Deno.test('r69 core sanity: compileShardRpcUrl/compileShardUrl identities + pars
 //   * engine core: replica/override targets never carry rpc (AM-13) with the
 //     override select-arm refusal surfaced through the REAL fetcher; the D2
 //     rpcMode gate's ABSENT direction (a hashless plan does NOT throw);
-//     limit echo at the target-construction level (AM-7); whCode survives
+//     grouped p_params:{} at the target-construction level (r139 R4; AM-7's
+//     never-null law unchanged); whCode survives
 //     classify into warnings[].detail on BOTH arms (AM-5/F-N2) unit + e2e;
 //     the F-N3 multi-template impossibility census; the F-N5 manifest-FILE
 //     provenance cross-check; the call-site shard stamp (merge-exclusion
@@ -1273,7 +1288,7 @@ Deno.test('r69 battery core D2: rpcMode ABSENT keeps the D2 check ABSENT — a h
   eq('the pre-r69 pipeline serves both shards', res?.coverage, '2/2');
 });
 
-Deno.test('r69 battery core: limit echo rides the rpc target p_params; limit:null stays ABSENT (AM-7 at target construction)', async () => {
+Deno.test('r69 battery core (r139 R4 re-pin): grouped waves carry p_params {} into BOTH rpc targets for ANY K — no limit key rides the wire; limit:null stays ABSENT (AM-7 at target construction)', async () => {
   const recording = () => {
     const seen: { shard: string; url: string; rpc?: WhRpcSpec }[] = [];
     const fetcher = ((shard: string, url: string, rpc?: WhRpcSpec) => {
@@ -1282,15 +1297,19 @@ Deno.test('r69 battery core: limit echo rides the rpc target p_params; limit:nul
     }) as WhShardFetcher;
     return { seen, fetcher };
   };
+  // r139 R4 (a): the W1 rpc plane is a GROUPED wave ⇒ p_params {} even
+  // under a clamped request — the recording fake is the wire witness (the
+  // audit P1-2 requirement: the POST body carries NO limit key at all).
   const lim = recording();
   await executeWhQuery(rpcPlaneArgs({
     req: { ...RPC_REQ, query: { ...RPC_REQ.query, limit: 25 } },
     fetcher: lim.fetcher,
   }));
-  eq('limit 25 echoes into BOTH rpc targets', lim.seen.map((t) => t.rpc), [
-    { p_template_hash: W1H, p_params: { limit: 25 } },
-    { p_template_hash: W1H, p_params: { limit: 25 } },
+  eq('limit 25 => BOTH rpc targets carry p_params {} (the retire — no per-shard LIMIT on the wire)', lim.seen.map((t) => t.rpc), [
+    { p_template_hash: W1H, p_params: {} },
+    { p_template_hash: W1H, p_params: {} },
   ]);
+  eqTrue('limit 25: NO limit key in any p_params (the recording-fake requirement — grouped waves never thread K)', lim.seen.every((t) => !('limit' in (t.rpc?.p_params as Record<string, unknown>))));
   const nul = recording();
   await executeWhQuery(rpcPlaneArgs({
     req: { ...RPC_REQ, query: { ...RPC_REQ.query, limit: null } },
