@@ -52,7 +52,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEMPLATES_DIR_DEFAULT = REPO_ROOT / "db" / "shard-templates"
 
-QC_CLASSES = {"QC2", "QC3", "QC4", "STDDEV", "PERCENTILE", "COLD_AGG"}
+QC_CLASSES = {"QC2", "QC3", "QC4", "STDDEV", "PERCENTILE", "COLD_AGG", "QC6"}
 KINDS = {"rows", "scalar"}
 STATES = {"draft", "active", "frozen", "retired"}
 MERGE_OPS = {

@@ -76,6 +76,13 @@ export interface WhDirectoryRow {
   // Optional — the §5.2 handshake warnings carry it when available so the
   // gather can weigh degrade-vs-abort; absent => 0 (no estimate known).
   row_estimate?: number;
+  // r129 (design_r128_joinplans §2.2, audit A A3): the dim-relation reference
+  // flag (0013:110 warehouse_tables / :144 warehouse_placements — writer-
+  // stamped on the placement INSERT, never propagated from the table row).
+  // Consumed ONLY by the join colocation gate, FAIL-CLOSED: absent/false
+  // (undefined !== true) ⇒ NOT a reference placement ⇒ join_not_colocated.
+  // Optional so every pre-r129 row/fixture shape stays unchanged.
+  is_reference?: boolean;
 }
 
 // 'quorum_unmet' is in the union forward-compat (§4.4 pins 409) — v0 never
@@ -85,6 +92,11 @@ export interface WhDirectoryRow {
 // the wh_query RPC tier cannot serve (hashless / where-carrying / no
 // rpc-eligible derived template). Thrown ONLY when rpcMode is on (F-N4);
 // the entrypoint's status ladder maps it to 400 explicitly (AM-3).
+// 'join_not_colocated' | 'join_template_required' | 'join_key_mismatch'
+// (r129, design_r128_joinplans §2.1/§2.2 — audit A A6): the join-plan
+// plan-time 4xx family. All three are plan/parse-class rejects and the
+// entrypoint's status ladder maps each to 400 EXPLICITLY (wh_entrypoint.ts
+// status arm) — never a 500-fallthrough (the hazard above applies verbatim).
 export type WhEngineErrorCode =
   | 'malformed'
   | 'capacity_exceeded'
@@ -92,6 +104,9 @@ export type WhEngineErrorCode =
   | 'tier_warm'
   | 'quorum_unmet'
   | 'plan_untemplated'
+  | 'join_not_colocated'
+  | 'join_template_required'
+  | 'join_key_mismatch'
   | 'internal';
 
 export interface WhPerShardEntry {
@@ -100,6 +115,18 @@ export interface WhPerShardEntry {
   latencyMs: number;
   error: string | null;
   stamped?: boolean;
+  // r129 (design_r128_joinplans §2.6): additive OK-ARM-ONLY measurement keys
+  // (present on ok:true entries, NEVER on error arms — the error-arm shapes
+  // are battery-pinned deep-equal and stay byte-identical). Optional so the
+  // error arms compile untouched.
+  /** The partial envelope's rowCount (wh_merge validateEnvelope already
+   *  cross-checks it === rows.length, wh_merge.ts:156-158). */
+  partial_rows?: number;
+  /** The partial body's wire size in bytes: the UTF-8 byte length of
+   *  JSON.stringify(envelope.partial) via TextEncoder — the serialization
+   *  convention of record is pinned at the construction site (the ok-arm in
+   *  executeWhQuery). */
+  partial_bytes?: number;
 }
 
 /** Engine error with the §4.4 status-table code space. `internal` carries
@@ -136,6 +163,20 @@ export interface WhWhereEntry {
   value: unknown;
 }
 
+/** r129 (design_r128_joinplans §2.1): the additive OPTIONAL query.join
+ *  descriptor. Absence = the pre-r129 behavior byte-for-byte. When present
+ *  the parse is STRICT (unknown keys INSIDE join are rejected — tighter than
+ *  the outer query ignore, which is untouched; type is 'inner' ONLY in v1;
+ *  table must be a plain identifier differing from the query table; on.* are
+ *  plain identifiers). Adds NO expression surface — every existing parse
+ *  reject fires UNCHANGED. Plan-time validation (join-class template
+ *  selection, key binding, colocation gate) lives in executeWhQuery. */
+export interface WhJoinDescriptor {
+  table: string;
+  type: 'inner';
+  on: { left: string; right: string };
+}
+
 /** Normalized v1 request (§4.3). Neutral clauses (having=null/orderBy=null|[]/
  *  offset=0/distinct=false) are DROPPED at parse; non-neutral forms reject
  *  (planner honesty). */
@@ -148,6 +189,10 @@ export interface WhEngineRequest {
     where?: WhWhereEntry[];
     groupBy?: string[];
     limit?: number | null;
+    // r129 (design_r128_joinplans §2.1): the additive OPTIONAL join
+    // descriptor (WhJoinDescriptor above). Absent unless the request
+    // carried a strictly-valid query.join.
+    join?: WhJoinDescriptor;
   };
   coverage_mode: 'best_effort' | 'fail_fast';
   directory_snapshot?: string;
@@ -488,6 +533,55 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
     malformed('DISTINCT is not supported in v0 — rejected at plan time');
   }
 
+  // ---- r129 (design_r128_joinplans §2.1): the additive OPTIONAL query.join
+  // descriptor — strictly validated WHEN PRESENT; undefined/null => absent
+  // (the null-lenient precedent of where/read_plane) and every request
+  // without it parses byte-identically. A join descriptor is NEW surface, so
+  // unknown keys INSIDE join (and inside join.on) are REJECTED — tighter
+  // than the outer query object's ignore, which is untouched (V-3). Every
+  // violation is a fixed-string malformed: r57 law — messages name the
+  // var/position ONLY, never echo the input value. The descriptor adds NO
+  // expression surface: on.* are plain identifiers (the same IDENT_RE the
+  // grammar already uses), and every reject above (HAVING/ORDER BY/OFFSET/
+  // DISTINCT/in-lists) fired BEFORE this block and is unaffected.
+  let join: WhJoinDescriptor | undefined;
+  if (query.join !== undefined && query.join !== null) {
+    if (typeof query.join !== 'object' || Array.isArray(query.join)) {
+      malformed('query.join must be an object');
+    }
+    const j = query.join as Record<string, unknown>;
+    for (const k of Object.keys(j)) {
+      if (k !== 'table' && k !== 'type' && k !== 'on') {
+        malformed('query.join carries unknown keys (only table|type|on are allowed — join descriptors are strictly validated)');
+      }
+    }
+    if (typeof j.table !== 'string' || !IDENT_RE.test(j.table)) {
+      malformed('query.join.table must be a plain identifier');
+    }
+    if (j.table === r.table) {
+      malformed('query.join.table must differ from the query table (self-join is not v1)');
+    }
+    if (j.type !== 'inner') {
+      malformed('query.join.type must be the literal "inner" (the only v1 join type)');
+    }
+    if (j.on === null || typeof j.on !== 'object' || Array.isArray(j.on)) {
+      malformed('query.join.on must be an object');
+    }
+    const on = j.on as Record<string, unknown>;
+    for (const k of Object.keys(on)) {
+      if (k !== 'left' && k !== 'right') {
+        malformed('query.join.on carries unknown keys (only left|right are allowed — join descriptors are strictly validated)');
+      }
+    }
+    if (typeof on.left !== 'string' || !IDENT_RE.test(on.left)) {
+      malformed('query.join.on.left must be a plain identifier');
+    }
+    if (typeof on.right !== 'string' || !IDENT_RE.test(on.right)) {
+      malformed('query.join.on.right must be a plain identifier');
+    }
+    join = { table: j.table, type: 'inner', on: { left: on.left, right: on.right } };
+  }
+
   // limit: absent => not kept; null => kept (no truncation); integer >= 0 => kept
   let limit: number | null | undefined;
   if (query.limit !== undefined) {
@@ -506,6 +600,7 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
       ...(where ? { where } : {}),
       ...(groupBy ? { groupBy } : {}),
       ...(limit !== undefined ? { limit } : {}),
+      ...(join !== undefined ? { join } : {}),
     },
     coverage_mode: (r.coverage_mode as 'best_effort' | 'fail_fast') ?? 'best_effort',
     ...(r.directory_snapshot !== undefined ? { directory_snapshot: r.directory_snapshot as string } : {}),
@@ -835,11 +930,24 @@ export function gatePartialAgainstPlan(plan: WhMergePlan, rawEnvelope: unknown):
  * time from the pinned manifest (ENGINE_TEMPLATE_MANIFEST, wh_handshake.ts —
  * the exact literal sha256 strings; NOT a manifest field, which would red
  * the manifest deep-equality statics wh_handshake_test.ts:393+).
+ * r129 (design_r128_joinplans §2.3, audit A A2): W6_colocated_join_agg
+ * joins the set — its shard-side SQL is null-guarded by the same W1-proven
+ * shape and a join plan must reach the wh_query RPC plane or every legal
+ * join request would 400 plan_untemplated (the D2 gate below tests derived
+ * hashes against THIS constant). Derivation is JOIN-AWARE (deriveTemplate
+ * Hashes, wh_handshake.ts): non-join plans EXCLUDE join-class rows and join
+ * plans derive ONLY them, so W6 (merge_ops ⊇ W1's) can never co-derive with
+ * W1 and the ≤1-template-per-opset invariant holds. Battery provenance:
+ * pinned by wh_shard_channel_test.ts:696-699 (exact contents) and the FILE
+ * provenance cell :1377-1403 (eligible set === manifest.json hashes in
+ * manifest order) — the battery leg re-pins both for W6; this constant +
+ * comment is the engine-side duty.
  */
 export const WH_RPC_ELIGIBLE_HASHES: readonly string[] = [
   'a934e7e062f59cff5a856afdc7aa743ec9be11c068c7e861ea856c36b40bdbfd', // W1_grouped_sum_count ["groupby","sum","count"]
   'a095adaa148253aee8d1cc8e976f01b3579beeea5082f3862df4a908c20b2659', // W2_scalar_minmax ["min","max","count_col"]
   'bca9dd2c591ed48a0fa5367179dd5deb1d752ed9141c23e6ad53083becf8ecac', // W3_scalar_avg_pair ["avg_pair"]
+  '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576', // W6_colocated_join_agg ["groupby","sum","count","count_col"] (r129 join class)
 ];
 
 /**
@@ -1215,6 +1323,18 @@ export interface ExecuteArgs {
   columnTypes: Record<string, string>;
   columnScales?: Record<string, number>;
   directoryRows: WhDirectoryRow[];
+  // ---- r129 join plans (design_r128_joinplans §2.2, audit A A4): the DIM
+  // population for the colocation gate — the query.join descriptor's table
+  // rows, filtered from the SAME atomic embed by the entrypoint. NEVER
+  // merged into directoryRows (the DISPATCH population stays the fact rows
+  // ONLY: dim rows carry unbounded NULL/NULL bounds, survive E11 range
+  // pruning, and would double-POST every shard — phantom coverage + doubled
+  // partials — and could displace the fact head row feeding the schema/shard
+  // -key metadata). Optional: absent on every request without query.join
+  // (all pre-r129 traffic and legacy callers — byte-identical args); a join
+  // request WITHOUT it fails the colocation gate CLOSED (join_not_colocated
+  // — the gate can never vouch a dim population it cannot see).
+  joinDimRows?: WhDirectoryRow[];
   shardKeyColumn: string;
   shardKeyType: 'none' | 'hash' | 'range' | 'time';
   directoryVersion: number;
@@ -1401,6 +1521,80 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     ...(args.hashSlotFn ? { hashSlotFn: args.hashSlotFn } : {}),
   });
 
+  // ---- r129 join plans (design_r128_joinplans §2.1-§2.2): plan-time join
+  // validation, immediately after the fact-side E11 pruning (the colocation
+  // gate is defined over the SELECTED shard set S). Fires ONLY when the
+  // request carries query.join — every non-join request skips this block
+  // byte-identically (additive law). Order is fixed: template-class → key
+  // binding (§2.1 audit-B AB-P2) → colocation gate; all three are plan/
+  // parse-class rejects mapped to 400 by the entrypoint ladder (never a
+  // 500-fallthrough) and all three throw BEFORE any network I/O.
+  const joinReq = args.req.query.join;
+  if (joinReq !== undefined) {
+    // (a) template-class gate: a join request MUST select a join-class
+    // template — a manifest row carrying the additive `join` binding. A
+    // ZERO-hash derivation is deliberately NOT rejected here: join plans
+    // derive ONLY join-class rows (deriveTemplateHashes, wh_handshake.ts),
+    // so an empty derivation can never fall back to W1, and the D2
+    // plan_untemplated gate below owns the empty-derivation outcome.
+    const derivedForJoin = args.templateHashes ?? [];
+    const matchedJoinRow = derivedForJoin.length > 0 ? manifestRowByHash(derivedForJoin[0]) : null;
+    if (matchedJoinRow !== null && matchedJoinRow.join === undefined) {
+      throw new WhEngineError(
+        'join_template_required',
+        'join_template_required: the derived template is not join-class — a query.join request requires the join-class template (a manifest row carrying the join binding) served over the wh_query RPC plane',
+      );
+    }
+    // (b) key binding (design §2.1 audit-B AB-P2): the request's on.{left,
+    // right} must EQUAL the selected join-class template's declared manifest
+    // join.{left,right} — the template body is SQL with the keys hardcoded,
+    // so a mismatched on.* would silently bind nothing and pass a WRONG
+    // oracle. Fixed-string reject, no echo (r57 law).
+    if (matchedJoinRow !== null && matchedJoinRow.join !== undefined) {
+      if (joinReq.on.left !== matchedJoinRow.join.left || joinReq.on.right !== matchedJoinRow.join.right) {
+        throw new WhEngineError(
+          'join_key_mismatch',
+          'join_key_mismatch: request join.on keys do not equal the selected join template\'s declared manifest join binding',
+        );
+      }
+    }
+    // (c) colocation gate (design §2.2, FAIL-CLOSED): the dim relation must
+    // be broadcast-reference (is_reference === true on EVERY dim placement
+    // — undefined/false ⇒ reject) and EXACTLY ONE serving-or-draining dim
+    // placement must exist on EVERY ref in the selected set S (the
+    // membership/arity invariant per the r113 law — never a role
+    // assignment). Messages name shape + offending ref only — no catalog
+    // dumps. The dim population rides joinDimRows (NEVER directoryRows —
+    // the dispatch-population split is load-bearing, see ExecuteArgs).
+    const dimRows = args.joinDimRows;
+    if (dimRows === undefined) {
+      throw new WhEngineError(
+        'join_not_colocated',
+        'join_not_colocated: dim placement population unavailable for the query.join relation — the colocation gate fails closed',
+      );
+    }
+    for (const d of dimRows) {
+      if (d.is_reference !== true) {
+        throw new WhEngineError(
+          'join_not_colocated',
+          `join_not_colocated: dim relation is not a reference placement (is_reference !== true) on ref '${d.shard}'`,
+        );
+      }
+    }
+    for (const s of selected) {
+      const servingDim = dimRows.filter((d) => d.shard === s.shard && (d.state === 'serving' || d.state === 'draining'));
+      if (servingDim.length !== 1) {
+        throw new WhEngineError(
+          'join_not_colocated',
+          `join_not_colocated: dim relation lacks exactly one serving-or-draining placement on selected ref '${s.shard}' (found ${servingDim.length})`,
+        );
+      }
+    }
+    // Fact shard_key_type is unconstrained (range/hash/time/none all fine —
+    // the dim is key-free/unbounded); the fact-side pruning above is the
+    // ONLY dispatch selector and its E11 semantics are untouched.
+  }
+
   // r49 B2 R3: the legacy primary-plane READ dispatch instruction. Only
   // consumed off the replica plane (the replica's identity is the geo row —
   // the instruction is never consulted there); 'placements' = no instruction
@@ -1553,7 +1747,11 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     // template_missing class on unsampled calls (missing-in-manifest hashes
     // died at plan time). Every derived hash's manifest row must serve K —
     // with the pinned manifest (no overlapping merge_ops) at most one hash
-    // derives per plan, so this degenerates to the hashes[0] check.
+    // derives per plan, so this degenerates to the hashes[0] check. r129
+    // amendment: the invariant stays true under W6 because derivation is
+    // JOIN-AWARE (wh_handshake.ts) — non-join plans EXCLUDE join-class rows
+    // (manifest join key) and join plans derive ONLY them, so W6 (whose
+    // merge_ops ⊇ W1's) can never co-derive with W1 on any one plan.
     if (planRef.limitK !== null && planRef.templateHashes.length > 0) {
       const k = planRef.limitK;
       const refused = planRef.templateHashes.some((h) => {
@@ -1653,7 +1851,10 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     // hash — hashes[0]-only sourcing cannot under-serve a multi-template
     // requirement (D2 above already guaranteed derived.length > 0 here). If
     // a future manifest ever carries overlapping merge_ops, re-widen here
-    // AND in the manifest-side max_rows pre-refusal above.
+    // AND in the manifest-side max_rows pre-refusal above. r129 amendment:
+    // the no-overlap assumption remains true under W6 for the same
+    // join-aware-derivation reason pinned at the max_rows site above (join
+    // plans derive ONLY join-class rows; non-join plans never do).
     const matched = derived[0];
     for (const row of fanoutRows) {
       rpcSpecByShard.set(row.shard, {
@@ -1747,7 +1948,26 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
         perShard.push({ shard: o.shard, ok: false, latencyMs: o.latencyMs, error: gate.code });
         continue;
       }
-      perShard.push({ shard: o.shard, ok: true, latencyMs: o.latencyMs, error: null });
+      // r129 (design_r128_joinplans §2.6): the additive OK-ARM measurement
+      // keys. partial_rows = the partial envelope's rowCount (already
+      // cross-checked === rows.length by wh_merge validateEnvelope at
+      // wh_merge.ts:156-158). partial_bytes = the wire size of the partial
+      // body EXACTLY as it rides the envelope — the UTF-8 byte length of
+      // JSON.stringify(envelope.partial) via TextEncoder. THE SERIALIZATION
+      // CONVENTION OF RECORD IS THIS LINE + COMMENT: the measured object is
+      // the CONSUMED envelope's partial member (the post-adaptation engine
+      // shape on the rpc path, the engine shape verbatim on the select
+      // path) — never re-measured from the raw pre-adaptation wire. Error
+      // arms carry NEITHER key (ok-arm-only; the error-entry shapes are
+      // battery-pinned deep-equal and stay byte-identical).
+      perShard.push({
+        shard: o.shard,
+        ok: true,
+        latencyMs: o.latencyMs,
+        error: null,
+        partial_rows: envelope.partial.rowCount,
+        partial_bytes: new TextEncoder().encode(JSON.stringify(envelope.partial)).length,
+      });
       okEnvelopes.push(envelope);
     } else {
       const w = o.warning ?? { code: 'excluded' };

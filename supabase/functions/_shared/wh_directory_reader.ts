@@ -136,6 +136,21 @@ export function toWhDirectoryRow(raw: unknown): WhDirectoryRow {
   if (typeof raw.row_estimate === 'number' && Number.isInteger(raw.row_estimate) && raw.row_estimate >= 0) {
     row.row_estimate = raw.row_estimate;
   }
+  // r129 (design_r128_joinplans §2.2, audit A A3): the dim-relation
+  // reference flag (0013:110 warehouse_tables / :144 warehouse_placements —
+  // writer-stamped on the placement, never propagated from the table row)
+  // rides the passthrough — the join colocation gate consumes it. Mirrors
+  // the row_estimate arm's advisory style, mapped FAIL-CLOSED: boolean
+  // true (or the text 'true' — PostgREST can deliver booleans as text
+  // through view/jsonb paths) => true; boolean/'text' false => false;
+  // ANYTHING else (absent/mistyped) => the field is OMITTED — the gate
+  // reads is_reference !== true as NOT a reference placement (undefined
+  // ≠ true, never guessed into colocatability).
+  if (raw.is_reference === true || raw.is_reference === 'true') {
+    row.is_reference = true;
+  } else if (raw.is_reference === false || raw.is_reference === 'false') {
+    row.is_reference = false;
+  }
   return row;
 }
 

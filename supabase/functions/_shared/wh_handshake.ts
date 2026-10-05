@@ -267,6 +267,18 @@ export interface EngineTemplateRow {
   state: string;
   aggs: Record<string, { op: string; col?: string }>;
   encoding: Record<string, string>;
+  // r129 (design_r128_joinplans §2.3): the additive OPTIONAL join binding —
+  // present ONLY on the join-class row(s) (W6_colocated_join_agg): the dim
+  // relation + the hardcoded SQL join keys the template body executes.
+  // DERIVATION PARTITION KEY: deriveTemplateHashes derives a row for a plan
+  // iff (row carries join) === (plan is a join plan), so the join class
+  // never co-derives with the plain classes (the ≤1-template-per-opset
+  // law, wh_shard_channel_test.ts:1331-1375) and a join request can never
+  // fall back to W1. The KEY BINDING check (wh_engine_core plan time,
+  // audit-B AB-P2) compares the request's on.{left,right} against
+  // join.{left,right} here — fail-closed when the row carries no binding.
+  // Additive optional: every pre-r129 row literal stays unchanged.
+  join?: { dim: string; left: string; right: string };
 }
 
 /**
@@ -276,6 +288,14 @@ export interface EngineTemplateRow {
  * referencing a hash outside this manifest is a plan-time 4xx (plan
  * honesty, design §6.3); a partial claiming such a hash is rejected at the
  * consumption site (F14).
+ * r129 (design_r128_joinplans §2.3): W6_colocated_join_agg APPENDED at
+ * index 5 (append-only — the geo-plane cells address manifest rows BY
+ * INDEX 0-4, so any earlier insert would shift every one of them RED) with
+ * the additive `join` binding {dim:'wh_probe_dim', left:'region',
+ * right:'region'} (engine-side manifest only — the shard-side registry
+ * stores hash+kind+body and needs NO new column). The row deep-equals the
+ * statics leg's db/shard-templates/manifest.json entry (qc_class QC6
+ * rides the lint QC_CLASSES extension). timeout_ms <as W1> = 8000.
  */
 export const ENGINE_TEMPLATE_MANIFEST: readonly EngineTemplateRow[] = [
   {
@@ -363,6 +383,29 @@ export const ENGINE_TEMPLATE_MANIFEST: readonly EngineTemplateRow[] = [
     aggs: { s: { op: 'sum', col: 'value' }, c: { op: 'count_col', col: 'value' } },
     encoding: { s: 'text', c: 'number' },
   },
+  // r129 (design_r128_joinplans §2.3): the join class — APPENDED at index 5
+  // (append-only law; the index-addressed geo-plane pins address 0-4).
+  // template_hash = sha256 of db/shard-templates/W6_colocated_join_agg.sql
+  // (the body IS the contract); the `join` binding is the derivation
+  // partition key + the key-binding check's manifest side.
+  {
+    slug: 'W6_colocated_join_agg',
+    file: 'W6_colocated_join_agg.sql',
+    template_hash: '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576',
+    logical_table: 'wh_probe_agg',
+    qc_class: 'QC6',
+    kind: 'rows',
+    merge_ops: ['groupby', 'sum', 'count', 'count_col'],
+    group_keys: ['region'],
+    params_schema: {},
+    timeout_ms: 8000,
+    max_rows: 1000,
+    schema_version: 1,
+    state: 'active',
+    aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+    encoding: { x: 'text', c: 'number', n: 'number' },
+    join: { dim: 'wh_probe_dim', left: 'region', right: 'region' },
+  },
 ];
 
 /** Manifest resolution by template hash (first match; the registry PK is the
@@ -441,6 +484,16 @@ export interface DerivePlanView {
   table: string;
   groupKeys?: readonly unknown[];
   aggs: Record<string, { op: string; col?: string }>;
+  /** r129 (design_r128_joinplans §2.3): PRESENCE-ONLY join marker — the
+   *  request's query.join descriptor (parsed shape {table,type,on}) when
+   *  the plan is a join plan. Derivation consumes ONLY presence: a join
+   *  plan derives ONLY manifest rows carrying the additive join binding,
+   *  a non-join plan EXCLUDES them (the join-class partition — keeps the
+   *  ≤1-template-per-opset law true under W6, whose merge_ops ⊇ W1's).
+   *  Typed `unknown` deliberately: the descriptor's own shape is parse-
+   *  space; derivation never reads its fields (key binding is the plan
+   *  block's job in wh_engine_core, against the MANIFEST side). */
+  join?: unknown;
 }
 
 /**
@@ -451,7 +504,14 @@ export interface DerivePlanView {
  *     planOpsSubset),
  *   * row.schema_version === tableSchemaVersion (VACUOUS when the directory
  *     version is unknown — undefined disables the filter),
- *   * state = 'active'.
+ *   * state = 'active',
+ *   * r129 JOIN-CLASS PARTITION (design_r128_joinplans §2.3, audit A A2):
+ *     (row carries the manifest `join` binding) === (plan is a join plan,
+ *     DerivePlanView.join present). Non-join plans EXCLUDE join-class rows
+ *     and join plans derive ONLY them — otherwise W6 (merge_ops ⊇ W1's)
+ *     would co-derive on every plain W1 plan (REDing the pinned
+ *     ≤1-template census) and a join request lacking a count-col would
+ *     derive W1+W6 with derived[0]=W1, 400ing a LEGAL join request.
  * The set is manifest-bounded BY CONSTRUCTION (plan-honesty can never
  * self-reject); the SAME set feeds plan-honesty, the §5.2 handshake, F14,
  * and "non-empty ⟺ the query could ride the wh_query RPC branch".
@@ -475,11 +535,15 @@ export function deriveTemplateHashes(
   // [groupby,sum,count] and would route a select-path query to a GROUPED RPC
   // template. The plan's shape (groupKeys present?) must equal the row's kind.
   const planKind = Array.isArray(plan.groupKeys) && plan.groupKeys.length > 0 ? 'rows' : 'scalar';
+  // r129 JOIN-CLASS PARTITION (design_r128_joinplans §2.3): presence-only —
+  // see the DerivePlanView.join doc + the header bullet above.
+  const planIsJoin = plan.join !== undefined;
   const out: string[] = [];
   for (const row of ENGINE_TEMPLATE_MANIFEST) {
     if (row.state !== 'active') continue;
     if (row.logical_table !== plan.table) continue;
     if (row.kind !== planKind) continue;
+    if (planIsJoin !== (row.join !== undefined)) continue;
     if (!planOpsSubset(planOps, row.merge_ops)) continue;
     if (tableSchemaVersion !== undefined && row.schema_version !== tableSchemaVersion) continue;
     out.push(row.template_hash);

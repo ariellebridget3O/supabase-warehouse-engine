@@ -461,6 +461,21 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
     }
     const tableRows = directoryRows.filter((r) => r.logical_name === parsed.table);
     const head = tableRows[0];
+    // r129 (design_r128_joinplans §2.2, audit A A4 — the DISPATCH-POPULATION
+    // SPLIT, load-bearing): a join request ALSO needs the dim relation's
+    // placements from the SAME atomic embed, but they feed the colocation
+    // gate ONLY (ExecuteArgs.joinDimRows) — they must NEVER enter
+    // directoryRows. Dim rows carry unbounded NULL/NULL key bounds, so they
+    // SURVIVE E11 range pruning: folding them into the dispatch population
+    // would POST W6 twice per shard (partials merged twice — n/x doubled,
+    // phantom coverage 6/6), and head = tableRows[0] must stay a FACT row
+    // (the shard-key metadata + tableSchemaVersion binding). Non-join
+    // requests: the dim population is not even collected (undefined — the
+    // args shape stays byte-identical).
+    const joinDescriptor = parsed.query.join;
+    const joinDimRows = joinDescriptor !== undefined
+      ? directoryRows.filter((r) => r.logical_name === joinDescriptor.table)
+      : undefined;
 
     // r47: ENGINE-DERIVED plan template hashes (wh-contract r47 errata) —
     // never client-supplied (no request field exists; a client-declared set
@@ -472,6 +487,10 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
       {
         table: parsed.table,
         ...(parsed.query.groupBy !== undefined ? { groupKeys: parsed.query.groupBy } : {}),
+        // r129 (design_r128_joinplans §2.3): the join-class partition rides
+        // on PRESENCE — a join plan derives ONLY join-class manifest rows,
+        // a non-join plan excludes them (deriveTemplateHashes header).
+        ...(joinDescriptor !== undefined ? { join: joinDescriptor } : {}),
         aggs: Object.fromEntries(
           parsed.query.select.map((s, i) => [s.alias ?? `${s.op}_${i}`, { op: s.op, ...(s.col !== undefined ? { col: s.col } : {}) }]),
         ),
@@ -506,6 +525,12 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
       columnTypes,
       ...(Object.keys(columnScales).length > 0 ? { columnScales } : {}),
       directoryRows: tableRows,
+      // r129 (design_r128_joinplans §2.2 A4): the dim population rides
+      // SEPARATELY (colocation-gate input ONLY — never the dispatch
+      // population; the split is load-bearing, see the comment at the :462
+      // filter). Spread-conditional: absent on every non-join request (the
+      // pre-r129 args shape stays byte-identical).
+      ...(joinDimRows !== undefined ? { joinDimRows } : {}),
       // r40 P1-1: shard-key metadata from the directory when present;
       // client-declared values are ignored (erratum §4.3). '' = no shard key
       // (columnTypes[''] is undefined => no shardKeyPlan => no pruning, the
@@ -568,6 +593,12 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
         : e.code === 'page_unavailable' ? 409
         : e.code === 'quorum_unmet' ? 409
         : e.code === 'plan_untemplated' ? 400 // r69 AM-3: the D2 plan-honesty 4xx (rpcMode plane only)
+        // r129 (design_r128_joinplans §2.1/§2.2): the join-plan plan-time
+        // 4xx family — ALL THREE are plan/parse-class rejects (400); the
+        // wh_engine_core.ts:81-87 hazard comment forbids a 500-fallthrough.
+        : e.code === 'join_not_colocated' ? 400
+        : e.code === 'join_template_required' ? 400
+        : e.code === 'join_key_mismatch' ? 400
         : 500;
       const directoryVersion = e.directoryVersion ?? knownVersion;
       return json({

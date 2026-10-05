@@ -166,5 +166,50 @@
    "s": "text",
    "c": "number"
   }
+ },
+ {
+  "slug": "W6_colocated_join_agg",
+  "file": "W6_colocated_join_agg.sql",
+  "template_hash": "7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576",
+  "logical_table": "wh_probe_agg",
+  "qc_class": "QC6",
+  "kind": "rows",
+  "merge_ops": [
+   "groupby",
+   "sum",
+   "count",
+   "count_col"
+  ],
+  "group_keys": [
+   "region"
+  ],
+  "params_schema": {},
+  "timeout_ms": 8000,
+  "max_rows": 1000,
+  "schema_version": 1,
+  "state": "active",
+  "aggs": {
+   "x": {
+    "op": "sum",
+    "col": "amount"
+   },
+   "c": {
+    "op": "count",
+    "col": "amount"
+   },
+   "n": {
+    "op": "count"
+   }
+  },
+  "encoding": {
+   "x": "text",
+   "c": "number",
+   "n": "number"
+  },
+  "join": {
+   "dim": "wh_probe_dim",
+   "left": "region",
+   "right": "region"
+  }
  }
 ]
