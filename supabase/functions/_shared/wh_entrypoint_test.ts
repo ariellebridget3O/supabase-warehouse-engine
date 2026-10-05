@@ -1126,17 +1126,29 @@ async function rpcPlaneBatteryPins(): Promise<void> {
     // AM-8/OQ-7: the boot defect-class log fires ONCE per isolate boot — the
     // log lines live in the boot-time deps IIFE (before Deno.serve), fixed
     // strings only, both defect classes covered.
-    // r131 D2 AMENDMENT: the prose literals are gone — the boot-log REGION
-    // re-anchors on the collector declaration (index.ts uses the typed
-    // WhBootDefectCode[] collector) and now covers the collector pushes +
-    // the post-IIFE emit block (strictly stronger than the old prose
-    // anchor). Invariant unchanged: strictly BEFORE Deno.serve.
+    // r131 D2 AMENDMENT (review fixes F1+F2) — this arm enforces EXACTLY the
+    // following, conjunct by conjunct, no more: (1) the collector
+    // DECLARATION exists and sits before Deno.serve; (2) the SHELL EMIT
+    // BLOCK exists (anchored on the gate call-shape
+    // shouldEmitWhBootLog(bootLog)) and sits strictly AFTER the collector
+    // and strictly BEFORE Deno.serve — emit-deleted, emit-below-serve, and
+    // emit-into-handler escapes all RED here; (3) the severity split is
+    // pinned by exact call-shape — console.error for the defects arm,
+    // console.log for the armed else; (4) the gate call-shape is pinned at
+    // the SHELL (conjuncts 2+4 share the one anchor) — dropping the wrapper
+    // makes clean inert boots emit a defects:[] line every boot and REDs.
+    // The interpolation arm below keeps its own larger collector→serve
+    // slice (unchanged).
     const defectIdx = indexSrc.indexOf('const bootDefects: WhBootDefectCode[] = [];');
     const serveIdx = indexSrc.indexOf('Deno.serve('); // the CALL, not the header comment's "Deno.serve shell" mention
+    const emitIdx = indexSrc.indexOf('shouldEmitWhBootLog(bootLog)'); // the shell emit block's gate call (index.ts, post-IIFE)
     ok(
-      'index.ts AM-8: the boot defect collector exists and is BOOT-TIME (before Deno.serve — once per isolate, never per-request)',
-      defectIdx >= 0 && serveIdx > defectIdx,
-      'collector missing or re-placed into a per-request path',
+      'index.ts AM-8: the collector + the merged-line EMIT block exist and are BOOT-TIME (collector < emit < Deno.serve — once per isolate, never per-request), the gate wraps the shell emit, and the severity split is pinned (defects => console.error, defect-free armed => console.log)',
+      defectIdx >= 0 && serveIdx > defectIdx &&
+      emitIdx > defectIdx && emitIdx < serveIdx &&
+      indexSrc.includes('if (bootLog.defects.length > 0) console.error(line);') &&
+      indexSrc.includes('else console.log(line);'),
+      'collector/emit missing, emit re-placed below Deno.serve or into a per-request path, gate unwrapped, or severity split swapped',
     );
     ok(
       'index.ts AM-8: the boot-log region is interpolation-free (fixed strings — never value fragments)',
