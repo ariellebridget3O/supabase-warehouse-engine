@@ -633,8 +633,9 @@ Deno.test('geo exec P3-5b: geo fallback rides the fail-closed EMPTY path — war
   // warning (RESERVED 'geo_replica' shard token, G1's mode_colocated
   // detail, est_rows 0) rides the empty response, and NOTHING is
   // dispatched: no replica probe (G1 precedes any geo dispatch), no primary
-  // fanout (an empty population dispatches no shards). Expected:
-  // coverage '0/0', ratio 1, partial false, perShard [], calls 0.
+  // fanout (an empty population dispatches no shards). Expected (r138 F-1b
+  // re-adjudicated shape — FB-5 re-comment): coverage '0/0', ratio 1,
+  // partial TRUE + fleet_de_listed, perShard [], calls 0.
   const calls: { shard: string; url: string }[] = [];
   const res = await executeWhQuery({
     ...(BASE_ARGS as unknown as Record<string, unknown>),

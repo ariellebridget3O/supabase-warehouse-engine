@@ -624,7 +624,17 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
               .in('project_id', ids);
           })
           .then(
-            () => {},
+            (res) => {
+              // FE-A-1 (r138 fresh-eyes A): postgrest-js RESOLVES PostgREST
+              // failures as {error} (never rejects) — the fulfillment path
+              // must discriminate too, else a failed stamp is silent and the
+              // "failure is log-only" contract is unrealized. Fixed string,
+              // echo law intact; same message both paths.
+              const upd = res as { error?: unknown } | null | undefined;
+              if (upd !== null && upd !== undefined && upd.error !== null && upd.error !== undefined) {
+                console.error('warehouse-engine freshness keeper: last_health_at stamp failed (log-only; never fails the query)');
+              }
+            },
             () => {
               console.error('warehouse-engine freshness keeper: last_health_at stamp failed (log-only; never fails the query)');
             },

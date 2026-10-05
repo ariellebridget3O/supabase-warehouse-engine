@@ -426,18 +426,96 @@ function malformed(msg: string): never {
 }
 
 /** r138 C1: whether the row carries a USABLE row_estimate — the exact
- *  validity predicate directoryRowEstimate applies (a present non-negative
- *  integer). Absent/invalid means "no estimate known" (0013 default-0
- *  stats column semantics): the C1 advisory's reconciliation is vacuous for
- *  a fleet that does not report estimates and must NOT arm on one. */
+ *  validity predicate directoryRowEstimate applies (a present positive
+ *  integer). Absent/invalid/0 means "no estimate known" (0013 default-0
+ *  stats column semantics — a never-statted placement reads 0, FE-A-3): the
+ *  C1 advisory's reconciliation is vacuous for a fleet that does not report
+ *  estimates and must NOT arm on one (an est_rows:0 warning is noise). */
 function directoryEstimateUsable(row: WhDirectoryRow): boolean {
-  return typeof row.row_estimate === 'number' && Number.isInteger(row.row_estimate) && row.row_estimate >= 0;
+  return typeof row.row_estimate === 'number' && Number.isInteger(row.row_estimate) && row.row_estimate > 0;
 }
 
 /** r44 §4.4 est_rows lane: the directory's row_estimate when the row carries
  *  a valid non-negative integer, else 0 (no estimate available). */
 function directoryRowEstimate(row: WhDirectoryRow): number {
   return directoryEstimateUsable(row) ? (row.row_estimate as number) : 0;
+}
+
+/** r138 C1 (FB-1, fresh-eyes B): whether the request's window makes
+ *  Σ row_estimate vs merged count_star RECONCILABLE at all. Σ estimates is
+ *  the WHOLE-span estimate of every dispatched placement — any client filter
+ *  that lawfully reduces the merged count below Σ would false-positive the
+ *  advisory (a filtered wave is NOT drift). Reconcilable IFF:
+ *  (g1) EVERY where predicate is on the shard-key column (any non-key
+ *       predicate reduces lawfully — disarm);
+ *  (g2) point/inequality key predicates (eq/neq/is) disarm — a value sliced
+ *       out of a span is a lawful reduction; ONLY pure range windows
+ *       (gt/gte/lt/lte/between, all on the key) can be span-aligned;
+ *  (g3) every DISPATCHED span is FULLY inside the key window with op-aware
+ *       edges: lower edge non-strict for gte/between (key_min >= lo) and
+ *       STRICT for gt (key_min > lo — the boundary key would be filtered);
+ *       upper edge key_max <= hi for both lt and lte (key_max is EXCLUSIVE,
+ *       so the two collapse); unbounded side = auto-covered; hash/none key
+ *       types disarm with any key window (no span alignment exists);
+ *  ANY canonicalize/comparison surprise disarms (fail-closed conservative).
+ *  Arm 6b's boundary-aligned window (excludes whole spans, S3's key_max ==
+ *  hi) stays reconcilable by construction. */
+function advisoryWindowReconcilable(args: ExecuteArgs, dispatched: WhDirectoryRow[]): boolean {
+  const where = args.req.query.where ?? [];
+  const key = args.shardKeyColumn;
+  if (where.some((w) => w.col !== key)) return false; // (g1)
+  if (where.length === 0) return true; // unfiltered: the steady-state instrument path
+  if (where.some((w) => w.op === 'eq' || w.op === 'neq' || w.op === 'is')) return false; // (g2)
+  if (args.shardKeyType !== 'range' && args.shardKeyType !== 'time') return false; // (g3) hash/none
+  const type = args.columnTypes[key] as WhColumnPlan['type'];
+  const plan: WhColumnPlan = {
+    col: key,
+    type,
+    ...(type === 'numeric' ? { scale: args.columnScales?.[key] ?? 0 } : {}),
+  };
+  try {
+    let lo: WhCanonicalValue | null = null; // null = unbounded lower edge
+    let loStrict = false; // the tightest lower edge is a STRICT gt
+    let hi: WhCanonicalValue | null = null; // null = unbounded upper edge
+    for (const w of where) {
+      if (w.op === 'between') {
+        const [a, b] = w.value as [unknown, unknown];
+        const va = canonicalizeValue(a, plan);
+        const vb = canonicalizeValue(b, plan);
+        if (va === null || vb === null) return false;
+        if (lo === null || compareCanonical(va, lo, plan, false) < 0) { lo = va; loStrict = false; }
+        if (hi === null || compareCanonical(vb, hi, plan, false) > 0) { hi = vb; }
+      } else if (w.op === 'gte' || w.op === 'gt') {
+        const v = canonicalizeValue(w.value, plan);
+        if (v === null) return false;
+        const cmp = lo === null ? -1 : compareCanonical(v, lo, plan, false);
+        if (lo === null || cmp > 0) { lo = v; loStrict = w.op === 'gt'; }
+        else if (cmp === 0 && w.op === 'gt') { loStrict = true; }
+      } else { // lte | lt
+        const v = canonicalizeValue(w.value, plan);
+        if (v === null) return false;
+        if (hi === null || compareCanonical(v, hi, plan, false) > 0) { hi = v; }
+      }
+    }
+    for (const row of dispatched) {
+      // canonicalize the ROW bounds too (selectShards law — raw key_min/max
+      // strings are NOT wire-comparable against canonical window bounds)
+      const min = row.key_min === null ? null : canonicalizeValue(row.key_min, plan);
+      const max = row.key_max === null ? null : canonicalizeValue(row.key_max, plan);
+      if (lo !== null) {
+        if (min === null) return false; // unbounded span inside a windowed query: not provably covered
+        const cmp = compareCanonical(min, lo, plan, false);
+        if (cmp < 0 || (cmp === 0 && loStrict)) return false;
+      }
+      if (hi !== null) {
+        if (max === null) return false;
+        if (compareCanonical(max, hi, plan, false) > 0) return false; // key_max exclusive: <= hi covers lt AND lte
+      }
+    }
+    return true;
+  } catch {
+    return false; // fail-closed: a surprise canonicalization never arms the advisory
+  }
 }
 
 /** r44: partial-derived est_rows for the truncation gate — the partial's own
@@ -2318,7 +2396,8 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     mergedCountStar !== null &&
     fanoutRows.length > 0 &&
     responded === fanoutRows.length &&
-    fanoutRows.every(directoryEstimateUsable)
+    fanoutRows.every(directoryEstimateUsable) &&
+    advisoryWindowReconcilable(args, fanoutRows)
   ) {
     let estSum = 0;
     for (const row of fanoutRows) estSum += row.row_estimate as number;

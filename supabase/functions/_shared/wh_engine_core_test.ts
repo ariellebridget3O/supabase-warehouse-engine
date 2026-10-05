@@ -765,6 +765,39 @@ Deno.test('r138 C2: advisory armed-and-SILENT on match; FIRES EXACTLY ONE on mis
   eqTrue('F-2 floor: EXACTLY ONE coverage_floor_unmet warning rides the envelope', floored.warnings.filter((w) => w.code === 'coverage_floor_unmet').length === 1);
 });
 
+Deno.test('r138 FB-2: the SCALAR advisory branch arms and fires (scalar bare-count wave, hand-computed merged c 21 vs Σest 20)', async () => {
+  // Scalar plan (no groupBy): baseReq's select = sum s + BARE count c.
+  // Hand-computed: scalar c = 6 + 4 + 11 = 21; Σ estimates 7+8+5 = 20 ⇒
+  // EXACTLY ONE row_estimate_mismatch with est_rows 20. A mutant nulling the
+  // SCALAR mergedCountStar assignment keeps this RED (the scalar branch had
+  // zero lethal coverage before FB-2).
+  const silentTwin = await executeWhQuery({
+    ...E1_EXECUTE,
+    req: parseWhEngineRequest(baseReq()),
+    directoryRows: [7, 9, 5].map((est, i) => ({ ...dirRow(`S${i + 1}`, null, null), row_estimate: est })),
+    fetcher: (async (shard: string) => {
+      if (shard === 'S1') return { ok: true, envelope: scalarEnv('S1', 'orders', { s: '600', c: 6 }) };
+      if (shard === 'S2') return { ok: true, envelope: scalarEnv('S2', 'orders', { s: '400', c: 4 }) };
+      return { ok: true, envelope: scalarEnv('S3', 'orders', { s: '1100', c: 11 }) };
+    }) as WhShardFetcher,
+  });
+  eq('FB-2 silent twin: scalar advisory armed (Σ 21 == merged 21) yet warnings []', silentTwin.warnings, []);
+  eqTrue('FB-2 silent twin: scalar result intact (c 21 — count finalizes to a JS number)', silentTwin.result !== undefined && (silentTwin.result as Record<string, unknown>).c === 21);
+  const fired = await executeWhQuery({
+    ...E1_EXECUTE,
+    req: parseWhEngineRequest(baseReq()),
+    directoryRows: [7, 8, 5].map((est, i) => ({ ...dirRow(`S${i + 1}`, null, null), row_estimate: est })),
+    fetcher: (async (shard: string) => {
+      if (shard === 'S1') return { ok: true, envelope: scalarEnv('S1', 'orders', { s: '600', c: 6 }) };
+      if (shard === 'S2') return { ok: true, envelope: scalarEnv('S2', 'orders', { s: '400', c: 4 }) };
+      return { ok: true, envelope: scalarEnv('S3', 'orders', { s: '1100', c: 11 }) };
+    }) as WhShardFetcher,
+  });
+  eq('FB-2 fires: EXACTLY ONE row_estimate_mismatch, est_rows = Σ estimates (20), scalar plan', fired.warnings, [
+    { shard: '<merged>', code: 'row_estimate_mismatch', est_rows: 20, retried: false },
+  ]);
+});
+
 Deno.test('execute: coverage 2/3 + ratio + partial flag + warnings sorted by shard (pins)', async () => {
   const res = await executeWhQuery({
     ...E1_EXECUTE,
@@ -944,7 +977,7 @@ Deno.test('execute: limit truncates grouped rows post-finalize (deterministic ca
   eqTrue('coverage is NOT affected by limit', res.coverage === '3/3');
 });
 
-Deno.test('execute: empty directory => tier_warm; pruned-to-zero => empty result, coverage 0/0, not partial', async () => {
+Deno.test('execute: empty directory => tier_warm; pruned-to-zero => empty result, coverage 0/0, re-adjudicated partial', async () => {
   await rejectsEngine('no hot placements at all => 404-class tier_warm', () => executeWhQuery({ ...E1_EXECUTE, directoryRows: [] }), 'tier_warm');
 
   const pruned = await executeWhQuery({
@@ -1078,13 +1111,18 @@ Deno.test('r138 B1: the advisory lethal block — armed-and-SILENT on match; FIR
     req: w2req,
     directoryRows: [6000, 3999, 4000].map((est, i) => ({ ...dirRow(`S${i + 1}`, null, null), row_estimate: est })),
     fetcher: (async (shard: string) => {
-      const c = shard === 'S1' ? 6000 : shard === 'S2' ? 3999 : 4000;
+      // FE-A-2 (fresh-eyes A): S2's partial c (4000) DIVERGES from its
+      // estimate (3999) — Σ count_col 14,000 ≠ Σest 13,999 — so the
+      // drop-bare-count-guard mutant (compare count_col) ARMS and FIRES and
+      // this pin REDs; the correct implementation stays silent via guard (d).
+      // (The old coinciding 3999 made the wall non-lethal.)
+      const c = shard === 'S1' ? 6000 : shard === 'S2' ? 4000 : 4000;
       return { ok: true, envelope: env(shard, 'orders', 'grouped', ['region'], { mn: { op: 'min', col: 'amount' }, mx: { op: 'max', col: 'amount' }, c: { op: 'count', col: 'amount' } }, [{ k: [shard === 'S3' ? 'us' : 'eu'], a: { mn: '10', mx: '500', c } }]) };
     }) as WhShardFetcher,
   });
   eq('B1 arm 5: count_col-only plan ⇒ NOT armed (no bare count(*) to reconcile), warnings []', w2Res.warnings, []);
 
-  // ---- Arm 6a (d3 §3 row 6): est_rows echoes Σ estimates in the OTHER
+  // ---- Arm 6a (d3 §2 B1 — FB-3 cite fix): est_rows echoes Σ estimates in the OTHER
   // direction too: estimates Σ 14,000 vs merged count 13,999 (S3's PARTIAL c
   // mutated, estimates intact) ⇒ fires with est_rows EXACTLY 14,000 — a
   // mutant echoing the merged count_star instead of Σ estimates REDs here.
@@ -1093,7 +1131,7 @@ Deno.test('r138 B1: the advisory lethal block — armed-and-SILENT on match; FIR
     { shard: '<merged>', code: 'row_estimate_mismatch', est_rows: 14000, retried: false },
   ]);
 
-  // ---- Arm 6b (d3 §3 row 6): Σ over the DISPATCHED placements ONLY. A
+  // ---- Arm 6b (d3 §2 B1 — FB-3 cite fix): Σ over the DISPATCHED placements ONLY. A
   // range query whose where-window excludes S2's span entirely: E11 prunes
   // S2 pre-fanout (never dispatched, never POSTed), so Σ estimates runs over
   // {S1: 6001, S3: 4000} = 10,001 ≠ merged 10,000 ⇒ fires with est_rows
@@ -1126,7 +1164,7 @@ Deno.test('r138 B1: the advisory lethal block — armed-and-SILENT on match; FIR
   eq('B1 arm 6b: the out-of-span placement was NEVER dispatched (E11 pruning, zero POSTs to S2)', seen, ['S1', 'S3']);
   eq('B1 arm 6b: coverage over the selected (pruned) population', [dispatched.coverage, dispatched.partial], ['2/2', false]);
 
-  // ---- Arm 7 (d3 §3 row 7 + core-receipt lane decision 1): the PARTIAL wave
+  // ---- Arm 7 (core-receipt lane decision 1 + d3 §2 B1 — FB-3 cite fix): the PARTIAL wave
   // does NOT arm — guard (e) FULL-coverage arming. S2 is socket-killed
   // mid-fanout: responded 2 ≠ dispatched 3 ⇒ the advisory is ABSENT EVEN THOUGH
   // Σ visible estimates 14,000 ≠ merged count 10,000 — the outage echo is
@@ -1144,10 +1182,52 @@ Deno.test('r138 B1: the advisory lethal block — armed-and-SILENT on match; FIR
     { shard: 'S2', code: 'network', est_rows: 0, retried: false },
   ]);
   eq('B1 arm 7: the partial wave stays 200-shaped degraded', [resPartial.coverage, resPartial.partial], ['2/3', true]);
+
+  // ---- Arm 8 (FB-1, fresh-eyes B): the WHERE-RECONCILABILITY walls. Σ
+  // estimates is the WHOLE-span estimate — a filter that lawfully reduces
+  // the merged count must NOT read as drift. Three walls pinned:
+  // (i) non-key where (g1), (ii) key eq (g2), (iii) a key window that SLICES
+  // a dispatched span (g3, gt-strict lower edge via between's non-strict
+  // lo < span start). All three: mismatch present (Σest 10,001 ≠ merged
+  // 10,000) yet advisory ABSENT. The boundary-ALIGNED window that fires is
+  // arm 6b (full-cover law, S3's key_max == hi stays reconcilable).
+  const wallRows = [
+    { ...dirRow('S1', '2026-01-01', '2026-02-01'), row_estimate: 6001 },
+    { ...dirRow('S2', '2026-07-01', '2026-08-01'), row_estimate: 4000 }, // outside every window — pruned
+    { ...dirRow('S3', '2026-04-01', '2026-06-01'), row_estimate: 4000 },
+  ];
+  const wallFetcher: WhShardFetcher = (async (shard: string) => {
+    // Proper per-shard envelopes for ALL THREE shards: arm 8a's non-key where
+    // prunes NOTHING (no key preds ⇒ E11 dispatches all 3) — a wrong-label S2
+    // envelope would envelope_invalid-exclude S2 and disarm via guard (e),
+    // masking the g1 wall (the vacuous-verdict class).
+    if (shard === 'S1') return { ok: true, envelope: e1('S1', [{ k: ['eu'], s: '120000', c: 6000 }]) };
+    if (shard === 'S2') return { ok: true, envelope: e1('S2', [{ k: ['ap'], s: '70000', c: 4000 }]) };
+    return { ok: true, envelope: e1('S3', [{ k: ['us'], s: '80000', c: 4000 }]) };
+  }) as WhShardFetcher;
+  const wallBase = (where: unknown[]) => executeWhQuery({
+    ...E1_EXECUTE,
+    req: parseWhEngineRequest(baseReq({
+      query: {
+        select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }],
+        groupBy: ['region'],
+        where,
+      },
+    })),
+    directoryRows: wallRows,
+    fetcher: wallFetcher,
+  });
+  const wallNonKey = await wallBase([{ col: 'region', op: 'eq', value: 'eu' }]);
+  eq('B1 arm 8a (FB-1 g1): non-key where ⇒ advisory ABSENT despite Σest 10001 ≠ merged 10000', wallNonKey.warnings, []);
+  const wallKeyEq = await wallBase([{ col: 'created_at', op: 'eq', value: '2026-01-15' }]);
+  eq('B1 arm 8b (FB-1 g2): key eq slices a point out of every span ⇒ advisory ABSENT', wallKeyEq.warnings, []);
+  const wallSlice = await wallBase([{ col: 'created_at', op: 'between', value: ['2026-01-15', '2026-06-01'] }]);
+  eq('B1 arm 8c (FB-1 g3): the window SLICES S1 (key_min 01-01 < lo 01-15) ⇒ advisory ABSENT', wallSlice.warnings, []);
+  eqTrue('B1 arm 8: sliced waves still dispatch their intersecting shards (S2 never POSTed)', !JSON.stringify(wallSlice.perShard).includes('S2'));
 });
 
 // -----------------------------------------------------------------------------
-// r138 B2 (d3 §3 row 6 sibling): the fetch_rows 10-of-50 EXACT offline
+// r138 B2 (d3 §2 B2 — FB-3 cite fix): the fetch_rows 10-of-50 EXACT offline
 // live-mirror. 3 shards × hand-built 50-region W1 grouped partials
 // (regions r00..r49, zero-padded so region-asc == index-asc). Shard j's
 // per-region values are pure index arithmetic: x_j(r) = (r+1)(j+1) [sum,
