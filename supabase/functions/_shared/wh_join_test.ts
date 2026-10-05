@@ -345,6 +345,13 @@ Deno.test('r129 join parse: every malformed variant is a fixed-string malformed 
   throwsEngine('unknown type (left) => malformed — inner is the ONLY v1 type', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'left', on: { left: 'region', right: 'region' } })), 'malformed', 'query.join.type must be the literal "inner"');
   throwsEngine('unknown key INSIDE join (using) => malformed (strict from day one)', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, using: 'region' })), 'malformed', 'query.join carries unknown keys');
   throwsEngine('missing on.* (left absent) => malformed', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { right: 'region' } })), 'malformed', 'query.join.on.left must be a plain identifier');
+  // r132 rider (F-A4, r129 P3 ledger): the 4 malformed variants the battery
+  // never pinned — the engine already rejects each (wh_engine_core.ts:547-583,
+  // design_r128_joinplans §2.1); these arms pin those rejects fail-loud.
+  throwsEngine('non-object join (a string) => malformed — typeof guard fires before any key lookups', () => parseWhEngineRequest(j('wh_probe_dim')), 'malformed', 'query.join must be an object');
+  throwsEngine('non-object join.on (a string) => malformed — the on object guard fires before on.* lookups', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: 'region=region' })), 'malformed', 'query.join.on must be an object');
+  throwsEngine('unknown key INSIDE join.on (bogus) => malformed — on is strictly validated like join itself', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region', bogus: 1 } })), 'malformed', 'query.join.on carries unknown keys');
+  throwsEngine('bad IDENT on.right ("region; DROP") => malformed — on.right is IDENT_RE, no expression surface', () => parseWhEngineRequest(j({ table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region; DROP' } })), 'malformed', 'query.join.on.right must be a plain identifier');
   // r57 no-echo law: the reject names the var/position only — never the value.
   let msg = '';
   try {
