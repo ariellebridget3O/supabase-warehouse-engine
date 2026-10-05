@@ -2,6 +2,14 @@
 
 Every JSON envelope carries `v: 1`. Grounded in `supabase/functions/_shared/wh_entrypoint.ts` (routes/auth/envelopes) + `wh_engine_core.ts` (request parse, success envelope, error map). `qid` echoes the request's `qid` when it is a string, else `null`.
 
+## Consumer contract dependency — agent-fetch-kit
+
+The engine's relayed fetches consume agent-fetch-kit's fleet backend. Consumer
+contract surface, pinned as of afk `601f0da` (2026-10-05): `_parse_env_file`
+semantics (`lib/fetchkit/config.py`), the `RelayResponse.text()` envelope
+(`lib/fetchkit/keypool.py`), and the afk CHANGELOG breaking-change law — consult
+the afk CHANGELOG before bumping this pin.
+
 ## Deployment URL shape
 
 ```
