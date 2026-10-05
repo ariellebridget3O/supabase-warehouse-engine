@@ -1968,6 +1968,103 @@ Deno.test('r123 P3: WH_PROXY_KV_BOOT_TIMEOUT_MS is the shipped 10s policy (a han
 });
 
 // -----------------------------------------------------------------------------
+// r138 B3 + V composite (channel plane) — additive re-pins, each arm citing
+// its existing killer:
+//   (1) >64KB synthetic grouped partial at the DEFAULT cap ⇒ abort_on_oversize
+//       (V-5; killer = the r133 M4a/M4b boundary-mutant class — the existing
+//       :65536-exact arms pin the boundary, this arm pins the DEFAULT cap on a
+//       realistic 50-region-class grouped body);
+//   (2) 413 is the per-shard EXCLUDED class (V-6; killer = the r130 classify
+//       mutant class — a mutant failing the whole query on 413 REDs the
+//       engine-plane consumption arm in wh_engine_core_test.ts);
+//   (3) count≡count_col is the SOLE op equivalence + count(id) FORBIDDEN on
+//       the bare-count W1 encoding (ERRATA-9 re-pin; killer = the r130
+//       adapter-arm removal class);
+//   (4) avg fuses ONLY from the same-col declared pair (W3 law re-pin);
+//   (5) V-12: the channel makes EXACTLY ONE attempt — behavioral 1:1 law +
+//       the static no-retry-vocabulary pin (F-7 decide-once, no-retry branch).
+// -----------------------------------------------------------------------------
+Deno.test('r138 B3/V (channel plane): oversize default cap + 413 excluded class + sole op-equivalence + count(id) forbidden + avg same-col-only + the ONE-attempt law', async () => {
+  // ---- (1) V-5: a realistic synthetic GROUPED wire pushed past the DEFAULT
+  // cap (no maxPartialBytes override — the shipped 65536 policy).
+  const bigWire = w1Wire({
+    rows: Array.from({ length: 1600 }, (_, i) => ({ k: [`region-${String(i).padStart(5, '0')}`], a: { x: '1200.50', c: 14 } })),
+    rowCount: 1600,
+  });
+  const bigBody = JSON.stringify(bigWire);
+  eqTrue('V-5 fixture self-check: the synthetic grouped body exceeds the 65536 default cap', new TextEncoder().encode(bigBody).length > 65536);
+  const over = makeRpcShardFetcher({ resolveKey: () => 'sk', rawFetch: fakeRaw({ body: bigBody }) });
+  const overRes = await over('s', 'u', { p_template_hash: W1H, p_params: {} });
+  eq('V-5: >64KB synthetic grouped partial at the DEFAULT cap => abort_on_oversize (the partial is aborted, never silently trimmed)', (overRes as { warning?: { code?: string } }).warning?.code, 'abort_on_oversize');
+
+  // ---- (2) V-6 unit: 413 classifies to the per-shard excluded class with
+  // the http 413 detail — a per-shard degrade, never a whole-query failure.
+  eq('V-6: classify 413 => {code:excluded, detail:http 413}', classifyFetchFailure({ httpStatus: 413 }), { code: 'excluded', detail: 'http 413' });
+
+  // ---- (3) the sole-equivalence law: count ⇔ count_col is the ONLY op
+  // equivalence, and col must be identical.
+  eqTrue(
+    'B3: count(id)-forbidden — the plan count(amount) CANNOT be served by W1\'s col-less count(*) encoding (adapter null, never a bare-count launder)',
+    adaptWireEnvelope(w1Wire(), W1_TEMPLATE, { aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'id' } } }) === null,
+  );
+  const w2WireFixture = {
+    v: 1, table: 'wh_probe_agg', schema_version: 1, qc_class: 'QC2', kind: 'scalar',
+    aggs: { min: { op: 'min', col: 'amount' }, max: { op: 'max', col: 'amount' }, c: { op: 'count_col', col: 'amount' } },
+    partial: { min: '12.50', max: '99.00', c: 14 }, rowCount: 1, truncated: false,
+    encoding: {}, template_hash: W2H, template_timeout_ms: 8000, latencyMs: 3,
+  };
+  eqTrue(
+    'B3: sole equivalence — plan sum(amount) NEVER cross-matches the count_col encoding (adapter null)',
+    adaptWireEnvelope(w2WireFixture, W2_TEMPLATE, { aggs: { s: { op: 'sum', col: 'amount' } } }) === null,
+  );
+  eqTrue(
+    'B3: col-scoped strictness — plan count(qty) vs the count_col(amount) encoding => null (col must be identical)',
+    adaptWireEnvelope(w2WireFixture, W2_TEMPLATE, { aggs: { c: { op: 'count', col: 'qty' } } }) === null,
+  );
+  eqTrue(
+    'B3: positive twin — plan count(amount) ⇔ count_col(amount) adapts (the W2 mapping law, unchanged re-pin)',
+    adaptWireEnvelope(w2WireFixture, W2_TEMPLATE, { aggs: { mn: { op: 'min', col: 'amount' }, mx: { op: 'max', col: 'amount' }, c: { op: 'count', col: 'amount' } } }) !== null,
+  );
+
+  // ---- (4) avg fuses ONLY from the same-col DECLARED pair.
+  eqTrue(
+    'B3: avg + the W3 avg_pair declared same-col pair => fused (positive re-pin)',
+    adaptWireEnvelope(w3Wire(), W3_TEMPLATE, { aggs: { 'avg(amount)': { op: 'avg', col: 'amount' } } }) !== null,
+  );
+  const noAvgDecl: WireTemplateView = {
+    kind: 'scalar',
+    aggs: { s: { op: 'sum', col: 'amount' }, c: { op: 'count_col', col: 'amount' } },
+    merge_ops: ['sum', 'count_col'], // the W5-class shape: a genuine sum+count_col pair, NO avg_pair declaration
+  };
+  eqTrue(
+    'B3: same-col sum+count_col WITHOUT the avg_pair declaration => never fused (adapter null)',
+    adaptWireEnvelope(w3Wire(), noAvgDecl, { aggs: { 'avg(amount)': { op: 'avg', col: 'amount' } } }) === null,
+  );
+  const crossColPair: WireTemplateView = {
+    kind: 'scalar',
+    aggs: { s: { op: 'sum', col: 'amount' }, c: { op: 'count_col', col: 'qty' } }, // the pair is NOT same-col
+    merge_ops: ['avg_pair'],
+  };
+  eqTrue(
+    'B3: avg_pair declared but the count rides a DIFFERENT col => never fused (adapter null — a mutant matching any-col REDs)',
+    adaptWireEnvelope(w3Wire(), crossColPair, { aggs: { 'avg(amount)': { op: 'avg', col: 'amount' } } }) === null,
+  );
+
+  // ---- (5) V-12 behavioral: EXACTLY ONE attempt per fetcher invocation —
+  // a 429-failing transport is called once per call, never retried.
+  const calls: RawCall[] = [];
+  const noRetry = makeRpcShardFetcher({ resolveKey: () => 'sk', rawFetch: fakeRaw({ status: 429, calls }) });
+  await noRetry('s', 'u', { p_template_hash: W1H, p_params: {} });
+  await noRetry('s', 'u', { p_template_hash: W1H, p_params: {} });
+  eq('V-12: two fetcher invocations over a failing transport => EXACTLY two raw attempts (the 1:1 no-retry law)', calls.length, 2);
+
+  // ---- (5b) V-12 static: the channel source carries ZERO retry vocabulary —
+  // the no-retry law is structural (no loop to widen), not a config accident.
+  const channelSrc = Deno.readTextFileSync(new URL('./wh_shard_channel.ts', import.meta.url));
+  eqTrue('V-12 static: wh_shard_channel.ts contains ZERO retry/attempt vocabulary (the ONE-attempt law is structural)', !/retr(y|ies)|attempt/i.test(channelSrc));
+});
+
+// -----------------------------------------------------------------------------
 // Harness report (hand-rolled runner, no external deps) — the house gate the
 // core batch OMITTED from this file (every sibling wh_* test file carries it:
 // wh_engine_core_test.ts:931 / wh_handshake_test.ts:900 / wh_merge_test.ts:680

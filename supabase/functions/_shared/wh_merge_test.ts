@@ -673,6 +673,69 @@ for (const op of ['sum', 'count', 'min', 'max', 'avg'] as const) {
 }
 
 // -----------------------------------------------------------------------------
+// r138 B3 (d3 §2 B3 / d1 disposition #2): the invariant-5/6 COMPOSITE —
+// additive re-pins on the merge plane. Each arm cites its existing killer:
+//   (1) more:true never merges — the r130 P2-1 killer class (a mutant that
+//       merges a truncated partial silently inflates every group total);
+//   (2) rowCount ≡ rows.length — the r130 §2.0 rowCount-consistency killer
+//       class (a lying rowCount launders a trimmed partial as complete);
+//   (3) avg fuses ONLY the same-col {s,c} pair — the r129/r133 E2-algebra
+//       killer class (mean-of-means / bare-number mutants).
+// No new mutant required — the composite is a re-pin (r138 battery law).
+// -----------------------------------------------------------------------------
+Deno.test('r138 B3 (merge plane): more:true never merges; rowCount ≡ rows.length; avg pair fusion is additive with the null identity', () => {
+  // (1) the P2-1 wall: a truncated grouped partial is envelope_invalid —
+  // wh_merge is the SECOND wall behind the engine F2 gate (which codes it
+  // truncated_groupby pre-merge, wh_handshake_test LETHAL 6b).
+  throwsCode('B3 (1): more:true grouped partial rejected envelope_invalid (P2-1 re-pin)', () => {
+    const env = JSON.parse(JSON.stringify(E1_ENVELOPES[0]));
+    (env.partial as Record<string, unknown>).more = true;
+    mergeGroupedPartials(E1_PLAN, [env]);
+  }, 'envelope_invalid');
+  let moreMsg = '';
+  try {
+    const env = JSON.parse(JSON.stringify(E1_ENVELOPES[0]));
+    (env.partial as Record<string, unknown>).more = true;
+    mergeGroupedPartials(E1_PLAN, [env]);
+  } catch (err) {
+    moreMsg = (err as Error).message;
+  }
+  eqTrue('B3 (1): the P2-1 reject NAMES the sentinel (more=true) and the remedy', moreMsg.includes('more=true') && moreMsg.includes('not mergeable'));
+
+  // (2) the §2.0 rowCount-consistency wall: rowCount must equal rows.length.
+  throwsCode('B3 (2): rowCount 3 ≠ rows.length 2 rejected envelope_invalid', () => {
+    const env = JSON.parse(JSON.stringify(E1_ENVELOPES[0]));
+    (env.partial as Record<string, unknown>).rowCount = 3;
+    mergeGroupedPartials(E1_PLAN, [env]);
+  }, 'envelope_invalid');
+  // the honest twin still merges — the walls are per-partial, never sticky
+  eq('B3 (1)/(2): the honest twin (more:false, rowCount 2) still merges to the exact eu total', (() => {
+    const fin = finalizeGroups(mergeGroupedPartials(E1_PLAN, [E1_ENVELOPES[0]]), E1_PLAN);
+    return fin.map((g) => ({ k: g.k, aggs: g.aggs }));
+  })(), [{ k: ['eu'], aggs: { s: 600n, c: 6 } }, { k: ['us'], aggs: { s: 300n, c: 3 } }]);
+
+  // (3) avg pair fusion (E2 algebra re-pin): {s:600,c:6} + {s:400,c:4} fuse
+  // ADDITIVELY to the exact rational 1000/10 — never the mean-of-means 55,
+  // never a bare number; and the {s:null,c:0} identity contributes nothing.
+  const avgPlan: WhMergePlan = { table: 't', aggs: { a: { op: 'avg', col: 'x', colPlan: { col: 'x', type: 'int8' } } } };
+  const fused = finalizeScalarAggs(mergeScalarAggs(avgPlan, [
+    scalarEnvelope('S1', 't', { a: { s: '600', c: 6 } }, avgPlan),
+    scalarEnvelope('S2', 't', { a: { s: '400', c: 4 } }, avgPlan),
+  ]), avgPlan);
+  eq('B3 (3): avg fuses the same-col pair additively — 600/6 + 400/4 ⇒ the exact rational 1000/10', fused.a, { num: 1000n, den: 10n });
+  const withIdentity = finalizeScalarAggs(mergeScalarAggs(avgPlan, [
+    scalarEnvelope('S1', 't', { a: { s: null, c: 0 } }, avgPlan),
+    scalarEnvelope('S2', 't', { a: { s: '400', c: 4 } }, avgPlan),
+  ]), avgPlan);
+  eq('B3 (3): the {s:null, c:0} identity is the avg zero — 400/4 unchanged', withIdentity.a, { num: 400n, den: 4n });
+  const allEmpty = finalizeScalarAggs(mergeScalarAggs(avgPlan, [
+    scalarEnvelope('S1', 't', { a: { s: null, c: 0 } }, avgPlan),
+    scalarEnvelope('S2', 't', { a: { s: null, c: 0 } }, avgPlan),
+  ]), avgPlan);
+  eq('B3 (3): zero non-NULL inputs ⇒ NULL (the empty-input rule — never 0, never NaN)', allEmpty.a, null);
+});
+
+// -----------------------------------------------------------------------------
 // Harness report (hand-rolled runner, no external deps).
 // -----------------------------------------------------------------------------
 Deno.test('__report__', () => {

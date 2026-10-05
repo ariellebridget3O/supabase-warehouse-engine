@@ -1075,6 +1075,34 @@ Deno.test('r129 R-B3 DECISION PIN: the join gate + binding fire identically on B
 });
 
 // -----------------------------------------------------------------------------
+// r138 B1 arm 4 (d3 §3 row 4 + §8 P3-e wall b): the planIsJoin guard. A W6-
+// shaped JOIN wave with limitK null and USABLE fact-placement estimates that
+// MISMATCH the merged Σn: the inner-join reduction is lawful, so the advisory
+// MUST be ABSENT — the join plane's completeness law is EXACT-oracle + the
+// per-band pins, never row reconciliation. Hand-computed: merged Σn = 10
+// (g00 4+1 + g01 2+3), fact estimates 7+7 = 14 ≠ 10 — the ONLY wall between
+// this wave and a false-positive advisory is the join guard
+// (wh_engine_core.ts:2315 `args.req.query.join === undefined`).
+// KILLER K-ADV-c: removing that guard fires EXACTLY ONE
+// {shard:'<merged>', code:'row_estimate_mismatch', est_rows:14, retried:false}
+// here ⇒ RED.
+// -----------------------------------------------------------------------------
+Deno.test('r138 B1 arm 4 (join guard): the W6 join wave NEVER arms the row-estimate advisory — even with usable mismatched estimates and limitK null (K-ADV-c lethal)', async () => {
+  const facts = [{ ...factRow('shard-a'), row_estimate: 7 }, { ...factRow('shard-b'), row_estimate: 7 }];
+  const seen: SeenCall[] = [];
+  const res = await executeWhQuery(joinExecArgs({
+    facts,
+    fetcher: recordingFetch({ 'shard-a': smallEnvA, 'shard-b': smallEnvB }, seen),
+  }));
+  eq('B1 arm 4: join guard — advisory ABSENT on the mismatched join wave (Σest 14 ≠ merged Σn 10), warnings EXACTLY []', res.warnings, []);
+  eq('B1 arm 4: the join wave still merges honestly (the guard suppresses NOTHING else)', res.rows, [
+    { k: ['g00'], aggs: { x: 140n, c: 4, n: 5 } },
+    { k: ['g01'], aggs: { x: 110n, c: 5, n: 5 } },
+  ]);
+  eq('B1 arm 4: the wave is a complete 2/2 (preconditions: placements plane, bare count n present, limitK null, full coverage — only the join wall remains)', [res.coverage, res.partial], ['2/2', false]);
+});
+
+// -----------------------------------------------------------------------------
 // Harness report (hand-rolled runner, no external deps).
 // -----------------------------------------------------------------------------
 Deno.test('__report__', () => {

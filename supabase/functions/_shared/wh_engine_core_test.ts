@@ -993,6 +993,370 @@ Deno.test('execute: window/timeout params plumb through (window:2, n=4 => max 2)
   eq('coverage 4/4', res.coverage, '4/4');
 });
 
+// =============================================================================
+// r138 BATTERY (maxxing-r138-battery) — B1 advisory lethal block + B2
+// fetch_rows 10-of-50 EXACT live-mirror + B3/V engine-plane composites.
+// Against the FROZEN core commit 143dc23 (C1 advisory ≈ wh_engine_core.ts:
+// 2288-2328; guard (e) FULL-coverage arming per the core receipt's lane-owned
+// decision 1). Every expectation is HAND-COMPUTED, independent of the impl:
+// the wave merges c = 6000 + 4000 + 4000 => count_star 14,000 exactly.
+// Killers (run AFTER the battery commit, one mutant at a time, restore-
+// verified): K-ADV-a kills arm 1 · K-ADV-b kills arm 2 · K-ADV-c (join guard,
+// wh_join_test.ts) kills the join arm.
+// =============================================================================
+
+/** The B1 3-shard wave: W1-shaped grouped partials {s: sum amount, c: count(*)}
+ *  whose merged count_star is EXACTLY 14,000 (6000 + 4000 + 4000), with
+ *  per-placement directory row_estimates handed in per arm. */
+function b1Fetcher(s3Count = 4000): WhShardFetcher {
+  return (async (shard: string) => {
+    if (shard === 'S1') return { ok: true, envelope: e1('S1', [{ k: ['eu'], s: '120000', c: 6000 }]) };
+    if (shard === 'S2') return { ok: true, envelope: e1('S2', [{ k: ['eu'], s: '80000', c: 4000 }]) };
+    return { ok: true, envelope: e1('S3', [{ k: ['us'], s: '80000', c: s3Count }]) };
+  }) as WhShardFetcher;
+}
+
+/** Hand-computed merged rows for the b1Fetcher wave (region-asc): eu
+ *  s=120000+80000=200000, c=10000; us s=80000, c=4000 (or 3999 when
+ *  s3Count=3999). */
+const B1_ROWS = (s3Count = 4000) => [
+  { k: ['eu'], aggs: { s: 200000n, c: 10000 } },
+  { k: ['us'], aggs: { s: 80000n, c: s3Count } },
+];
+
+Deno.test('r138 B1: the advisory lethal block — armed-and-SILENT on match; FIRES EXACTLY ONE on mismatch; the three disarm walls; est_rows pins (d3 §3 rows 1-3,5-7 + P3-e)', async () => {
+  const wave = (estimates: number[], fetcher: WhShardFetcher, queryOverride: Record<string, unknown> = {}) => ({
+    ...E1_EXECUTE,
+    directoryRows: estimates.map((est, i) => ({ ...dirRow(`S${i + 1}`, null, null), row_estimate: est })),
+    fetcher,
+    ...(Object.keys(queryOverride).length > 0
+      ? { req: parseWhEngineRequest(baseReq({ query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], ...queryOverride } })) }
+      : {}),
+  });
+
+  // ---- Arm 1 (d3 §3 row 1): armed-and-SILENT on match. Σ estimates
+  // 6000+4000+4000 = 14,000 == merged count_star 14,000 (hand-computed) ⇒
+  // warnings EXACTLY []. K-ADV-a (invert !== to ==) fires the advisory here ⇒ RED.
+  const silent = await executeWhQuery(wave([6000, 4000, 4000], b1Fetcher()));
+  eq('B1 arm 1: armed preconditions ALL met (placements plane, non-join, no limitK, bare count, full coverage, usable estimates) yet warnings EXACTLY [] on the 14000==14000 match', silent.warnings, []);
+  eq('B1 arm 1: the merged 14000-count wave rows (hand-computed, region-asc)', silent.rows, B1_ROWS());
+  eq('B1 arm 1: response stays 200-shaped complete', [silent.coverage, silent.partial, silent.coverage_ratio], ['3/3', false, 1]);
+
+  // ---- Arm 2 (d3 §3 row 2): FIRES on mismatch. One estimate mutated
+  // 4000 -> 3999 ⇒ Σ 13,999 ≠ 14,000 ⇒ EXACTLY ONE advisory warning, exact
+  // shape, est_rows = Σ DISPATCHED estimates (13,999 — NOT the merged count).
+  // The advisory NEVER fails: rows byte-identical, coverage/partial untouched.
+  // K-ADV-b (delete the advisory block) leaves warnings [] here ⇒ RED.
+  const fired = await executeWhQuery(wave([6000, 3999, 4000], b1Fetcher()));
+  eq('B1 arm 2: EXACTLY ONE row_estimate_mismatch, est_rows 13999 (the Σ-estimates echo), retried:false', fired.warnings, [
+    { shard: '<merged>', code: 'row_estimate_mismatch', est_rows: 13999, retried: false },
+  ]);
+  eq('B1 arm 2: advisory never fails — rows byte-identical to the silent wave', fired.rows, silent.rows);
+  eq('B1 arm 2: advisory never fails — coverage/partial/ratio unchanged', [fired.coverage, fired.partial, fired.coverage_ratio], ['3/3', false, 1]);
+
+  // ---- Arm 3 (d3 §3 row 3 / P3-e wall c): the limitK guard. The SAME
+  // mismatched wave (Σ 13,999 ≠ 14,000) + fetch_rows:10 ⇒ advisory ABSENT:
+  // a client clamp lawfully truncates output (Σn vs Σestimates is NOT drift).
+  const clamped = await executeWhQuery(wave([6000, 3999, 4000], b1Fetcher(), { fetch_rows: 10 }));
+  eq('B1 arm 3: limitK guard — the advisory is ABSENT under fetch_rows (mismatch unchanged, clamp lawful)', clamped.warnings, []);
+  eq('B1 arm 3: the clamp did not corrupt the merge (both regions still returned, sliced only)', clamped.rows, B1_ROWS());
+
+  // ---- Arm 5 (d3 §3 row 5 / P3-e wall d): the count_col-only plan. A
+  // W2-shaped plan (min/max/count_col) has NO bare col-less count(*) token —
+  // nothing to reconcile ⇒ advisory ABSENT even on mismatched estimates.
+  const w2req = parseWhEngineRequest(baseReq({
+    query: {
+      select: [
+        { op: 'min', col: 'amount', alias: 'mn' }, { op: 'max', col: 'amount', alias: 'mx' },
+        { op: 'count', col: 'amount', alias: 'c' },
+      ],
+      groupBy: ['region'],
+    },
+  }));
+  const w2Res = await executeWhQuery({
+    ...E1_EXECUTE,
+    req: w2req,
+    directoryRows: [6000, 3999, 4000].map((est, i) => ({ ...dirRow(`S${i + 1}`, null, null), row_estimate: est })),
+    fetcher: (async (shard: string) => {
+      const c = shard === 'S1' ? 6000 : shard === 'S2' ? 3999 : 4000;
+      return { ok: true, envelope: env(shard, 'orders', 'grouped', ['region'], { mn: { op: 'min', col: 'amount' }, mx: { op: 'max', col: 'amount' }, c: { op: 'count', col: 'amount' } }, [{ k: [shard === 'S3' ? 'us' : 'eu'], a: { mn: '10', mx: '500', c } }]) };
+    }) as WhShardFetcher,
+  });
+  eq('B1 arm 5: count_col-only plan ⇒ NOT armed (no bare count(*) to reconcile), warnings []', w2Res.warnings, []);
+
+  // ---- Arm 6a (d3 §3 row 6): est_rows echoes Σ estimates in the OTHER
+  // direction too: estimates Σ 14,000 vs merged count 13,999 (S3's PARTIAL c
+  // mutated, estimates intact) ⇒ fires with est_rows EXACTLY 14,000 — a
+  // mutant echoing the merged count_star instead of Σ estimates REDs here.
+  const reverse = await executeWhQuery(wave([6000, 4000, 4000], b1Fetcher(3999)));
+  eq('B1 arm 6a: est_rows is Σ DISPATCHED estimates (14000), never the merged count_star (13999)', reverse.warnings, [
+    { shard: '<merged>', code: 'row_estimate_mismatch', est_rows: 14000, retried: false },
+  ]);
+
+  // ---- Arm 6b (d3 §3 row 6): Σ over the DISPATCHED placements ONLY. A
+  // range query whose where-window excludes S2's span entirely: E11 prunes
+  // S2 pre-fanout (never dispatched, never POSTed), so Σ estimates runs over
+  // {S1: 6001, S3: 4000} = 10,001 ≠ merged 10,000 ⇒ fires with est_rows
+  // EXACTLY 10001. A mutant summing the whole directory (14,001) or echoing
+  // the merged count (10,000) REDs here.
+  const seen: string[] = [];
+  const dispatched = await executeWhQuery({
+    ...E1_EXECUTE,
+    req: parseWhEngineRequest(baseReq({
+      query: {
+        select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }],
+        groupBy: ['region'],
+        where: [{ col: 'created_at', op: 'between', value: ['2026-01-01', '2026-06-01'] }],
+      },
+    })),
+    directoryRows: [
+      { ...dirRow('S1', '2026-01-01', '2026-02-01'), row_estimate: 6001 },
+      { ...dirRow('S2', '2026-07-01', '2026-08-01'), row_estimate: 4000 }, // outside the window — pruned, estimate NEVER counted
+      { ...dirRow('S3', '2026-04-01', '2026-06-01'), row_estimate: 4000 },
+    ],
+    fetcher: (async (shard: string) => {
+      seen.push(shard);
+      if (shard === 'S1') return { ok: true, envelope: e1('S1', [{ k: ['eu'], s: '120000', c: 6000 }]) };
+      return { ok: true, envelope: e1('S3', [{ k: ['us'], s: '80000', c: 4000 }]) };
+    }) as WhShardFetcher,
+  });
+  eq('B1 arm 6b: est_rows = Σ over the DISPATCHED set only (6001+4000 = 10001)', dispatched.warnings, [
+    { shard: '<merged>', code: 'row_estimate_mismatch', est_rows: 10001, retried: false },
+  ]);
+  eq('B1 arm 6b: the out-of-span placement was NEVER dispatched (E11 pruning, zero POSTs to S2)', seen, ['S1', 'S3']);
+  eq('B1 arm 6b: coverage over the selected (pruned) population', [dispatched.coverage, dispatched.partial], ['2/2', false]);
+
+  // ---- Arm 7 (d3 §3 row 7 + core-receipt lane decision 1): the PARTIAL wave
+  // does NOT arm — guard (e) FULL-coverage arming. S2 is socket-killed
+  // mid-fanout: responded 2 ≠ dispatched 3 ⇒ the advisory is ABSENT EVEN THOUGH
+  // Σ visible estimates 14,000 ≠ merged count 10,000 — the outage echo is
+  // already warned per-shard; it is NEVER re-reported as estimate drift.
+  const resPartial = await executeWhQuery({
+    ...E1_EXECUTE,
+    directoryRows: [6000, 4000, 4000].map((est, i) => ({ ...dirRow(`S${i + 1}`, null, null), row_estimate: est })),
+    fetcher: (async (shard: string) => {
+      if (shard === 'S2') return { ok: false, warning: { code: 'network' } };
+      if (shard === 'S1') return { ok: true, envelope: e1('S1', [{ k: ['eu'], s: '120000', c: 6000 }]) };
+      return { ok: true, envelope: e1('S3', [{ k: ['us'], s: '80000', c: 4000 }]) };
+    }) as WhShardFetcher,
+  });
+  eq('B1 arm 7: outage echo ≠ drift — NO row_estimate_mismatch on the partial wave (Σest 14000 ≠ merged 10000 goes UNRECONCILED by design)', resPartial.warnings, [
+    { shard: 'S2', code: 'network', est_rows: 0, retried: false },
+  ]);
+  eq('B1 arm 7: the partial wave stays 200-shaped degraded', [resPartial.coverage, resPartial.partial], ['2/3', true]);
+});
+
+// -----------------------------------------------------------------------------
+// r138 B2 (d3 §3 row 6 sibling): the fetch_rows 10-of-50 EXACT offline
+// live-mirror. 3 shards × hand-built 50-region W1 grouped partials
+// (regions r00..r49, zero-padded so region-asc == index-asc). Shard j's
+// per-region values are pure index arithmetic: x_j(r) = (r+1)(j+1) [sum,
+// scale-0 text], c_j(r) = 2r + j [count_col], n_j(r) = 10 + r + j [count(*)].
+// Merged GLOBAL 3-band values: x(r) = 6(r+1), c(r) = 6r+3, n(r) = 33+3r.
+// Under fetch_rows:10 the shard-side $2 LIMIT trims EACH shard to its first
+// 10 regions region-asc (r00..r09 — the SAME region set on every band: the
+// offline emulation of the live uniform construction; the live A3 band s8
+// re-proves it against the real corpus). Hand-computed expectations, zero
+// impl derivation: r00 {x:6, c:3, n:33} · r09 {x:60, c:57, n:60} · r49
+// {x:300, c:297, n:180}.
+// -----------------------------------------------------------------------------
+const B2_AGGS = { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } };
+function b2RegionLabel(r: number): string {
+  return `r${String(r).padStart(2, '0')}`;
+}
+function b2Env(shard: string, regions: number[]): WhPartialEnvelope {
+  const j = Number(shard.slice(1)) - 1;
+  return env(shard, 'orders', 'grouped', ['region'], B2_AGGS, regions.map((r) => ({
+    k: [b2RegionLabel(r)],
+    a: { x: String((r + 1) * (j + 1)), c: 2 * r + j, n: 10 + r + j },
+  })));
+}
+function b2ExpectedRow(r: number): { k: string[]; aggs: { x: bigint; c: number; n: number } } {
+  return { k: [b2RegionLabel(r)], aggs: { x: BigInt(6 * (r + 1)), c: 6 * r + 3, n: 33 + 3 * r } };
+}
+function b2Req(withClamp: boolean): ReturnType<typeof parseWhEngineRequest> {
+  return parseWhEngineRequest(baseReq({
+    query: {
+      select: [
+        { op: 'sum', col: 'amount', alias: 'x' }, { op: 'count', col: 'amount', alias: 'c' },
+        { op: 'count', alias: 'n' },
+      ],
+      groupBy: ['region'],
+      ...(withClamp ? { fetch_rows: 10 } : {}),
+    },
+  }));
+}
+
+Deno.test('r138 B2: fetch_rows 10-of-50 EXACT — merged rows are EXACTLY the first 10 regions region-asc with GLOBAL 3-band values; perShard partial_rows 10 ×3; the unclamped twin returns all 50', async () => {
+  // The shard-side-trimmed wave: each shard's partial carries EXACTLY its
+  // first 10 regions (r00..r09) — what the live shard returns under LIMIT 10.
+  const clamped = await executeWhQuery({
+    ...E1_EXECUTE,
+    req: b2Req(true),
+    fetcher: (async (shard: string) => ({ ok: true, envelope: b2Env(shard, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]) })) as WhShardFetcher,
+  });
+  // Hand-computed merged expectation for r = 0..9 (x = 6(r+1), c = 6r+3,
+  // n = 33+3r) — arithmetic independent of the implementation.
+  eq('B2: merged rows are EXACTLY the 10 clamped regions region-asc with GLOBAL 3-band values (hand-computed)', clamped.rows, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(b2ExpectedRow));
+  eq('B2: literal spot pin r00 = {x:6n, c:3, n:33}', clamped.rows?.[0], { k: ['r00'], aggs: { x: 6n, c: 3, n: 33 } });
+  eq('B2: literal spot pin r09 = {x:60n, c:57, n:60}', clamped.rows?.[9], { k: ['r09'], aggs: { x: 60n, c: 57, n: 60 } });
+  eq('B2: exactly 10 merged rows (the clamp, not the merge, did the trimming)', clamped.rows?.length, 10);
+  eq('B2: the designed truncation is COMPLETE — shard-side trim keeps the same region set, coverage 3/3 partial:false (more never rides)', [clamped.coverage, clamped.partial, clamped.warnings], ['3/3', false, []]);
+  eq('B2: perShard partial_rows 10 ×3 (each shard trimmed to its own K)', clamped.perShard.map((p) => p.partial_rows), [10, 10, 10]);
+
+  // The unclamped twin wave: same shards, no fetch_rows ⇒ all 50 regions.
+  const unclamped = await executeWhQuery({
+    ...E1_EXECUTE,
+    req: b2Req(false),
+    fetcher: (async (shard: string) => ({ ok: true, envelope: b2Env(shard, Array.from({ length: 50 }, (_, i) => i)) })) as WhShardFetcher,
+  });
+  eq('B2 twin: 50 merged rows region-asc', unclamped.rows?.length, 50);
+  eq('B2 twin: literal spot pin r49 = {x:300n, c:297, n:180} (the unclamped tail)', unclamped.rows?.[49], { k: ['r49'], aggs: { x: 300n, c: 297, n: 180 } });
+  eq('B2 twin: the r00 band value is IDENTICAL under both waves (global values, not per-shard)', unclamped.rows?.[0], clamped.rows?.[0]);
+  eq('B2 twin: full coverage, no warnings', [unclamped.coverage, unclamped.partial, unclamped.warnings], ['3/3', false, []]);
+  eq('B2 twin: perShard partial_rows 50 ×3', unclamped.perShard.map((p) => p.partial_rows), [50, 50, 50]);
+});
+
+// -----------------------------------------------------------------------------
+// r138 B3 + V composites (engine plane): the 413-excluded class (V-6, d3 §3
+// row 7's oversize/413 composite — each arm cites its existing killer:
+// the 413 mapping is the r130 classify-receipt class; the excluded-loud
+// consumption is the r129 ok-arm/degrade receipt class), the socket-kill
+// degrade (V-3) with the ONE-attempt law (V-12 behavioral), and the
+// de-list plane (V-1 re-adjudicated 0/0 + V-2 floor/no-floor zero-delta +
+// V-4 invisibility negative).
+// -----------------------------------------------------------------------------
+Deno.test('r138 B3/V-6/V-3/V-12 composite (engine plane): 413 is a per-shard EXCLUDED class; the socket-killed shard degrades to 200 2/3; EXACTLY ONE attempt per shard', async () => {
+  // ---- V-6 (d2 §e V-6; B3 arm 3): S2 answers http 413. The classify law
+  // maps 413 to the per-shard excluded class {code:'excluded', detail:
+  // 'http 413'} — the query NEVER fails on it (a mutant that 5xxes the whole
+  // query on 413 REDs this arm). Existing killer: the r130 classify-mapping
+  // mutant class (wh_engine_core_test classify pins).
+  const res413 = await executeWhQuery({
+    ...E1_EXECUTE,
+    fetcher: (async (shard: string) => {
+      if (shard === 'S2') return { ok: false, warning: { httpStatus: 413 } };
+      if (shard === 'S1') return { ok: true, envelope: e1('S1', [{ k: ['eu'], s: '600', c: 6 }]) };
+      return { ok: true, envelope: e1('S3', [{ k: ['eu'], s: '100', c: 1 }]) };
+    }) as WhShardFetcher,
+  });
+  eq('V-6: 413 => EXACTLY ONE per-shard excluded warning carrying the http 413 detail (est_rows 0 — no payload weighed)', res413.warnings, [
+    { shard: 'S2', code: 'excluded', est_rows: 0, retried: false, detail: 'http 413' },
+  ]);
+  eq('V-6: never a whole-query failure — 200-shaped, the honest shards merged (eu 700/7)', [res413.coverage, res413.partial, res413.rows], ['2/3', true, [{ k: ['eu'], aggs: { s: 700n, c: 7 } }]]);
+
+  // ---- V-3 (d2 §e V-3): the socket-killed shard MID-FANOUT (the throw IS
+  // the offline kill — the fake fetcher emulates the r119 mutation-probe
+  // socket cut): the engine RETURNS a 200-shaped '2/3' partial:true envelope
+  // with the 2-shard monoid fold — never a 5xx, never a hang.
+  // ---- V-12 (d2 §e F-7 decide-once, no-retry branch): the killed shard saw
+  // EXACTLY ONE attempt — the engine has NO retry loop, so the pinned
+  // retried:false on EVERY warning is TRUTH, not a stub.
+  const s2Attempts: number[] = [];
+  const resKill = await executeWhQuery({
+    ...E1_EXECUTE,
+    fetcher: (async (shard: string) => {
+      if (shard === 'S2') {
+        s2Attempts.push(1);
+        throw new TypeError('fetch failed — socket killed mid-fanout');
+      }
+      if (shard === 'S1') return { ok: true, envelope: e1('S1', [{ k: ['eu'], s: '600', c: 6 }, { k: ['us'], s: '300', c: 3 }]) };
+      return { ok: true, envelope: e1('S3', [{ k: ['us'], s: '700', c: 7 }]) };
+    }) as WhShardFetcher,
+  });
+  eq('V-3: the engine RETURNS (never throws/5xx) — coverage 2/3, partial:true', [resKill.coverage, resKill.partial], ['2/3', true]);
+  eq('V-3: the kill is ONE per-shard network warning (est_rows 0, retried:false)', resKill.warnings, [
+    { shard: 'S2', code: 'network', est_rows: 0, retried: false },
+  ]);
+  eq('V-3: merged = the 2-shard monoid fold (eu 600/6, us 1000/10)', resKill.rows, [
+    { k: ['eu'], aggs: { s: 600n, c: 6 } }, { k: ['us'], aggs: { s: 1000n, c: 10 } },
+  ]);
+  eq('V-12: the killed shard saw EXACTLY ONE fetch attempt (no retry — one call, one failure, one warning)', s2Attempts.length, 1);
+});
+
+Deno.test('r138 V-1/V-2/V-4 composite (de-list plane): INACTIVE-shard invisibility; floor/no-floor zero-delta byte-shape; the re-adjudicated 0/0 + floor coexistence', async () => {
+  // The 0013 view's de-list law: an INACTIVE (or stale) placement is ABSENT
+  // from the directory payload — the engine never sees it. S2 is de-listed:
+  // the visible fleet is [S1, S3] with usable estimates 6000/4000.
+  const deListedFleet = [
+    { ...dirRow('S1', null, null), row_estimate: 6000 },
+    { ...dirRow('S3', null, null), row_estimate: 4000 },
+  ];
+  const seen: string[] = [];
+  const visibleFetch: WhShardFetcher = (async (shard: string) => {
+    seen.push(shard);
+    if (shard === 'S1') return { ok: true, envelope: e1('S1', [{ k: ['eu'], s: '120000', c: 6000 }]) };
+    return { ok: true, envelope: e1('S3', [{ k: ['us'], s: '80000', c: 4000 }]) };
+  }) as WhShardFetcher;
+
+  // ---- V-2 no-floor arm (d2 §e V-2): the SAME wave without min_shards is
+  // byte-identical v21 behavior — absent-field zero-delta. Σ dispatched
+  // estimates 6000+4000 = 10,000 == merged count 10,000 ⇒ the advisory is
+  // silent too (a mutant summing the de-listed shard's phantom estimate has
+  // nothing to sum — the row is not in the payload at all).
+  const noFloor = await executeWhQuery({ ...E1_EXECUTE, directoryRows: deListedFleet, fetcher: visibleFetch });
+  eq('V-2 no-floor: byte-identical v21 verdict shape (coverage 2/2, ratio 1, partial:false, warnings [])', [noFloor.coverage, noFloor.coverage_ratio, noFloor.partial, noFloor.warnings], ['2/2', 1, false, []]);
+  eq('V-2 no-floor: the visible 2-shard merge still returns data (eu 6000, us 4000 — the de-listed contribution is gone)', noFloor.rows, [
+    { k: ['eu'], aggs: { s: 120000n, c: 6000 } }, { k: ['us'], aggs: { s: 80000n, c: 4000 } },
+  ]);
+  eq('V-2 no-floor: perShard carries ONLY the visible shards', noFloor.perShard.map((p) => p.shard), ['S1', 'S3']);
+
+  // ---- V-4 (d2 §e V-4, negative assert): the de-listed shard is INVISIBLE
+  // to the dispatch — zero POSTs, zero perShard entries, zero warnings that
+  // even name it. The engine cannot see pauses; the floor/keeper pair is the
+  // ONLY defense (the narrative pin).
+  eq('V-4: the de-listed shard was NEVER dispatched (zero POSTs to S2)', seen, ['S1', 'S3']);
+  eqTrue('V-4: no perShard entry, no warning fragment names the paused shard', !noFloor.perShard.some((p) => p.shard === 'S2') && JSON.stringify(noFloor.warnings).includes('S2') === false);
+
+  // ---- V-2 with-floor arm: min_shards 3 over the 2-visible fleet ⇒
+  // post-merge degrade: partial:true + EXACTLY ONE coverage_floor_unmet
+  // (<merged>, est_rows 0), data STILL returned, advisory silent (Σest
+  // 10,000 == merged 10,000 — the floor warning is the ONLY warning).
+  const floored = await executeWhQuery({
+    ...E1_EXECUTE,
+    req: parseWhEngineRequest(baseReq({ query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], min_shards: 3 } })),
+    directoryRows: deListedFleet,
+    fetcher: visibleFetch,
+  });
+  eq('V-2 floor: partial:true + EXACTLY the ONE coverage_floor_unmet warning (nothing else — the advisory stays silent on the reconciling wave)', floored.warnings, [
+    { shard: '<merged>', code: 'coverage_floor_unmet', est_rows: 0, retried: false },
+  ]);
+  eq('V-2 floor: READS DEGRADE — the data is still returned (2 rows, byte-identical to the no-floor wave)', [floored.partial, floored.rows], [true, noFloor.rows]);
+  eq('V-2 floor: coverage stays honest over the VISIBLE population (2/2)', floored.coverage, '2/2');
+
+  // ---- V-1 (d2 §e V-1, offline-executable half): the re-adjudicated 0/0
+  // shape with the floor COEXISTING — a fully-pruned selection (the where
+  // window predates every span) returns the empty envelope partial:true with
+  // EXACTLY [fleet_de_listed, coverage_floor_unmet] (the pre-r138 poison
+  // 0/0 + partial:false + warnings [] shape appears in NO surviving pin).
+  // The keeper stamp that PREVENTS this live (>90s idle de-list) is the
+  // runner's live arm; offline db() throws synchronously and the keeper is
+  // log-only (wh_entrypoint.ts fire-and-forget catch).
+  const pruned00 = await executeWhQuery({
+    ...E1_EXECUTE,
+    req: parseWhEngineRequest(baseReq({
+      query: {
+        select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }],
+        groupBy: ['region'],
+        where: [{ col: 'created_at', op: 'lt', value: '2025-06-30' }], // predates every span — prunes BOTH
+        min_shards: 2,
+      },
+    })),
+    directoryRows: [
+      { ...dirRow('S1', '2026-01-01', '2026-06-30'), row_estimate: 6000 },
+      { ...dirRow('S2', '2026-07-01', '2026-12-31'), row_estimate: 4000 },
+    ],
+    fetcher: (async () => {
+      throw new Error('V-1: the empty-selection path must dispatch NOTHING');
+    }) as WhShardFetcher,
+  });
+  eq('V-1: the re-adjudicated 0/0 + floor coexistence — EXACT two-warning shape (fleet_de_listed THEN coverage_floor_unmet, both <merged>/est_rows 0)', pruned00.warnings, [
+    { shard: '<merged>', code: 'fleet_de_listed', est_rows: 0, retried: false },
+    { shard: '<merged>', code: 'coverage_floor_unmet', est_rows: 0, retried: false },
+  ]);
+  eq('V-1: partial:true, empty rows STILL returned, coverage 0/0 (READS DEGRADE — the poison verdict is retired)', [pruned00.partial, pruned00.rows, pruned00.coverage], [true, [], '0/0']);
+});
+
 // -----------------------------------------------------------------------------
 // Harness report (hand-rolled runner, no external deps).
 // -----------------------------------------------------------------------------
