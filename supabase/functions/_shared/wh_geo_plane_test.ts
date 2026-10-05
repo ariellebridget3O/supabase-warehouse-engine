@@ -658,7 +658,13 @@ Deno.test('geo exec P3-5b: geo fallback rides the fail-closed EMPTY path — war
   });
   eqTrue('ZERO fetches dispatched (fail-closed empty path)', calls.length === 0);
   eq('empty coverage 0/0', res.coverage, '0/0');
-  eqTrue('partial false — nothing dispatched, nothing partial', res.partial === false);
+  // r138 F-1b ADDITIVE RE-PIN (same commit as the re-adjudication — exact
+  // folded shape, never weakened): the fail-closed empty path is
+  // re-adjudicated to partial:true + the fleet_de_listed warning appended
+  // AFTER the geo_fallback_primary warning (the warnings[0] pin above is
+  // UNCHANGED — additive warning, stable order).
+  eqTrue('re-adjudicated: partial:true on the empty path (the poison 0/0 verdict is retired)', res.partial === true);
+  eqTrue('re-adjudicated: fleet_de_listed rides after the geo warning (additive, <merged> label)', res.warnings.length === 2 && res.warnings[1]?.code === 'fleet_de_listed' && res.warnings[1]?.shard === '<merged>' && res.warnings[1]?.est_rows === 0 && res.warnings[1]?.retried === false);
   eqTrue('perShard empty', res.perShard.length === 0);
   eqTrue('coverage_ratio honest at the empty denominator', res.coverage_ratio === 1);
 });

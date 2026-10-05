@@ -52,6 +52,13 @@ import {
 import type { WhDirectoryRow, WhGeoDirectoryRow, WhShardFetcher, WhEngineTimers } from './wh_engine_core.ts';
 import { parseWhEngineRequest } from './wh_engine_core.ts';
 import type { WhGeoReadDispatch } from './wh_engine_core.ts';
+// r138 F-1a: the freshness keeper stamps last_health_at for shards that
+// answered 2xx — via the EXISTING db() singleton (whe_store.ts, the engine's
+// only production supabase-js entry point; r116 seam). The call site is the
+// entrypoint, NOT the core (the core's purity island bans direct I/O and
+// index.ts is frozen) and NOT a new dep (no new env, no new infra, no
+// scheduled prober — d2 F-1 decide-once).
+import { db } from './whe_store.ts';
 import {
   fenceReadOnlyBody,
   geoWriteGate,
@@ -578,6 +585,54 @@ async function handleQuery(req: Request, deps: WhEngineDeps): Promise<Response> 
       // lever unset the core never sees the field at all, byte-identical).
       ...(deps.rpcMode === true ? { rpcMode: true } : {}),
     });
+    // ---- r138 F-1a: the FRESHNESS KEEPER (d2 P1 fold). After a fanout where
+    // shards answered HTTP 2xx (the envelope's ok-set = the placements whose
+    // partials were consumed), fire-and-forget ONE stats-only UPDATE bumping
+    // last_health_at for those shards. Stats-only law, provably never bumps
+    // directory_version: the 0013 placements dv trigger is
+    // `after update of state, key_min, key_max, hash_slot, schema_version`
+    // (0013:329-334) — last_health_at is EXCLUDED from UPDATE OF, so the
+    // write cannot fire wh_bump_directory_version. Fire-and-forget: the
+    // response below is NOT awaited behind it; every rejection is handled.
+    // Failure = log-only — this is NOT a user-facing write (WRITES-FAIL-FAST
+    // does not apply): a missed stamp degrades to the pre-r138 90s-staleness
+    // behavior, never fails the query. The stamp is a PostgREST value (the
+    // engine-side now equivalent — PostgREST cannot execute SQL now()). The
+    // placements table carries project_id (uuid), not the ref, so the ok-set
+    // resolves ids via projects (the 0013 view's own join columns, pr.id =
+    // p.project_id / pr.ref). Echo law: fixed strings only — never ref/value
+    // fragments on the log line. Offline (dep-less tests): db() throws the
+    // FM missing-env message synchronously — caught here, log-only.
+    try {
+      const okShards = response.perShard.filter((p) => p.ok).map((p) => p.shard);
+      if (okShards.length > 0) {
+        const store = db();
+        const stampedAt = new Date().toISOString();
+        void store
+          .from('projects')
+          .select('id')
+          .in('ref', okShards)
+          .then(({ data, error }) => {
+            if (error !== null && error !== undefined) throw new Error('keeper project-id resolve failed');
+            const ids = ((data ?? []) as { id: unknown }[])
+              .map((r) => r.id)
+              .filter((id): id is string => typeof id === 'string');
+            if (ids.length === 0) return;
+            return store
+              .from('warehouse_placements')
+              .update({ last_health_at: stampedAt })
+              .in('project_id', ids);
+          })
+          .then(
+            () => {},
+            () => {
+              console.error('warehouse-engine freshness keeper: last_health_at stamp failed (log-only; never fails the query)');
+            },
+          );
+      }
+    } catch {
+      console.error('warehouse-engine freshness keeper: last_health_at stamp failed (log-only; never fails the query)');
+    }
     return json({
       ...response,
       // §4.6: attach a fresh snapshot on full embed ONLY — a valid replay

@@ -201,6 +201,15 @@ export interface WhEngineRequest {
     // clamp is a consumer error); effectiveK = fetch_rows ?? limit (absent
     // both = the manifest max_rows path, today's whole-table behavior).
     fetch_rows?: number | null;
+    // r138 F-2 (design_r137_q6_serving §2, d2 F-2): the additive OPTIONAL
+    // client-visible completeness floor. Absent = the pre-r138 behavior
+    // byte-for-byte; present = a positive integer (parse law: ANY other
+    // shape is a 400 malformed riding the existing parse path — fixed-string
+    // message, r57 law). SEMANTIC enforcement is POST-merge in
+    // executeWhQuery: dispatched-and-ok shards < min_shards ⇒ the envelope
+    // gains partial:true + ONE additive coverage_floor_unmet warning and the
+    // data is STILL returned (READS DEGRADE — never a 4xx on a read).
+    min_shards?: number;
     // r129 (design_r128_joinplans §2.1): the additive OPTIONAL join
     // descriptor (WhJoinDescriptor above). Absent unless the request
     // carried a strictly-valid query.join.
@@ -416,12 +425,19 @@ function malformed(msg: string): never {
   throw new WhEngineError('malformed', msg);
 }
 
+/** r138 C1: whether the row carries a USABLE row_estimate — the exact
+ *  validity predicate directoryRowEstimate applies (a present non-negative
+ *  integer). Absent/invalid means "no estimate known" (0013 default-0
+ *  stats column semantics): the C1 advisory's reconciliation is vacuous for
+ *  a fleet that does not report estimates and must NOT arm on one. */
+function directoryEstimateUsable(row: WhDirectoryRow): boolean {
+  return typeof row.row_estimate === 'number' && Number.isInteger(row.row_estimate) && row.row_estimate >= 0;
+}
+
 /** r44 §4.4 est_rows lane: the directory's row_estimate when the row carries
  *  a valid non-negative integer, else 0 (no estimate available). */
 function directoryRowEstimate(row: WhDirectoryRow): number {
-  return typeof row.row_estimate === 'number' && Number.isInteger(row.row_estimate) && row.row_estimate >= 0
-    ? row.row_estimate
-    : 0;
+  return directoryEstimateUsable(row) ? (row.row_estimate as number) : 0;
 }
 
 /** r44: partial-derived est_rows for the truncation gate — the partial's own
@@ -639,6 +655,23 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
     fetchRows = query.fetch_rows as number | null;
   }
 
+  // r138 F-2 (design_r137_q6_serving §2, d2 F-2): the OPTIONAL completeness
+  // floor — a parse-time TYPE gate only (the SEMANTIC enforcement is
+  // post-merge). When present it must be a POSITIVE integer: 0/negative/
+  // non-integer/null are all "present but not a positive int" ⇒ 400 (the
+  // binding parse law — null is refused because absence IS the no-floor
+  // state and a second name for a no-op floor is the fetch_rows-0 consumer-
+  // error class). Message follows the r57 law verbatim: fixed-string, names
+  // the var, never echoes the value. Requests WITHOUT the field parse
+  // byte-identically (additive law — the entire pre-r138 traffic).
+  let minShards: number | undefined;
+  if (query.min_shards !== undefined) {
+    if (typeof query.min_shards !== 'number' || !Number.isInteger(query.min_shards) || (query.min_shards as number) < 1) {
+      malformed('query.min_shards must be a positive integer');
+    }
+    minShards = query.min_shards as number;
+  }
+
   return {
     v: 1,
     qid: r.qid,
@@ -649,6 +682,7 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
       ...(groupBy ? { groupBy } : {}),
       ...(limit !== undefined ? { limit } : {}),
       ...(fetchRows !== undefined ? { fetch_rows: fetchRows } : {}),
+      ...(minShards !== undefined ? { min_shards: minShards } : {}),
       ...(join !== undefined ? { join } : {}),
     },
     coverage_mode: (r.coverage_mode as 'best_effort' | 'fail_fast') ?? 'best_effort',
@@ -1706,14 +1740,35 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
 
   const emptyResponse = (warnings: WhEngineWarning[], perShard: WhPerShardEntry[]): WhEngineResponse => {
     const grouped = plan.groupKeys !== undefined;
+    // r138 F-1b (d2 P1 fold — POISON-VERDICT RE-ADJUDICATION): the
+    // empty/under-selection envelope `coverage:'0/0', coverage_ratio:1,
+    // partial:false` is a poison "complete answer: no data exists" verdict —
+    // the steady-state shape after every >90s idle gap once a placement
+    // de-lists from v_warehouse_directory. Re-adjudicated ADDITIVELY: the
+    // verdict becomes partial:true + ONE `fleet_de_listed` warning (the
+    // reserved '<merged>' plane label; est_rows 0 — plane events never bias
+    // SUM/COUNT partials, the geo_fallback_primary precedent), so a
+    // cold-start-after-idle degrades LOUDLY instead of poisoning. A
+    // requested completeness floor that 0 ok-shards cannot meet adds its OWN
+    // additive warning (F-2) — the data (empty rows/scalars) is still
+    // returned and the request still succeeds (READS DEGRADE, never a 4xx).
+    // ADDITIVE RE-PIN: the battery pins asserting the poison shape were
+    // re-pinned to this folded shape in the SAME commit (never weakened).
+    const emptyWarnings: WhEngineWarning[] = [
+      ...warnings,
+      { shard: '<merged>', code: 'fleet_de_listed', est_rows: 0, retried: false },
+    ];
+    if (typeof args.req.query.min_shards === 'number') {
+      emptyWarnings.push({ shard: '<merged>', code: 'coverage_floor_unmet', est_rows: 0, retried: false });
+    }
     const base: WhEngineResponse = {
       v: 1,
       qid: args.req.qid,
       directory_version: args.directoryVersion,
       coverage: '0/0',
       coverage_ratio: 1,
-      partial: false,
-      warnings,
+      partial: true,
+      warnings: emptyWarnings,
       perShard,
       latency_ms: args.timers.nowMs() - started,
     };
@@ -2171,6 +2226,21 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     latency_ms: args.timers.nowMs() - started,
   };
 
+  // r138 C1 scaffolding: the plan's bare col-less count(*) agg name (the
+  // buildMergePlan naming — alias ?? 'count(*)'; an aliased bare count keeps
+  // its alias) and the merged count_star (null = nothing to reconcile: no
+  // bare count, or the merged value was not a finalized number). Count
+  // accumulate/finalize is the number kind (wh_merge), so the null face is
+  // defensive only — the advisory below never throws, never fabricates.
+  let bareCountName: string | null = null;
+  for (const [name, pa] of Object.entries(plan.aggs)) {
+    if (pa.op === 'count' && pa.col === undefined) {
+      bareCountName = name;
+      break; // duplicate names are a parse reject; first-in-plan-order is deterministic
+    }
+  }
+  let mergedCountStar: number | null = null;
+
   if (grouped) {
     const fin = merged === null ? [] : finalizeGroups(merged, plan);
     if (fin.length > MAX_GROUPS) {
@@ -2188,8 +2258,83 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     // wave (wh_join_test.ts fetch_rows block).
     const limitK = effectiveLimitK(args.req.query);
     response.rows = limitK === null ? fin : fin.slice(0, limitK);
+    // r138 C1: the merged count_star = Σ over the FINALIZED rows (pre-slice)
+    // of the bare count(*) agg — the actual serving count the fleet merged.
+    if (bareCountName !== null && merged !== null) {
+      let total = 0;
+      let numeric = true;
+      for (const row of fin) {
+        const v = row.aggs[bareCountName];
+        if (typeof v === 'number') total += v;
+        else {
+          numeric = false;
+          break;
+        }
+      }
+      // count(*) finalizes to a JS number (wh_merge accToFinal count kind);
+      // the numeric flag is belt-and-braces — a non-number skips the
+      // advisory (never throws, never fabricates).
+      if (numeric) mergedCountStar = total;
+    }
   } else {
-    response.result = merged === null ? finalizeScalarAggs(mergeScalarAggs(plan, []), plan) : finalizeScalarAggs(merged, plan);
+    const scalarResult = merged === null ? finalizeScalarAggs(mergeScalarAggs(plan, []), plan) : finalizeScalarAggs(merged, plan);
+    response.result = scalarResult;
+    // r138 C1: scalar plans carry the count(*) as the single finalized value.
+    if (bareCountName !== null && typeof scalarResult[bareCountName] === 'number') {
+      mergedCountStar = scalarResult[bareCountName] as number;
+    }
+  }
+
+  // ---- r138 C1: the ROW-ESTIMATE RECONCILIATION ADVISORY (design_r137_q6_
+  // serving §2, d3 C1 — the C3 completeness instrument). NEVER fails the
+  // request: this block only ever appends ONE additive warning — the
+  // response stays 200 and rows/partial/coverage are untouched. Arms IFF
+  // ALL of (every guard is a load-bearing false-positive wall):
+  //   (a) primary PLACEMENTS plane — replica/geoDispatch single-target
+  //       planes carry no per-shard directory estimates (nothing to
+  //       reconcile);
+  //   (b) NON-join plan (args.req.query.join undefined) — inner-join
+  //       reduction is lawful; the join plane's completeness law is
+  //       EXACT-oracle, not row reconciliation;
+  //   (c) planRef.limitK == null — a client clamp lawfully truncates output
+  //       (Σn 2,800 vs 14,000 is NOT drift);
+  //   (d) the plan carries a bare col-less count agg (a count_col-only plan
+  //       has no count(*) token to reconcile);
+  //   (e) FULL coverage over the DISPATCHED set: every dispatched placement
+  //       (fanoutRows) carried a usable row_estimate AND merged ok
+  //       (responded === fanoutRows.length). A dead/excluded shard's missing
+  //       contribution is an OUTAGE echo (already warned per-shard), never
+  //       estimate drift — arming there would false-positive every partial
+  //       wave (and would break the pinned exclusion-arm shapes);
+  //   (f) merged count_star != Σ row_estimate of the dispatched placements.
+  // Fires: EXACTLY ONE {shard:'<merged>', code:'row_estimate_mismatch',
+  // est_rows:<Σ estimates>, retried:false} appended to the envelope
+  // warnings (post-sort; the per-shard warning order is untouched).
+  if (
+    !onReplicaPlane && geoDispatch === null &&
+    args.req.query.join === undefined &&
+    planRef.limitK === null &&
+    bareCountName !== null &&
+    mergedCountStar !== null &&
+    fanoutRows.length > 0 &&
+    responded === fanoutRows.length &&
+    fanoutRows.every(directoryEstimateUsable)
+  ) {
+    let estSum = 0;
+    for (const row of fanoutRows) estSum += row.row_estimate as number;
+    if (mergedCountStar !== estSum) {
+      response.warnings.push({ shard: '<merged>', code: 'row_estimate_mismatch', est_rows: estSum, retried: false });
+    }
+  }
+
+  // ---- r138 F-2: the client-visible completeness floor — SEMANTIC
+  // enforcement is POST-merge (the parse law above owns only the type).
+  // dispatched-and-ok shards < min_shards ⇒ partial:true + ONE additive
+  // warning, data STILL returned (READS DEGRADE — never a 4xx on a read).
+  // Absent field = this block never fires (byte-identical v21 paths).
+  if (typeof args.req.query.min_shards === 'number' && responded < args.req.query.min_shards) {
+    response.partial = true;
+    response.warnings.push({ shard: '<merged>', code: 'coverage_floor_unmet', est_rows: 0, retried: false });
   }
   // r121 OPT-1b (design §1.7): phases — injected POST-ASSEMBLY onto the
   // SUCCESS envelope only. Error envelopes are built by the entrypoint's

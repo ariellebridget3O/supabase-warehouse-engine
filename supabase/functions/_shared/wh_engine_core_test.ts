@@ -725,6 +725,46 @@ Deno.test('execute: scalar happy path — result ONE-of, perShard shape, latency
   eq('coverage', res.coverage, '2/2');
 });
 
+// -----------------------------------------------------------------------------
+// r138 C2 green-keeping pins: C1 row-estimate reconciliation advisory + F-2
+// completeness floor (minimal shapes — the full lethal block is the battery
+// leg's, against the FROZEN core; r53 split-cells).
+// Hand-computed expectations, independent of the implementation: the E1 wave
+// merges c = 6+3 (S1) + 4+1 (S2) + 7 (S3) => count_star 21.
+// -----------------------------------------------------------------------------
+Deno.test('r138 C2: advisory armed-and-SILENT on match; FIRES EXACTLY ONE on mismatch (never fails); F-2 floor degrades post-merge', async () => {
+  const wave = (estimates: number[]) => ({
+    ...E1_EXECUTE,
+    directoryRows: estimates.map((est, i) => ({ ...dirRow(`S${i + 1}`, null, null), row_estimate: est })),
+    fetcher: (async (shard: string) => {
+      if (shard === 'S1') return { ok: true, envelope: e1('S1', [{ k: ['eu'], s: '600', c: 6 }, { k: ['us'], s: '300', c: 3 }]) };
+      if (shard === 'S2') return { ok: true, envelope: e1('S2', [{ k: ['eu'], s: '400', c: 4 }, { k: ['ap'], s: '50', c: 1 }]) };
+      return { ok: true, envelope: e1('S3', [{ k: ['us'], s: '700', c: 7 }]) };
+    }) as WhShardFetcher,
+  });
+
+  // Hand-computed: Σ estimates 7+9+5 = 21 == merged count_star 21 => SILENT.
+  const silent = await executeWhQuery(wave([7, 9, 5]));
+  eq('C2 advisory: armed preconditions met (full coverage, bare count, no limit) yet warnings EXACTLY [] on match', silent.warnings, []);
+  eq('C2 advisory silent: response stays 200-shaped (coverage 3/3, partial false)', [silent.coverage, silent.partial], ['3/3', false]);
+
+  // Hand-computed: Σ estimates 7+8+5 = 20 != 21 => EXACTLY ONE warning, exact
+  // shape; rows/partial/coverage untouched (advisory NEVER fails).
+  const fired = await executeWhQuery(wave([7, 8, 5]));
+  eq('C2 advisory fires on mismatch: EXACTLY ONE row_estimate_mismatch, est_rows = Σ estimates (20)', fired.warnings, [
+    { shard: '<merged>', code: 'row_estimate_mismatch', est_rows: 20, retried: false },
+  ]);
+  eq('C2 advisory never fails: rows byte-identical to the silent wave', fired.rows, silent.rows);
+  eq('C2 advisory never fails: coverage/partial unchanged', [fired.coverage, fired.partial, fired.coverage_ratio], ['3/3', false, 1]);
+
+  // F-2 floor: min_shards 4 with 3 ok shards => partial:true + ONE additive
+  // coverage_floor_unmet warning, data STILL returned (READS DEGRADE).
+  const flooredReq = baseReq({ query: { select: [{ op: 'sum', col: 'amount', alias: 's' }, { op: 'count', alias: 'c' }], groupBy: ['region'], min_shards: 4 } });
+  const floored = await executeWhQuery({ ...E1_EXECUTE, req: parseWhEngineRequest(flooredReq), directoryRows: wave([7, 9, 5]).directoryRows, fetcher: wave([7, 9, 5]).fetcher });
+  eq('F-2 floor: floor unmet degrades partial:true (data still returned — 3 rows)', [floored.partial, (floored.rows ?? []).length], [true, 3]);
+  eqTrue('F-2 floor: EXACTLY ONE coverage_floor_unmet warning rides the envelope', floored.warnings.filter((w) => w.code === 'coverage_floor_unmet').length === 1);
+});
+
 Deno.test('execute: coverage 2/3 + ratio + partial flag + warnings sorted by shard (pins)', async () => {
   const res = await executeWhQuery({
     ...E1_EXECUTE,
@@ -921,8 +961,15 @@ Deno.test('execute: empty directory => tier_warm; pruned-to-zero => empty result
   eq('predicate disjoint from every span => zero shards selected', pruned.rows, []);
   eq('coverage 0/0 (nothing attempted, nothing lost)', pruned.coverage, '0/0');
   eq('ratio vacuously 1', pruned.coverage_ratio, 1);
-  eqTrue('not partial', pruned.partial === false);
-  eq('no warnings — the prune was legitimate', pruned.warnings, []);
+  // r138 F-1b ADDITIVE RE-PIN (same commit as the re-adjudication — exact
+  // folded shape, never weakened): the poison `0/0 + partial:false + no
+  // warnings` verdict is retired. The empty/under-selection envelope is now
+  // partial:true + EXACTLY the ONE <merged>-labelled fleet_de_listed
+  // warning ("complete answer: no data exists" never ships silently again).
+  eqTrue('re-adjudicated: partial:true (a 0/0 verdict is never a complete answer)', pruned.partial === true);
+  eq('re-adjudicated: EXACTLY the ONE fleet_de_listed warning', pruned.warnings, [
+    { shard: '<merged>', code: 'fleet_de_listed', est_rows: 0, retried: false },
+  ]);
 });
 
 Deno.test('execute: window/timeout params plumb through (window:2, n=4 => max 2)', async () => {
