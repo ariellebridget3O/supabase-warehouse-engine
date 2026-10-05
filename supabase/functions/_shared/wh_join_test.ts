@@ -523,6 +523,46 @@ Deno.test('r129 join gate: a ZERO-derivation join plan belongs to D2 (plan_untem
   eq('D2 fired before any network: zero POSTs', seen, []);
 });
 
+// r134 (review-b B-F2, design_r132_w7_family §6.2): the LITERAL tier2-flavored
+// zero-derivation arm — the r129 D2 precedent above with the variant:'tier2'
+// discriminator carried. Derivation is DIM-BLIND (join.table is NOT a
+// derivation input — the (a2) gate solely owns it), so a zero-match tier2
+// plan is built the precedent's way: a scalar-kind join (no groupBy — W7 is
+// rows-kind) whose REAL manifest derivation is EMPTY. The join gates
+// deliberately skip zero derivation (matchedJoinRow === null leaves
+// (a)/(a2)/(b) inert) and the rpcMode D2 gate owns the outcome:
+// plan_untemplated, NEVER join_template_required.
+Deno.test('r134 B-F2 (design_r132_w7_family §6.2): the tier2-flavored ZERO-derivation join belongs to D2 (plan_untemplated), never to the join gates', async () => {
+  const scalarTier2JoinReq = parseWhEngineRequest({
+    v: 1,
+    qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+    table: 'wh_probe_agg',
+    query: {
+      select: [{ op: 'sum', col: 'amount', alias: 'x' }],
+      join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' },
+    },
+  });
+  // REAL derivation path (the wh_entrypoint.ts:486 plan-view shape — table +
+  // groupKeys? + join? + aggs — against the REAL ENGINE_TEMPLATE_MANIFEST):
+  // the tier2 scalar-kind join derives ZERO rows (kind mismatch — W7 is
+  // rows-kind; no unit-fake, the [] IS the real derivation output, and it is
+  // the exact set the engine consumes below).
+  const derivedReal = deriveTemplateHashes(
+    { table: scalarTier2JoinReq.table, join: scalarTier2JoinReq.query.join, aggs: { x: { op: 'sum', col: 'amount' } } },
+    1,
+  );
+  eq('REAL manifest derivation of the tier2 scalar-kind join => [] (zero-match tier2 — the variant partition never matches a scalar plan)', derivedReal, []);
+  const seen: SeenCall[] = [];
+  await rejectsEngine('zero-derived tier2 join under rpcMode => plan_untemplated (D2 — NOT join_template_required)', () =>
+    executeWhQuery(joinExecArgs({
+      fetcher: recordingFetch({}, seen),
+      templateHashes: derivedReal,
+      rpcMode: true,
+      reqOverride: scalarTier2JoinReq,
+    })), 'plan_untemplated', 'derives 0 template hash');
+  eq('D2 fired before any network: zero POSTs', seen, []);
+});
+
 Deno.test('r129 join-aware derivation partition: join plans derive ONLY the join class, non-join plans EXCLUDE it (W6 never co-derives with W1)', () => {
   const groupedView = {
     table: 'wh_probe_agg',
