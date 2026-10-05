@@ -22,7 +22,7 @@
 //     shard-migrations site confinement, and the env contract
 //     (WHE_PROJECT_REF / SUPABASE_ACCESS_TOKEN in; the fm token/rotation/
 //     probe set negatively pinned out).
-//   * db/shard-templates/manifest.json + W1..W5 — RECOMPUTE each row's
+//   * db/shard-templates/manifest.json + W1..W6 — RECOMPUTE each row's
 //     sha256 from the file bytes and eq it to row.template_hash: this pulls
 //     scripts/lint_shard_templates.py's body-of-record invariant inside CI,
 //     so a file/manifest drift fails the battery too, not just the lint.
@@ -165,12 +165,17 @@ Deno.test('migrate.sh source — env contract: WHE_PROJECT_REF + SUPABASE_ACCESS
 // recomputes each row's digest from the ACTUAL file bytes so file+manifest
 // drift fails the battery even where the python lint does not run.
 // -----------------------------------------------------------------------------
-Deno.test('manifest recompute — sha256(W1..W5 file bytes) == manifest.template_hash (lint-templates invariant inside CI)', async () => {
+Deno.test('manifest recompute — sha256(W1..W6 file bytes) == manifest.template_hash (lint-templates invariant inside CI)', async () => {
   const manifestBytes = await Deno.readFile(new URL('../../../db/shard-templates/manifest.json', import.meta.url));
   const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as Array<{ slug: string; file: string; template_hash: string }>;
-  eq('manifest has exactly 5 template rows (W1..W5)', manifest.length, 5);
-  eq('manifest slugs are the pinned five, in order', manifest.map((r) => r.slug),
-    ['W1_grouped_sum_count', 'W2_scalar_minmax', 'W3_scalar_avg_pair', 'W4_topk', 'W5_cold_agg']);
+  // r129 re-pin (design_r128_joinplans.md §2.3 — the W6 provenance cell this
+  // census law requires; census agent-ctx/r129-pincensus.md §3.3
+  // templates_test row): W6_colocated_join_agg APPENDED at index 5 — the
+  // append-only law (W1..W5 keep their pinned order) — and the per-row
+  // sha256 recompute loop below AUTO-covers W6 (lethal, never weakened).
+  eq('manifest has exactly 6 template rows (W1..W5 + r129 W6_colocated_join_agg)', manifest.length, 6);
+  eq('manifest slugs are the pinned six, in order (W6 appended at index 5)', manifest.map((r) => r.slug),
+    ['W1_grouped_sum_count', 'W2_scalar_minmax', 'W3_scalar_avg_pair', 'W4_topk', 'W5_cold_agg', 'W6_colocated_join_agg']);
   eq('every row\'s file is the slug + .sql (no stray file/slug drift inside the manifest)',
     manifest.every((r) => r.file === `${r.slug}.sql`), true);
   for (const row of manifest) {

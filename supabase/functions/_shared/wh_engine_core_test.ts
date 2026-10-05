@@ -698,7 +698,30 @@ Deno.test('execute: scalar happy path — result ONE-of, perShard shape, latency
   });
   eq('scalar result (exact rational NOT expected here — sum/count)', res.result, { s: 1000n, c: 10 });
   eqTrue('rows NEVER set alongside result', res.rows === undefined);
-  eq('perShard entry shape (§4.4: error null when ok)', res.perShard[0], { shard: 'S1', ok: true, latencyMs: res.perShard[0].latencyMs, error: null });
+  // r129 re-pin (census §2.1 #1; legB R-B2): the OK arm gained the additive
+  // measurement keys — partial_rows = the CONSUMED envelope's rowCount;
+  // partial_bytes = the UTF-8 byte length of JSON.stringify(consumed
+  // envelope.partial) — the serialization convention of record
+  // (wh_engine_core.ts:1951-1969). The expected byte count is computed from
+  // the SAME deterministic fixture helper the fetcher returned (never from a
+  // run variance); the exact-key-set law of deepEq is preserved (never
+  // weakened to a projection). Error arms carry NEITHER key (unchanged pins).
+  const s1Partial = scalarEnv('S1', 'orders', { s: '600', c: 6 }).partial;
+  eq('perShard entry shape (§4.4: error null when ok) + r129 ok-arm partial_rows/partial_bytes (census §2.1 #1 re-pin)', res.perShard[0], {
+    shard: 'S1',
+    ok: true,
+    latencyMs: res.perShard[0].latencyMs,
+    error: null,
+    partial_rows: 1,
+    partial_bytes: new TextEncoder().encode(JSON.stringify(s1Partial)).length,
+  });
+  // Byte-convention hand-check: the §4.4 scalar partial serializes to EXACTLY
+  // 143 UTF-8 bytes (key order kind,aggs,rows,rowCount,more — the env()
+  // literal order; verified offline: {"kind":"scalar","aggs":{"s":{"op":
+  // "sum","col":"amount"},"c":{"op":"count"}},"rows":[{"k":[],"a":{"s":
+  // "600","c":6}}],"rowCount":1,"more":false}). A mutant measuring the whole
+  // envelope, the pre-adaptation wire, or any other serialization REDs here.
+  eq('r129 byte-convention hand-check: the scalar partial is 143 bytes', res.perShard[0].partial_bytes, 143);
   eq('coverage', res.coverage, '2/2');
 });
 

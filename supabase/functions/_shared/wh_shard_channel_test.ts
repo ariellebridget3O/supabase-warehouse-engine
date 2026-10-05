@@ -106,6 +106,10 @@ const W2H = 'a095adaa148253aee8d1cc8e976f01b3579beeea5082f3862df4a908c20b2659';
 const W3H = 'bca9dd2c591ed48a0fa5367179dd5deb1d752ed9141c23e6ad53083becf8ecac';
 const W4H = 'dccfc317035961a6310c31194e86a01c715f384ac8cbdc33fb00f35f27eefcee';
 const W5H = '9a8e922d064539e3418fd77dbc17479fe6a9b69bafe0f182128c675ef1f95234';
+// r129 (design_r128_joinplans.md §2.3 — the W6 provenance cell; census §3.2):
+// the join-class hash = sha256 of db/shard-templates/W6_colocated_join_agg.sql.
+// APPENDED to the eligible set in manifest order — never widened silently.
+const W6H = '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576';
 
 /** The manifest's template defs (the adapter's second arg in production) —
  *  the kind + agg defs + merge_ops slices the adapter consumes. */
@@ -693,8 +697,12 @@ Deno.test('r69 compileShardRpcUrl: the byte-pinned §6.1 URL', () => {
   eq('exact string', compileShardRpcUrl('blnkremote'), 'https://blnkremote.supabase.co/rest/v1/rpc/wh_query');
 });
 
-Deno.test('r69 WH_RPC_ELIGIBLE_HASHES: W1/W2/W3 only (the null-guarded set; W4/W5-class excluded — F-N5)', () => {
-  eq('contents', [...WH_RPC_ELIGIBLE_HASHES], [W1H, W2H, W3H]);
+Deno.test('r69 WH_RPC_ELIGIBLE_HASHES: W1/W2/W3 + r129 W6 join-class (the null-guarded set; W4/W5-class excluded — F-N5)', () => {
+  // r129 re-pin (census §3.2; design_r128_joinplans.md §2.3 audit-A A2 — the
+  // provenance cell for this widening): W6's hash APPENDED in manifest order.
+  // The D2 eligible set grows ONLY through this pinned cell + the FILE
+  // provenance cell below (never silently).
+  eq('contents', [...WH_RPC_ELIGIBLE_HASHES], [W1H, W2H, W3H, W6H]);
   eqTrue('W4 (topk) not eligible', !WH_RPC_ELIGIBLE_HASHES.includes(W4H));
   eqTrue('W5-class (unguarded dataset param) not eligible', !WH_RPC_ELIGIBLE_HASHES.includes(W5H));
 });
@@ -757,10 +765,25 @@ Deno.test('r69 core e2e: rpcMode placements plane builds §6.1 rpc targets, adap
     { k: ['eu'], aggs: { 'sum(amount)': 240100n, 'count(*)': 28 } },
     { k: ['us'], aggs: { 'sum(amount)': 180050n, 'count(*)': 14 } },
   ]);
-  eq('perShard clean', res.perShard, [
-    { shard: 'shard-a', ok: true, latencyMs: res.perShard[0]?.latencyMs, error: null },
-    { shard: 'shard-b', ok: true, latencyMs: res.perShard[1]?.latencyMs, error: null },
+  // r129 re-pin (census §2.1 #2): the OK entries carry the additive
+  // partial_rows/partial_bytes — measured from the CONSUMED (post-adaptation)
+  // envelope partial on the rpc path: the adapter remaps the flat §6.2 wire's
+  // x/c keys to the plan names, so the byte count runs over the ADAPTED shape
+  // (the convention of record, wh_engine_core.ts:1951-1969). Expected bytes
+  // computed from the same deterministic wire + adapter — never from a run.
+  const adapted = adaptWireEnvelope(w1Wire(), W1_TEMPLATE, RPC_PLAN);
+  const adaptedBytes = adapted === null
+    ? -1
+    : new TextEncoder().encode(JSON.stringify(adapted.partial)).length;
+  eq('perShard clean (r129 re-pin: ok-arm partial_rows/partial_bytes over the post-adaptation partial)', res.perShard, [
+    { shard: 'shard-a', ok: true, latencyMs: res.perShard[0]?.latencyMs, error: null, partial_rows: 2, partial_bytes: adaptedBytes },
+    { shard: 'shard-b', ok: true, latencyMs: res.perShard[1]?.latencyMs, error: null, partial_rows: 2, partial_bytes: adaptedBytes },
   ]);
+  // Byte-convention hand-check: the adapted w1Wire partial serializes to
+  // EXACTLY 265 UTF-8 bytes (plan-name keys, remapped a-maps, kind,
+  // groupKeys, aggs, rows, rowCount, more). A mutant measuring the RAW
+  // pre-adaptation wire or the whole envelope REDs here.
+  eq('r129 byte-convention hand-check: the adapted w1Wire partial is 265 bytes', res.perShard[0]?.partial_bytes, 265);
 });
 
 Deno.test('r69 core: rpcMode ABSENT (F-N4 Δ0 shape) => 2-arg select targets, adapter never runs', async () => {
@@ -1388,16 +1411,17 @@ Deno.test('r69 battery core: WH_RPC_ELIGIBLE_HASHES === the manifest FILE W1/W2/
   const byHash = ENGINE_TEMPLATE_MANIFEST.map((r) => r.template_hash);
   if (rows !== null) {
     const fileBySlug = Object.fromEntries(rows.map((r) => [r.slug, r.template_hash]));
-    eq('eligible set === the FILE W1/W2/W3 hashes in manifest order', [...WH_RPC_ELIGIBLE_HASHES], [
+    eq('eligible set === the FILE W1/W2/W3/W6 hashes in manifest order (r129 re-pin: W6 appended — provenance design_r128_joinplans.md §2.3)', [...WH_RPC_ELIGIBLE_HASHES], [
       fileBySlug['W1_grouped_sum_count'],
       fileBySlug['W2_scalar_minmax'],
       fileBySlug['W3_scalar_avg_pair'],
+      fileBySlug['W6_colocated_join_agg'],
     ]);
     eqTrue('W4 not eligible (file hash)', !WH_RPC_ELIGIBLE_HASHES.includes(fileBySlug['W4_topk']));
     eqTrue('W5-class not eligible (file hash)', !WH_RPC_ELIGIBLE_HASHES.includes(fileBySlug['W5_cold_agg']));
   } else {
     console.log('  note [fallback branch: manifest file not readable — the engine-manifest cross-check below carries the pin]');
-    eq('eligible set === the ENGINE manifest W1/W2/W3 hashes in manifest order', [...WH_RPC_ELIGIBLE_HASHES], [byHash[0], byHash[1], byHash[2]]);
+    eq('eligible set === the ENGINE manifest W1/W2/W3/W6 hashes in manifest order (r129 re-pin: W6 at index 5)', [...WH_RPC_ELIGIBLE_HASHES], [byHash[0], byHash[1], byHash[2], byHash[5]]);
   }
   eqTrue('the eligible set is a SUBSET of the engine manifest (plan-honesty can never self-reject an rpc plan)', [...WH_RPC_ELIGIBLE_HASHES].every((h) => byHash.includes(h)));
 });

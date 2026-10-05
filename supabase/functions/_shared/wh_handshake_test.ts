@@ -97,6 +97,11 @@ const W2H = 'a095adaa148253aee8d1cc8e976f01b3579beeea5082f3862df4a908c20b2659'; 
 const W3H = 'bca9dd2c591ed48a0fa5367179dd5deb1d752ed9141c23e6ad53083becf8ecac'; // ["avg_pair"]
 const W4H = 'dccfc317035961a6310c31194e86a01c715f384ac8cbdc33fb00f35f27eefcee'; // ["topk","raw_rows"]
 const W5H = '9a8e922d064539e3418fd77dbc17479fe6a9b69bafe0f182128c675ef1f95234'; // ["sum","count_col"]
+// r129 (design_r128_joinplans.md §2.3 — the W6 provenance cell; census §3.3):
+// the join-class hash = sha256 of db/shard-templates/W6_colocated_join_agg.sql
+// (the body IS the contract). APPENDED in manifest order — never widened
+// silently; the eligible-set provenance lives in wh_shard_channel_test.ts.
+const W6H = '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576'; // ["groupby","sum","count","count_col"] + join{dim,left,right}
 
 function invRow(hash: string, opts: Partial<TemplateInventoryRow> = {}): TemplateInventoryRow {
   return {
@@ -471,6 +476,11 @@ Deno.test('handshake: never throws on garbage inputs (consumption-site guard law
 // 1e1c725 (r43 seed wave, 5/5 sha256-pinned template bodies). This literal is
 // the offline pin; the file pin below re-reads the file whenever the test
 // config grants --allow-read over db/shard-templates.
+// r129 (design_r128_joinplans.md §2.3 — the W6 provenance cell): the literal
+// gains the W6_colocated_join_agg row APPENDED at index 5 (append-only law —
+// the geo-plane cells address rows 0-4 by index), 16 fields incl. the
+// additive join binding {dim:'wh_probe_dim', left:'region', right:'region'}
+// — deep-equal to the engine row (wh_handshake.ts) and the FILE row.
 const MANIFEST_LITERAL: EngineTemplateRow[] = [
   {
     slug: 'W1_grouped_sum_count',
@@ -557,12 +567,35 @@ const MANIFEST_LITERAL: EngineTemplateRow[] = [
     aggs: { s: { op: 'sum', col: 'value' }, c: { op: 'count_col', col: 'value' } },
     encoding: { s: 'text', c: 'number' },
   },
+  // r129 (design_r128_joinplans.md §2.3): the join class — hand-transcribed
+  // from the manifest.json W6 entry (16 fields; the ONLY row carrying the
+  // additive join binding). qc QC6 rides the lint QC_CLASSES extension.
+  {
+    slug: 'W6_colocated_join_agg',
+    file: 'W6_colocated_join_agg.sql',
+    template_hash: W6H,
+    logical_table: 'wh_probe_agg',
+    qc_class: 'QC6',
+    kind: 'rows',
+    merge_ops: ['groupby', 'sum', 'count', 'count_col'],
+    group_keys: ['region'],
+    params_schema: {},
+    timeout_ms: 8000,
+    max_rows: 1000,
+    schema_version: 1,
+    state: 'active',
+    aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+    encoding: { x: 'text', c: 'number', n: 'number' },
+    join: { dim: 'wh_probe_dim', left: 'region', right: 'region' },
+  },
 ];
 
-Deno.test('manifest pin: ENGINE_TEMPLATE_MANIFEST deep-equals the hand-transcribed literal (W1-W5, all fields)', () => {
+Deno.test('manifest pin: ENGINE_TEMPLATE_MANIFEST deep-equals the hand-transcribed literal (W1-W5 + r129 W6, all fields)', () => {
   eq('engine manifest === literal copy', ENGINE_TEMPLATE_MANIFEST, MANIFEST_LITERAL);
-  eq('exactly five templates (W1-W5)', ENGINE_TEMPLATE_MANIFEST.length, 5);
-  eq('the five pinned hashes are present', ENGINE_TEMPLATE_MANIFEST.map((r) => r.template_hash), [W1H, W2H, W3H, W4H, W5H]);
+  // r129 re-pin (census §3.3): LENGTH 5 → 6, W6 APPENDED at index 5 —
+  // provenance = design_r128_joinplans.md §2.3 (never widen silently).
+  eq('exactly six templates (W1-W5 + W6)', ENGINE_TEMPLATE_MANIFEST.length, 6);
+  eq('the six pinned hashes are present (W6 appended in manifest order)', ENGINE_TEMPLATE_MANIFEST.map((r) => r.template_hash), [W1H, W2H, W3H, W4H, W5H, W6H]);
 });
 
 Deno.test('manifest pin: file equality when --allow-read grants db/shard-templates (fallback = literal pin, provenance noted)', () => {
@@ -805,10 +838,22 @@ Deno.test('LETHAL 4 (F14 arm A end-to-end): partial claiming W2 cannot serve a [
     handshake: fakeHandshake({ S1: [invRow(W1H)], S2: [invRow(W1H)] }, []),
     templateHashes: [W1H],
   });
-  eq('S1 degraded with merge_mismatch (422-class, contract §4.4)', res.perShard, [
+  eq('S1 degraded with merge_mismatch (422-class, contract §4.4) — r129 re-pin (census §2.1 #3): the OK entry (S2) carries the additive partial_rows/partial_bytes (ok-arm-only law: the S1 error entry stays byte-identical); bytes computed from the SAME deterministic genv fixture the fetcher returned (R-B2 — never from a run variance)', res.perShard, [
     { shard: 'S1', ok: false, latencyMs: res.perShard[0]?.latencyMs, error: 'merge_mismatch' },
-    { shard: 'S2', ok: true, latencyMs: res.perShard[1]?.latencyMs, error: null },
+    {
+      shard: 'S2',
+      ok: true,
+      latencyMs: res.perShard[1]?.latencyMs,
+      error: null,
+      partial_rows: 2,
+      partial_bytes: new TextEncoder().encode(JSON.stringify(
+        genv('S2', [{ k: ['eu'], s: '200', c: 2 }, { k: ['us'], s: '300', c: 3 }], { templateHash: W1H }).partial,
+      )).length,
+    },
   ]);
+  // Byte-convention hand-check (wh_engine_core.ts:1951-1969 convention of
+  // record): the S2 grouped partial serializes to EXACTLY 206 UTF-8 bytes.
+  eq('r129 byte-convention hand-check: the S2 grouped partial is 206 bytes', res.perShard[1]?.partial_bytes, 206);
   eq('warning names the subset violation (detail carries plan-vs-template ops)', res.warnings, [{
     shard: 'S1',
     code: 'merge_mismatch',
