@@ -1,0 +1,28 @@
+# P3 LEDGER — record-only findings (code-behavior class)
+
+House law: P3s are never closed by ad-hoc code edits. Doc-closeable P3s get one-line notes in
+their doc home; code-behavior P3s are RECORDED here with cites + status and stay record-only
+until a design round explicitly adopts them. Created r134 (task `maxxing-r134-whe-riders`) to
+discharge the r133 Q-7b review ledgers: `agent-ctx/r133-q7b-review-a.md` §5 (6×P3) and
+`agent-ctx/r133-q7b-review-b.md` findings table (4×P3). No code changes were made for any P3
+in this ledger (the record-only class is honored); CLOSED entries carry a commit sha or doc cite.
+
+## review-a — r133 Q-7b fresh-eyes impl review (6×P3)
+
+| ID | Finding (cite) | Class | Status |
+|---|---|---|---|
+| A-P3-1 | Join gate (a2)'s leading conjuncts `matchedJoinRow !== null && matchedJoinRow.join !== undefined` (wh_engine_core.ts:1641) are unreachable-false — gate (a) at :1622-1627 has already thrown on exactly that condition and nothing rebinds `matchedJoinRow` between them. Harmless defensive style; the K-W7c mutant removes the whole condition, so lethality is unaffected. | code-behavior (engine) | RECORD-ONLY — dead-conjunct removal would touch a live gate line for zero behavioral payoff; adopted nowhere |
+| A-P3-2 | Plan-honesty cell wh_handshake_test.ts:677 still reads "all five W-hashes manifest-clean" (pins [W1..W5] only). Extending to all seven is OPTIONAL hygiene (audit A: the cell cannot go RED on W7); not taken. Stale wording, true statement, green cell. | code-behavior (test wording) | RECORD-ONLY per the task law (optional-hygiene extension not taken) |
+| A-P3-3 | Battery report §6's substitution sentence over-attributes: the set-inclusion/value-identity + every-region-is-tier-2 arms consume W7-shaped partials through the MERGE plane and never execute the body; the offline killer for a BODY mutant is the sha256/TEXT byte pin (any body byte change REDs ×3). Wording-only; lethality union intact. | doc (report record) | CLOSED r134 — errata appended (unmodified original preserved) to agent-ctx/r133-q7b-battery.md; executable leg independently closed live at r134 Q-7c (A2 merged==E16 EXACT ×20; verify-b 62/62 CONFIRM) |
+| A-P3-4 | Design §6 battery-spec item 2's zero-derivation arm ("variant:'tier2' against a manifest with NO tier2 row — unit-faked → plan_untemplated") was realized COMPOSITIONALLY at r133 (pre-existing D2 pin wh_join_test.ts:455-478 kept green + no-new-code-path verification); the literal unit-fake is unconstructible against the real manifest (W7 always derives for a tier2 plan). | doc (design wording) + test coverage | CLOSED r134 — the LITERAL tier2-flavored arm landed (review-b B-F2; kit commit 0065399, mutant-proven ×2) + errata note added to design §6 item 2 |
+| A-P3-5 | Design §3's "integer ≥ 0" shorthand (census C.5.2) vs §6 item 6's "0/negative → malformed": the impl correctly shipped positive-integer-or-null (core F2; `0` ⇒ `400 malformed` `'query.fetch_rows must be a positive integer or null'`). | doc (design wording) | CLOSED r134 — errata note added to design §3 (the §6 item-6 reading is normative) |
+| A-P3-6 | K-W7b's executable leg (mutated/registered body vs E16) rested entirely on the r134 live ladder — a HARD exit condition so the TEXT-pin substitution could not silently become permanent. | process | CLOSED r134 — SATISFIED by Q-7c (A2 live merged==E16 EXACT ×20 through deployed v21 @ 669c9c2; audit-a recorded the leg SATISFIED; verify-b CONFIRMED from the 60 persisted harvest raws) |
+
+## review-b — r133 Q-7b independent math+meaning review (4×P3)
+
+| ID | Finding (cite) | Class | Status |
+|---|---|---|---|
+| B-F1 | Presence-based fetch_rows/limit mutual exclusion: `{fetch_rows:25, limit:null}` is a `400 malformed` even though `limit:null` alone legally means no-truncation. Deterministic + battery-pinned (wh_join_test.ts:895). | doc (consumer contract) | CLOSED r134 — API.md request-table line beside `query.limit` pins the exact behavior with the 400 error-home (kit commit f47fb82) |
+| B-F2 | Design §6.2's tier2-flavored zero-derivation arm (variant:'tier2' + empty derivation → plan_untemplated) not shipped as a literal arm at r133 (covered compositionally: D2 variant-blind + r129 arm + K-W7c tier2 injections). | test coverage | CLOSED r134 — literal arm landed in wh_join_test.ts (kit commit 0065399): scalar-kind tier2 join whose REAL-manifest derivation is `[]` (entrypoint :486 plan-view shape) → rpcMode D2 `plan_untemplated`, NOT `join_template_required`; mutant-proven ×2 post-commit (D2-disarm → no-throw + 2 silent select-shape POSTs captured; zero-derivation double-home → wrong-throw `join_template_required`); both restores verified clean |
+| B-F3 | fetch_rows inherits limit's per-shard-LIMIT row-selection semantics (each shard returns its first K groups, key-ascending — deterministic only on aligned/uniform fleet bands; an alias, not pagination). | doc (consumer contract) | CLOSED r134 — API.md semantics line beside the B-F1 line (kit commit f47fb82) |
+| B-F4 | Over-max_rows "refusal" is a 200 degraded envelope (warnings + perShard, est_rows from the directory estimate), not a 4xx — exactly the pre-existing limit/r121 precedent; naming only. | doc (naming only) | RECORD-ONLY — pre-existing behavior, no new surprise; a consumer-contract sentence may ride a future doc pass |
