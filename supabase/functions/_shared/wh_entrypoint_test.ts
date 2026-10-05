@@ -713,15 +713,22 @@ function staticPins(): void {
   // wrapper is constructed BETWEEN the lever env check and the conditional
   // spread — the bypass exists ONLY when the lever is ON (lever off ⇒
   // proxyRawFetch stays undefined ⇒ the default platform fetch).
+  // r131 D2 AMENDMENT: the 8 boot defect branches + the armed console.log
+  // collapsed into the ONE merged wh_boot line (wh_bootlog.ts) — the prose
+  // literals are gone; the arm re-pins the COLLECTOR/CODE wirings at the
+  // same guard positions (1:1 codes, branch order) + the lever:'armed'
+  // fold-in at the former :225 site. The ordering conjuncts below are
+  // UNTOUCHED (they anchor on the env check / the bypass factory / the
+  // conditional spread — none of which moved).
   ok('index.ts r123 P0 own-ref bypass: carve-out wrapper + known-own-ref gate + boot KV timeout-race, all INSIDE the lever block',
     indexSrc.includes('makeOwnRefBypassRawFetch({') &&
     indexSrc.includes('proxiedRawFetch: makeProxiedRawFetch({ proxyUrl: proxyMap.url, proxyToken }),') &&
     indexSrc.includes("if (proxyMap !== null && ownRef === '')") &&
-    indexSrc.includes('warehouse-engine wh_proxy lever armed: own-ref DIRECT bypass active — the engine OWN host keeps the default platform fetch (co-hosted law), remote shards ride the proxy') &&
-    indexSrc.includes('warehouse-engine wh_proxy lever defect: SUPABASE_URL unparseable — the own-ref DIRECT carve-out cannot be guaranteed — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)') &&
+    indexSrc.includes("bootDefects.push('proxy_ownref_unparsed');") &&
+    indexSrc.includes("bootLever = 'armed';") &&
     indexSrc.includes('raceWhProxyKvBoot(') &&
     indexSrc.includes('WH_PROXY_KV_BOOT_TIMEOUT_MS') &&
-    indexSrc.includes('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map boot read timed out (hanging PostgREST) — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)') &&
+    indexSrc.includes("bootDefects.push('proxy_kv_timeout');") &&
     indexSrc.indexOf("Deno.env.get('WH_PROXY_FETCHER') === 'on'") < indexSrc.indexOf('makeOwnRefBypassRawFetch({') &&
     indexSrc.indexOf('makeOwnRefBypassRawFetch({') < indexSrc.indexOf('...(proxyRawFetch !== undefined ? { rawFetch: proxyRawFetch } : {})'),
     'own-ref bypass wiring missing, ungated, or outside the lever block');
@@ -933,7 +940,9 @@ async function rywFlipPins(): Promise<void> {
     // The SHELL imports the constant (a static import cannot throw) and
     // threads it; _shared itself never reads the file — it only sees the
     // value as deps.engineBuild (the hasRealFetcher precedent). The boot
-    // defect log for an empty constant is fixed-string + boot-time (echo law).
+    // defect for an empty constant rides the merged wh_boot line as the
+    // 'stamp_absent' collector push (r131 D2) — fixed code, boot-time,
+    // echo law (never per-request).
     ok(
       "index.ts A8: the ENGINE_BUILD stamp is imported + threaded as deps.engineBuild (the hasRealFetcher DI precedent — the constant import lives in the shell, never in _shared)",
       indexSrc.includes("import { ENGINE_BUILD } from '../_shared/engine_build.ts';") &&
@@ -941,9 +950,9 @@ async function rywFlipPins(): Promise<void> {
       'the stamp import or the DI thread is missing',
     );
     ok(
-      'index.ts A8: the stamp-absent boot defect log exists and is the pinned fixed string (echo law; boot-time, never per-request)',
-      indexSrc.includes('warehouse-engine boot defect: ENGINE_BUILD stamp absent — deploy provenance unavailable (stamp null on /health)'),
-      'the fixed-string boot defect log is missing',
+      'index.ts A8: the stamp-absent boot defect exists as the pinned collector push (echo law; boot-time, never per-request)',
+      indexSrc.includes("bootDefects.push('stamp_absent');"),
+      'the stamp_absent collector push is missing',
     );
 
     // m5 rides this section (same design §8 batch)
@@ -1117,12 +1126,17 @@ async function rpcPlaneBatteryPins(): Promise<void> {
     // AM-8/OQ-7: the boot defect-class log fires ONCE per isolate boot — the
     // log lines live in the boot-time deps IIFE (before Deno.serve), fixed
     // strings only, both defect classes covered.
-    const defectIdx = indexSrc.indexOf('shard key channel defect');
+    // r131 D2 AMENDMENT: the prose literals are gone — the boot-log REGION
+    // re-anchors on the collector declaration (index.ts uses the typed
+    // WhBootDefectCode[] collector) and now covers the collector pushes +
+    // the post-IIFE emit block (strictly stronger than the old prose
+    // anchor). Invariant unchanged: strictly BEFORE Deno.serve.
+    const defectIdx = indexSrc.indexOf('const bootDefects: WhBootDefectCode[] = [];');
     const serveIdx = indexSrc.indexOf('Deno.serve('); // the CALL, not the header comment's "Deno.serve shell" mention
     ok(
-      'index.ts AM-8: the boot defect-class log exists and is BOOT-TIME (before Deno.serve — once per isolate, never per-request)',
+      'index.ts AM-8: the boot defect collector exists and is BOOT-TIME (before Deno.serve — once per isolate, never per-request)',
       defectIdx >= 0 && serveIdx > defectIdx,
-      'log missing or re-placed into a per-request path',
+      'collector missing or re-placed into a per-request path',
     );
     ok(
       'index.ts AM-8: the boot-log region is interpolation-free (fixed strings — never value fragments)',
@@ -1130,9 +1144,9 @@ async function rpcPlaneBatteryPins(): Promise<void> {
       'template interpolation found in the boot-log region',
     );
     ok(
-      'index.ts AM-8: BOTH defect classes are logged (unparseable SUPABASE_URL + empty SUPABASE_SERVICE_ROLE_KEY)',
-      indexSrc.includes('SUPABASE_URL unparseable') && indexSrc.includes('SUPABASE_SERVICE_ROLE_KEY empty'),
-      'a defect class is unlogged',
+      'index.ts AM-8: BOTH defect classes are collected (ownref_unparsed + ownkey_empty — the merged wh_boot line keeps 1:1 codes)',
+      indexSrc.includes("'ownref_unparsed'") && indexSrc.includes("'ownkey_empty'"),
+      'a defect class is uncollected',
     );
   });
 }

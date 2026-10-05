@@ -65,6 +65,10 @@ import {
 } from '../_shared/wh_shard_channel.ts';
 import type { WhProxyRawFetch } from '../_shared/wh_shard_channel.ts';
 import { fetchFenceConfig, ownProjectRefFromSupabaseUrl } from '../_shared/geo_write_fence.ts';
+// r131 D2: the merged boot log — pure formatter + emit gate (the shell keeps
+// the only console calls; F-N8 purity intact — the module reads no env).
+import { formatWhBootLog, shouldEmitWhBootLog } from '../_shared/wh_bootlog.ts';
+import type { WhBootDefectCode, WhBootLeverState, WhBootLogInput } from '../_shared/wh_bootlog.ts';
 import type { WhFenceClient } from '../_shared/geo_write_fence.ts';
 import { db } from '../_shared/whe_store.ts';
 
@@ -82,6 +86,19 @@ const engineBuild: string = ENGINE_BUILD;
 // PostgREST at boot degrades to the KV-absent state (lever inert + the
 // fixed-string timeout defect log) after WH_PROXY_KV_BOOT_TIMEOUT_MS
 // instead of wedging module evaluation forever.
+// r131 D2 boot-log consolidation (design_d2_bootlog_consolidation_r129.md
+// §2.1): the boot-defect COLLECTOR — the guard arms below push 1:1 codes IN
+// BRANCH ORDER instead of firing 8 scattered prose console.error lines; the
+// ONE merged {"event":"wh_boot",...} line emits ONCE after the IIFE, before
+// Deno.serve (OQ-7: once per isolate boot — one collector, one emit).
+// Module-scope so the post-IIFE emit block sees it. Echo law (AM-8): the
+// codes are compile-time literals — env name + defect class ONLY, never
+// values (no env value, ref, URL, key fragment, or KV content can reach the
+// line). Severity mapping lives at the emit site (defects => console.error,
+// defect-free armed boot => console.log).
+const bootDefects: WhBootDefectCode[] = [];
+let bootLever: WhBootLeverState = 'inert';
+
 const deps: WhEngineDeps = await (async () => {
   // r69 §3.3 (D4/D5/D6): the shard SERVICE-KEY channel — parsed ONCE at
   // isolate boot, wired ONCE, feeding BOTH the handshake plane auth AND the
@@ -91,21 +108,24 @@ const deps: WhEngineDeps = await (async () => {
   const ownRef = ownProjectRefFromSupabaseUrl(Deno.env.get('SUPABASE_URL') ?? '');
   const ownKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
   // r69 AM-8 boot defect-class log — once per isolate boot, env name +
-  // defect class ONLY (never values). The fail-closed enforcement itself
-  // stays per-call inside the resolver (OQ-7: once-per-boot reading pinned).
+  // defect class ONLY (never values). r131 D2: the branches now push 1:1
+  // codes onto the bootDefects collector (the ONE merged wh_boot line emits
+  // after the IIFE); the fail-closed enforcement itself stays per-call
+  // inside the resolver (OQ-7: once-per-boot reading pinned).
   if (ownRef === '') {
-    console.error('warehouse-engine shard key channel defect: SUPABASE_URL unparseable — own-ref resolver arm disabled (ownRef empty)');
+    bootDefects.push('ownref_unparsed');
   }
   if (ownKey === '') {
-    console.error('warehouse-engine shard key channel defect: SUPABASE_SERVICE_ROLE_KEY empty — own-ref key resolution fails closed (shard_key_missing)');
+    bootDefects.push('ownkey_empty');
   }
-  // r124 A8 (design §2 ⟫B-1): the stamp's ONE boot defect log — an EMPTY
+  // r124 A8 (design §2 ⟫B-1): the stamp's ONE boot defect — an EMPTY
   // generated constant (a hand-written placeholder that only satisfies the
-  // import) means deploy provenance is unavailable. Fixed string, echo law:
-  // never value fragments, never a 500 on /health over it (the dep simply
-  // stays unthreaded and /health renders engine_build: null).
+  // import) means deploy provenance is unavailable. r131 D2: rides the
+  // merged wh_boot line as the 'stamp_absent' code (echo law: never value
+  // fragments, never a 500 on /health over it — the dep simply stays
+  // unthreaded and /health renders engine_build: null).
   if (engineBuild === '') {
-    console.error('warehouse-engine boot defect: ENGINE_BUILD stamp absent — deploy provenance unavailable (stamp null on /health)');
+    bootDefects.push('stamp_absent');
   }
   const resolveShardKey = makeShardKeyResolver({ ownRef, ownKey, remoteKeys: shardKeys });
 
@@ -157,9 +177,9 @@ const deps: WhEngineDeps = await (async () => {
   // ∈ refs, NO JWT-shaped string anywhere — the token NEVER rides config).
   // ANY miss ⇒ the lever is INERT: proxyRawFetch stays undefined, the
   // rawFetch dep below is the default platform fetch (byte-identical unset
-  // path — mirror of the rpcMode expression's unset law), and ONE
-  // fixed-string boot defect log fires (echo law: never value fragments,
-  // never the KV content).
+  // path — mirror of the rpcMode expression's unset law), and ONE fixed
+  // code pushes onto the bootDefects collector (the merged wh_boot line;
+  // echo law: never value fragments, never the KV content).
   // OFF is the shipped default: with the env not 'on' this block reads NO
   // other env, performs NO KV round-trip, and boots exactly as pre-r123.
   // The activation expression is INLINE (mirror of the rpcMode expression —
@@ -168,7 +188,7 @@ const deps: WhEngineDeps = await (async () => {
   if (Deno.env.get('WH_PROXY_FETCHER') === 'on') {
     const proxyToken = Deno.env.get('WH_PROXY_TOKEN') ?? '';
     if (proxyToken === '') {
-      console.error('warehouse-engine wh_proxy lever defect: WH_PROXY_TOKEN unset — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+      bootDefects.push('proxy_token_unset');
     } else {
       try {
         // r123 fresh-eyes P3 fix: the boot KV read is TIMEOUT-RACED — a
@@ -185,17 +205,17 @@ const deps: WhEngineDeps = await (async () => {
             .maybeSingle(),
           WH_PROXY_KV_BOOT_TIMEOUT_MS,
           () => {
-            console.error('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map boot read timed out (hanging PostgREST) — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+            bootDefects.push('proxy_kv_timeout');
             return null;
           },
         );
         if (raced === null) {
-          // the timeout defect log already fired inside the callback —
+          // the timeout code was already pushed inside the callback —
           // stays inert (the KV-absent state).
         } else {
           const { data, error } = raced;
           if (error !== null || data === null) {
-            console.error('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map row absent or unreadable — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+            bootDefects.push('proxy_kv_absent');
           } else {
             // Validate ONCE (one boot, one defect log on any shape fault — the
             // validator owns the per-class fixed-string log, value fragments
@@ -216,18 +236,21 @@ const deps: WhEngineDeps = await (async () => {
             // identity); the bypass arm itself ALSO disables on '' (AM-8
             // mirror, belt-and-braces).
             if (proxyMap !== null && ownRef === '') {
-              console.error('warehouse-engine wh_proxy lever defect: SUPABASE_URL unparseable — the own-ref DIRECT carve-out cannot be guaranteed — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+              bootDefects.push('proxy_ownref_unparsed');
             } else if (proxyMap !== null) {
               proxyRawFetch = makeOwnRefBypassRawFetch({
                 ownRef,
                 proxiedRawFetch: makeProxiedRawFetch({ proxyUrl: proxyMap.url, proxyToken }),
               });
-              console.log('warehouse-engine wh_proxy lever armed: own-ref DIRECT bypass active — the engine OWN host keeps the default platform fetch (co-hosted law), remote shards ride the proxy');
+              // r131 D2: the armed log folds into the merged wh_boot line
+              // (lever:'armed', class:'boot_armed' — the steady-state
+              // emitter, emitted after the IIFE below).
+              bootLever = 'armed';
             }
           }
         }
       } catch {
-        console.error('warehouse-engine wh_proxy lever defect: wh_shard_proxy_map read failed — WH_PROXY_FETCHER=on stays inert (default platform fetch in use)');
+        bootDefects.push('proxy_kv_failed');
       }
     }
   }
@@ -344,5 +367,22 @@ const deps: WhEngineDeps = await (async () => {
     ...(engineBuild !== '' ? { engineBuild } : {}),
   };
 })();
+
+// r131 D2: the ONE merged boot line (design §2.1/§2.3) — the 8 prose defect
+// branches + the armed console.log above collapse into one JSON line
+// (worst-case 1,140 B -> 239 B, −79.0%; armed steady-state 171 B -> 92 B).
+// Severity mapping preserved: a defect-bearing boot emits via console.error
+// (error class), the defect-free ARMED boot via console.log (info — the
+// former :225 severity). A clean inert boot emits NOTHING (the byte-
+// identical 0-line path). Still ONCE per isolate boot (OQ-7). D1 wrap
+// point: the LOG_LEVEL shim (r128 findings D1), if it ever lands, wraps
+// THIS call site — the armed/info-class line is its first gated customer;
+// the error-class defects stay ungated (the triage floor).
+const bootLog: WhBootLogInput = { lever: bootLever, defects: bootDefects };
+if (shouldEmitWhBootLog(bootLog)) {
+  const line = formatWhBootLog(bootLog);
+  if (bootLog.defects.length > 0) console.error(line); // class boot_defect
+  else console.log(line); // class boot_armed
+}
 
 Deno.serve((req: Request) => handleWhEngineRequest(req, deps));
