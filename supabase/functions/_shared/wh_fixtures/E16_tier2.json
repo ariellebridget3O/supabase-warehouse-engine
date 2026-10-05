@@ -1,0 +1,41 @@
+{
+  "id": "E16_tier2",
+  "meta": {
+    "fixture": "E16_tier2",
+    "source": "audit/r128_join_oracle/join_oracle.json sha256 e5959512546b9d00591af265c944911101314c5ce8cdf9470618d09b7f298172",
+    "doc": "design_r132_w7_family.md §5 oracle (tier-2 sha-gated PROJECTION of the banked join oracle — tier = (k % 3) + 1 == 2 ⇔ k ≡ 1 mod 3) — rows = the 17 merged tier-2 output rows {region, x, c, n} sorted region-ascending; x is the P0-1 scale-0 fixed-point integer, c = count(amount) (null-blind), n = count(*); n_r = 280 uniform ∀17; per_band = the {n, sum_x} projection home."
+  },
+  "rows": [
+    { "region": "g01", "x": 1307287, "c": 277, "n": 280 },
+    { "region": "g04", "x": 1349242, "c": 277, "n": 280 },
+    { "region": "g07", "x": 1258445, "c": 277, "n": 280 },
+    { "region": "g10", "x": 1329404, "c": 277, "n": 280 },
+    { "region": "g13", "x": 1401144, "c": 277, "n": 280 },
+    { "region": "g16", "x": 1280237, "c": 278, "n": 280 },
+    { "region": "g19", "x": 1333942, "c": 277, "n": 280 },
+    { "region": "g22", "x": 1176427, "c": 277, "n": 280 },
+    { "region": "g25", "x": 1233432, "c": 277, "n": 280 },
+    { "region": "g28", "x": 1306019, "c": 277, "n": 280 },
+    { "region": "g31", "x": 1240777, "c": 277, "n": 280 },
+    { "region": "g34", "x": 1325258, "c": 277, "n": 280 },
+    { "region": "g37", "x": 1345669, "c": 278, "n": 280 },
+    { "region": "g40", "x": 1393669, "c": 277, "n": 280 },
+    { "region": "g43", "x": 1299481, "c": 277, "n": 280 },
+    { "region": "g46", "x": 1341796, "c": 277, "n": 280 },
+    { "region": "g49", "x": 1342756, "c": 277, "n": 280 }
+  ],
+  "excluded": {
+    "note": "tier-2 loses NO region to the g47 omission (g47 is tier-3; exclusion already applied in the banked oracle)"
+  },
+  "globals": {
+    "rows": 17,
+    "sum_c": 4711,
+    "sum_n": 4760,
+    "sum_x": 22264985
+  },
+  "per_band": {
+    "A": { "n": 2040, "sum_x": 9506717 },
+    "B": { "n": 1360, "sum_x": 6438027 },
+    "C": { "n": 1360, "sum_x": 6320241 }
+  }
+}

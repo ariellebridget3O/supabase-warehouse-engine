@@ -18,6 +18,12 @@
 // closure + finalize EXACT 49 + dim-labeled envelope_invalid), manifest
 // statics (W6 row deep-equality + rows-kind body TEXT pins, lint parity),
 // E15 provenance, rpcParams ({} + optional limit — no new params), perShard
+// r133 (design_r132_w7_family §5/§6.4): E16_tier2 — the W7 tier2 oracle = the
+// sha-gated PROJECTION of the same banked join_oracle.json (17 rows;
+// scripts/r133_tier2_oracle.py). Arms: fixture statics + SET-INCLUSION
+// (E16 ⊂ E15, keys AND values), 17-row monoid closure + full-pipeline W7
+// wave (finalize EXACT 17 + perShard 6/6/5) + the W7 dim-labeled
+// envelope_invalid twin.
 // additive ok-arm presence + exact-shape pins (the R-3 law on the new
 // surface), the entrypoint :464-478 dispatch-population split, and the R-B3
 // rpcMode decision pin (see the block comment there).
@@ -161,6 +167,22 @@ interface E15Fixture {
 const E15 = JSON.parse(
   Deno.readTextFileSync(new URL('./wh_fixtures/E15_join.json', import.meta.url)),
 ) as E15Fixture;
+
+// r133 (design_r132_w7_family §5): E16 — the W7 tier2 oracle = the sha-gated
+// PROJECTION of the same banked join_oracle.json (17 tier-2 rows; generator
+// scripts/r133_tier2_oracle.py, ALL hand-pin gates green pre-emit). Same
+// provenance law as E15: the fixture's numbers ARE the expectations.
+interface E16Fixture {
+  id: string;
+  meta: { fixture: string; source: string; doc: string };
+  rows: E15Row[];
+  excluded: { note: string };
+  globals: { rows: number; sum_c: number; sum_n: number; sum_x: number };
+  per_band: Record<'A' | 'B' | 'C', { n: number; sum_x: number }>;
+}
+const E16 = JSON.parse(
+  Deno.readTextFileSync(new URL('./wh_fixtures/E16_tier2.json', import.meta.url)),
+) as E16Fixture;
 
 const COLS: Record<string, string> = { region: 'text', amount: 'numeric' };
 const SCALES: Record<string, number> = { amount: 0 };
@@ -690,6 +712,112 @@ Deno.test('r133 W7 body compliance TEXT pins (design_r132_w7_family §2.3 rows-k
 Deno.test('r129 E15 fixture provenance: canonical oracle port (path + sha256 self-pinned), the hand constants ride the fixture', () => {
   eqTrue('meta.source names the canonical oracle file AND its sha256 (never a silent re-derivation)', E15.meta.source.includes('audit/r128_join_oracle/join_oracle.json') && E15.meta.source.includes('e5959512546b9d00591af265c944911101314c5ce8cdf9470618d09b7f298172'));
   eq('49 rows + globals + excluded are the audit-B-confirmed hand constants', [E15.rows.length, E15.globals, E15.excluded.g47, E15.meta.fixture], [49, { rows: 49, sum_c: 13578, sum_n: 13720, sum_x: 64521483 }, { x: 1374335, c: 277, n: 280 }, 'E15']);
+});
+
+// =============================================================================
+// §5 + §6.4 (r133) — E16_tier2: the W7 oracle = sha-gated PROJECTION of the
+// banked join oracle (17 tier-2 rows, generator scripts/r133_tier2_oracle.py,
+// hand-pin gates ALL green pre-emit). Arms: fixture statics + the SET-
+// INCLUSION identity (E16 ⊂ E15, keys AND per-region values), the monoid
+// closure through the REAL merge path, the full-pipeline W7 wave, and the
+// W7-shaped dim-labeled envelope_invalid twin (the §2.4 law is
+// variant-independent).
+// =============================================================================
+
+/** The W7 tier2 request: the W6 descriptor + variant:'tier2' (the ONE field
+ *  that flips derivation to W7 — design_r132_w7_family §2.2). */
+function tier2JoinReqBody(): Record<string, unknown> {
+  return joinReqBody({ query: { join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' } } });
+}
+
+const W7_PLAN: WhMergePlan = buildMergePlan(parseWhEngineRequest(tier2JoinReqBody()), { columnTypes: COLS, columnScales: SCALES });
+
+/** W7-shaped grouped partial — the exact per-shard shape the W7 template
+ *  emits post-adaptation. W7's body is W6 + the ONE tier-2 delta line, so
+ *  the ENVELOPE is byte-identical to W6's (same aggs {x,c,n}, same
+ *  groupKeys ['region'], same schema_version; the variant lives in the
+ *  manifest/template, NEVER in the envelope) — only the ROW SET differs
+ *  (17 tier-2 regions, n_r = 280 each). Same fixed-point TEXT convention
+ *  as w6env (x rides as String). */
+function w7env(shard: string, rows: E15Row[]): WhPartialEnvelope {
+  return {
+    v: 1,
+    shard,
+    table: 'wh_probe_agg',
+    schema_version: 1,
+    partial: {
+      kind: 'grouped',
+      groupKeys: ['region'],
+      aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+      rows: rows.map((r) => ({ k: [r.region], a: { x: String(r.x), c: r.c, n: r.n } })),
+      rowCount: rows.length,
+      more: false,
+    },
+  };
+}
+
+Deno.test('r133 E16 provenance + SET-INCLUSION: the tier2 oracle is a strict SUBSET of the E15 oracle (17 ⊂ 49 region keys, per-region values identical), fixture self-pinned', () => {
+  eqTrue('E16 id/fixture are the §5 schema literals ("E16_tier2" ×2 — the audit-B P2-2 fold: the schema is fully determined)', E16.id === 'E16_tier2' && E16.meta.fixture === 'E16_tier2');
+  eqTrue('meta.source names the canonical oracle file AND its sha256 (the E15 provenance convention — never a silent re-derivation)', E16.meta.source.includes('audit/r128_join_oracle/join_oracle.json') && E16.meta.source.includes('e5959512546b9d00591af265c944911101314c5ce8cdf9470618d09b7f298172'));
+  eq('17 rows + globals + per_band are the hand pins (§5: Σx 22,264,985 / Σc 4,711 / Σn 4,760; per-band n 2040/1360/1360, Σx 9,506,717/6,438,027/6,320,241)', [E16.rows.length, E16.globals, E16.per_band], [17, { rows: 17, sum_c: 4711, sum_n: 4760, sum_x: 22264985 }, { A: { n: 2040, sum_x: 9506717 }, B: { n: 1360, sum_x: 6438027 }, C: { n: 1360, sum_x: 6320241 } }]);
+  eq('the 17 region keys are EXACTLY the hand-derived tier-2 set (k ≡ 1 mod 3: g01…g49 — tier = (k % 3) + 1)', E16.rows.map((r) => r.region), ['g01', 'g04', 'g07', 'g10', 'g13', 'g16', 'g19', 'g22', 'g25', 'g28', 'g31', 'g34', 'g37', 'g40', 'g43', 'g46', 'g49']);
+  eqTrue('region-ascending AND n_r = 280 ∀17 (uniform 120+80+80 by the coprime construction — Σn = 17 × 280 = 4,760)', E16.rows.every((r, i, a) => i === 0 || a[i - 1].region < r.region) && E16.rows.every((r) => r.n === 280));
+  const E15RegionKeys = new Set(E15.rows.map((r) => r.region));
+  eq('SET-INCLUSION (the §5 identity, pinned explicitly): every E16 region key ∈ the E15 region keys (17 ⊂ 49)', [E16.rows.every((r) => E15RegionKeys.has(r.region)), E15.rows.length], [true, 49]);
+  eqTrue('per-region value identity: each E16 row {x,c,n} EQUALS its E15 twin (a strict subset of the 49-row oracle — a tier-predicate-drop mutant emits tier-1/3 rows → EXACT mismatch RED, K-W7b)', E16.rows.every((r) => {
+    const twin = E15.rows.find((e) => e.region === r.region);
+    return twin !== undefined && twin.x === r.x && twin.c === r.c && twin.n === r.n;
+  }));
+  eq('closure: the tier-1+3 complement (E15 − E16) is the hand-derived residual {Σx 42,256,498, Σc 8,867, Σn 8,960} (t1+t2+t3 = banked, ALL EXACT)', [E15.globals.sum_x - E16.globals.sum_x, E15.globals.sum_c - E16.globals.sum_c, E15.globals.sum_n - E16.globals.sum_n], [42256498, 8867, 8960]);
+  eq('per-band closure: A+B+C reassembles the tier-2 globals (Σx 9,506,717 + 6,438,027 + 6,320,241 = 22,264,985; n 2040+1360+1360 = 4760)', [E16.per_band.A.sum_x + E16.per_band.B.sum_x + E16.per_band.C.sum_x, E16.per_band.A.n + E16.per_band.B.n + E16.per_band.C.n], [22264985, 4760]);
+  eqTrue('excluded.note pins the g47-losslessness statement (tier-2 loses NO region to the omission — g47 is tier-3, excluded in the BANKED oracle)', typeof E16.excluded.note === 'string' && E16.excluded.note.includes('g47') && E16.excluded.note.includes('tier-3'));
+});
+
+Deno.test('r133 E16 monoid closure: 17 W7-shaped one-region partials merge + finalize through the REAL merge path to EXACTLY the tier2 oracle', () => {
+  const envs = E16.rows.map((r) => w7env(`e16-${r.region}`, [r]));
+  const merged = mergeGroupedPartials(W7_PLAN, envs);
+  eq('merged partial keeps the rowCount invariant (17 groups from 17 one-region shard partials)', merged.partial.rowCount, 17);
+  const fin = finalizeGroups(merged, W7_PLAN);
+  eq('finalize(merged) === E16 rows EXACT (17 rows, x as the scale-0 bigint carrier, canonical order)', fin, E16.rows.map((r) => ({ k: [r.region], aggs: { x: BigInt(r.x), c: r.c, n: r.n } })));
+  const finRev = finalizeGroups(mergeGroupedPartials(W7_PLAN, [...envs].reverse()), W7_PLAN);
+  eq('monoid closure: reversed-arrival merge finalizes to the SAME 17 rows (assoc + comm spot pin)', finRev, fin);
+  const sumX = fin.reduce((a, r) => a + (r.aggs.x as bigint), 0n);
+  const sumC = fin.reduce((a, r) => a + (r.aggs.c as number), 0);
+  const sumN = fin.reduce((a, r) => a + (r.aggs.n as number), 0);
+  eq('hand-computed tier2 globals: Σx 22,264,985 / Σc 4,711 / Σn 4,760 (the §5 pins through the merge path)', [sumX.toString(), sumC, sumN], ['22264985', 4711, 4760]);
+  eqTrue('every merged region is tier-2 by the (k % 3) + 1 rule AND g47 ABSENT (a dropped tier predicate emits tier-1/3 regions → row-count AND set-difference RED)', fin.every((r) => (parseInt(r.k[0].slice(1), 10) % 3) + 1 === 2) && !fin.some((r) => r.k[0] === 'g47'));
+});
+
+// Shard slices for the W7 wave: A = g01..g16 (6 rows), B = g19..g37 (6), C = g40..g49 (5). 6+6+5 = 17.
+const E16_A = E16.rows.slice(0, 6);
+const E16_B = E16.rows.slice(6, 12);
+const E16_C = E16.rows.slice(12, 17);
+const w7envA = w7env('shard-a', E16_A);
+const w7envB = w7env('shard-b', E16_B);
+const w7envC = w7env('shard-c', E16_C);
+
+Deno.test('r133 W7 fanout: the FULL E16 tier2 oracle through the real pipeline (17 rows EXACT), perShard ok-arm pins + the W7-shaped dim-labeled envelope_invalid twin', async () => {
+  const seen: SeenCall[] = [];
+  const res = await executeWhQuery(joinExecArgs({
+    reqOverride: parseWhEngineRequest(tier2JoinReqBody()),
+    facts: [factRow('shard-a'), factRow('shard-b'), factRow('shard-c')],
+    dims: [dimRow('shard-a', { isReference: true }), dimRow('shard-b', { isReference: true }), dimRow('shard-c', { isReference: true })],
+    fetcher: recordingFetch({ 'shard-a': w7envA, 'shard-b': w7envB, 'shard-c': w7envC }, seen),
+    templateHashes: [W7H],
+  }));
+  eq('tier2 colocated wave: coverage 3/3, partial false, warnings [], exactly 3 shard POSTs', [res.coverage, res.partial, res.warnings, seen.length], ['3/3', false, [], 3]);
+  eq('finalize output === E16 rows EXACT (17 rows through gate → fanout → merge → finalize)', res.rows, E16.rows.map((r) => ({ k: [r.region], aggs: { x: BigInt(r.x), c: r.c, n: r.n } })));
+  eq('perShard exact shape (R-3 law: exact ok-arm key set, partial_rows = consumed rowCount 6/6/5)', res.perShard, [
+    { shard: 'shard-a', ok: true, latencyMs: res.perShard[0]?.latencyMs, error: null, partial_rows: 6, partial_bytes: bytes(w7envA.partial) },
+    { shard: 'shard-b', ok: true, latencyMs: res.perShard[1]?.latencyMs, error: null, partial_rows: 6, partial_bytes: bytes(w7envB.partial) },
+    { shard: 'shard-c', ok: true, latencyMs: res.perShard[2]?.latencyMs, error: null, partial_rows: 5, partial_bytes: bytes(w7envC.partial) },
+  ]);
+  const sumX = (res.rows ?? []).reduce((a, r) => a + (r.aggs.x as bigint), 0n);
+  const sumC = (res.rows ?? []).reduce((a, r) => a + (r.aggs.c as number), 0);
+  const sumN = (res.rows ?? []).reduce((a, r) => a + (r.aggs.n as number), 0);
+  eqTrue('globals recompute from the ENGINE output: Σx 22,264,985 / Σc 4,711 / Σn 4,760 (the E16 globals ride the live path)', sumX.toString() === '22264985' && sumC === 4711 && sumN === 4760);
+  const dimLabeledW7 = { ...w7env('s-dim', [E16.rows[0]]), table: 'wh_probe_dim' };
+  throwsMerge('W7-shaped partial labeled with the DIM table => envelope_invalid vs the W7 plan (the §2.4 envelope law is variant-independent — the W6 twin is the r129 arm above)', () => mergeGroupedPartials(W7_PLAN, [dimLabeledW7]), 'envelope_invalid');
 });
 
 // =============================================================================
