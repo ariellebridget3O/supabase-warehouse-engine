@@ -545,6 +545,11 @@ export function rankComparator(
   // Pre-flip value compare — values ONLY (both non-null, both the same
   // shape); the caller owns NULL placement and the direction flip.
   const valueCompare = (va: WhFinalAggValue, vb: WhFinalAggValue): number => {
+    // the wrapper places NULLs before ever calling this — the guard is for
+    // the TYPE (null rides typeof 'object'), never a behavioral branch
+    if (va === null || vb === null) {
+      throw new TypeError('rankComparator: valueCompare called with a NULL final (wrapper contract violated)');
+    }
     if (typeof va === 'object' && typeof vb === 'object') {
       // exact rational cross-multiply — the E2 hard clause, never a float
       const l = va.num * vb.den;
