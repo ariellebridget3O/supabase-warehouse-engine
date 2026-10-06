@@ -542,10 +542,9 @@ export function rankComparator(
   rankBy: WhRankBy,
   groupKeys: WhColumnPlan[],
 ): (a: WhGroupFinal, b: WhGroupFinal) => number {
+  // Pre-flip value compare — values ONLY (both non-null, both the same
+  // shape); the caller owns NULL placement and the direction flip.
   const valueCompare = (va: WhFinalAggValue, vb: WhFinalAggValue): number => {
-    if (va === null && vb === null) return 0;
-    if (va === null) return 1; // NULLs last — FIXED, direction-independent
-    if (vb === null) return -1;
     if (typeof va === 'object' && typeof vb === 'object') {
       // exact rational cross-multiply — the E2 hard clause, never a float
       const l = va.num * vb.den;
@@ -563,8 +562,23 @@ export function rankComparator(
     throw new TypeError('rankComparator: finalized value outside the v1 rank scope (avg|count|sum)');
   };
   return (a, b) => {
-    const c = valueCompare(a.aggs[rankBy.agg], b.aggs[rankBy.agg]);
-    if (c !== 0) return rankBy.direction === 'asc' ? c : -c;
+    const va = a.aggs[rankBy.agg];
+    const vb = b.aggs[rankBy.agg];
+    // NULL placement — decided OUTSIDE the direction flip (the
+    // makeTypedComparator :303-306 law: null returns come BEFORE the dir
+    // flip, which is exactly why placement stays FIXED when direction
+    // flips). NULLs LAST in BOTH directions; two NULLs are peers and fall
+    // through to the key-asc tiebreak.
+    if (va === null || vb === null) {
+      if (va === null && vb === null) {
+        // fall through to the tiebreak below (key-asc)
+      } else {
+        return va === null ? 1 : -1;
+      }
+    } else {
+      const c = valueCompare(va, vb);
+      if (c !== 0) return rankBy.direction === 'asc' ? c : -c;
+    }
     // explicit canonical key-ascending tiebreak — clause 7
     for (let i = 0; i < groupKeys.length; i++) {
       const kc = canonicalSlotOrder(a.k[i], b.k[i], groupKeys[i]);
