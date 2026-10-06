@@ -32,8 +32,9 @@ import {
   finalizeScalarAggs,
   mergeGroupedPartials,
   mergeScalarAggs,
+  rankComparator,
 } from './wh_merge.ts';
-import type { WhFinalAggValue, WhMergePlan } from './wh_merge.ts';
+import type { WhFinalAggValue, WhMergePlan, WhRankBy } from './wh_merge.ts';
 import {
   checkHandshake,
   derivePlanMergeOps,
@@ -214,6 +215,17 @@ export interface WhEngineRequest {
     // descriptor (WhJoinDescriptor above). Absent unless the request
     // carried a strictly-valid query.join.
     join?: WhJoinDescriptor;
+    // r148 (design_r147_g2_rankbyagg §1-2): the additive OPTIONAL rank_by
+    // directive — ranks the POST-merge grouped rows by an aggregate VALUE
+    // before the K slice (the canonical top-N analytics ask). Shape
+    // {agg, direction?} (WhRankBy in wh_merge.ts — the comparator's home).
+    // Absent/null => byte-identical to the pre-r148 key-ascending behavior
+    // (binding clause 1). Shape-only at parse (strict-when-present, null-
+    // lenient-absent, unknown keys INSIDE rejected); the BINDING check (the
+    // named aggregate EXISTS in the plan), the SCOPE check (avg|count|sum)
+    // and the grouped-only gate are PLAN-TIME at the end of buildMergePlan
+    // — the dim-binding parse-shape/plan-binding split precedent (r129).
+    rank_by?: WhRankBy;
   };
   coverage_mode: 'best_effort' | 'fail_fast';
   directory_snapshot?: string;
@@ -750,6 +762,44 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
     minShards = query.min_shards as number;
   }
 
+  // r148 (design_r147_g2_rankbyagg §1 binding clause 2): the additive
+  // OPTIONAL rank_by directive — strictly validated WHEN PRESENT;
+  // undefined/null => absent (the where/read_plane/join null-lenient
+  // precedent; `rank_by: null` IS the absent state). Unknown keys INSIDE
+  // rank_by are REJECTED (tighter than the outer query object's ignore —
+  // the V-3 outer law itself is untouched: WITHOUT this block a rank_by
+  // field would be silently DROPPED here, the lying-parser class). Reject
+  // ORDER is load-bearing and battery-pinned (arm 11): object → unknown
+  // keys → agg (non-empty string) → direction (enum literal) LAST — the
+  // join.variant precedent. Fixed-string messages: r57 law — name the
+  // var, never echo the input value. This is SHAPE-ONLY validation: the
+  // binding check (rank_by.agg names a plan aggregate), the scope check
+  // (avg|count|sum) and the grouped-only gate are PLAN-TIME at the end of
+  // buildMergePlan — parse knows aliases only (the dim-binding split
+  // precedent, r129).
+  let rankBy: WhRankBy | undefined;
+  if (query.rank_by !== undefined && query.rank_by !== null) {
+    if (typeof query.rank_by !== 'object' || Array.isArray(query.rank_by)) {
+      malformed('query.rank_by must be an object');
+    }
+    const rb = query.rank_by as Record<string, unknown>;
+    for (const k of Object.keys(rb)) {
+      if (k !== 'agg' && k !== 'direction') {
+        malformed('query.rank_by carries unknown keys (only agg|direction are allowed — rank directives are strictly validated)');
+      }
+    }
+    if (typeof rb.agg !== 'string' || (rb.agg as string).length === 0) {
+      malformed('query.rank_by.agg must be a non-empty string naming a plan aggregate');
+    }
+    if (rb.direction !== undefined && rb.direction !== 'asc' && rb.direction !== 'desc') {
+      malformed('query.rank_by.direction must be "asc" or "desc"');
+    }
+    rankBy = {
+      agg: rb.agg as string,
+      ...(rb.direction !== undefined ? { direction: rb.direction as 'asc' | 'desc' } : {}),
+    };
+  }
+
   return {
     v: 1,
     qid: r.qid,
@@ -762,6 +812,7 @@ export function parseWhEngineRequest(raw: unknown): WhEngineRequest {
       ...(fetchRows !== undefined ? { fetch_rows: fetchRows } : {}),
       ...(minShards !== undefined ? { min_shards: minShards } : {}),
       ...(join !== undefined ? { join } : {}),
+      ...(rankBy !== undefined ? { rank_by: rankBy } : {}),
     },
     coverage_mode: (r.coverage_mode as 'best_effort' | 'fail_fast') ?? 'best_effort',
     ...(r.directory_snapshot !== undefined ? { directory_snapshot: r.directory_snapshot as string } : {}),
@@ -817,6 +868,35 @@ export function buildMergePlan(
       ? { col, type: 'numeric', scale: columnScales?.[col] ?? 0 }
       : { col, type: t as 'int8' | 'text' | 'timestamptz' };
     plan.aggs[name] = { op: s.op, col, colPlan };
+  }
+
+  // r148 (design_r147_g2_rankbyagg §1 binding clauses 2+3, P1-2 fold): the
+  // rank_by BINDING gate — PRE-NETWORK (buildMergePlan is the first
+  // statement of executeWhQuery; the plan shape is final here). Gate order
+  // is load-bearing and battery-pinned (arm 11): (1) grouped-only — a
+  // scalar wave has nothing to rank, and a rank DIRECTIVE that silently
+  // no-ops is the lying-parser class (fetch_rows/limit inertness on scalar
+  // does NOT generalize); the predicate is EXACTLY the kind law (grouped =
+  // plan.groupKeys !== undefined, :2293); (2) NAME-membership — rank_by.agg
+  // must be a member of plan.aggs (the envelope keys the consumer sees:
+  // alias ?? 'op(col)' / 'count(*)'; the {op,col} reference form is
+  // REJECTED — no second matching path, the col-strict r130 law); the W8
+  // flagship avg(amount) ships UNALIASED so alias-only binding would make
+  // the canonical ask unrankable (both r147 audits converged); (3) SCOPE —
+  // v1 ranks {avg, count, sum} only (clause 5): min/max finals ride
+  // compareCanonical, a free extension NOT yet admitted. Fixed-string
+  // messages (r57 law): no input echo.
+  if (req.query.rank_by !== undefined) {
+    if (plan.groupKeys === undefined) {
+      malformed('query.rank_by requires a grouped query');
+    }
+    const pa = plan.aggs[req.query.rank_by.agg];
+    if (pa === undefined) {
+      malformed('query.rank_by.agg does not name an aggregate in the plan (rank binds by the aggregate NAME the envelope carries)');
+    }
+    if (pa.op !== 'avg' && pa.op !== 'count' && pa.op !== 'sum') {
+      malformed('query.rank_by.agg names a min/max aggregate — outside the v1 rank scope (avg|count|sum only)');
+    }
   }
   return plan;
 }
@@ -2359,6 +2439,21 @@ export async function executeWhQuery(args: ExecuteArgs): Promise<WhEngineRespons
     // (one untrimmed K per shard, trimmed only here at the end). The
     // truncation battery arm pins merged rows ≤ effectiveK on a multi-shard
     // wave (wh_join_test.ts fetch_rows block).
+    // r148 (design_r147_g2_rankbyagg §1 binding clauses 4+8): gate → rank
+    // → slice. The MAX_GROUPS gate above reads ONLY fin.length — a rank is
+    // a permutation, so gate-before-rank is observationally identical
+    // (pinned by the battery; the capacity verdict can never depend on the
+    // order). When rank_by is ARMED (shape at parse; grouped + scope +
+    // binding gates already passed at buildMergePlan), the finalized rows
+    // sort VALUE-first under the rankComparator law (exact BigInt
+    // cross-multiply; NULLs last FIXED; explicit canonical key-asc
+    // tiebreak) BEFORE the K slice — rows ride in RANK order. Absent ⇒ the
+    // sort is SKIPPED and the slice law is byte-identical to the pre-r148
+    // key-ascending behavior (binding clause 1 — every existing first-K
+    // pin stays green untouched).
+    if (args.req.query.rank_by !== undefined) {
+      fin.sort(rankComparator(args.req.query.rank_by, plan.groupKeys ?? []));
+    }
     const limitK = effectiveLimitK(args.req.query);
     response.rows = limitK === null ? fin : fin.slice(0, limitK);
     // r138 C1: the merged count_star = Σ over the FINALIZED rows (pre-slice)

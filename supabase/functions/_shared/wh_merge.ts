@@ -499,6 +499,81 @@ function sortedGroupKeys(plan: WhMergePlan, groups: Map<string, GroupState>): Gr
   });
 }
 
+/** r148 (design_r147_g2_rankbyagg §1-2): the additive OPTIONAL rank_by
+ *  directive — `query.rank_by = {agg, direction?}`. `agg` NAMES a plan
+ *  aggregate (the buildMergePlan envelope key the consumer sees: alias ??
+ *  'op(col)' / 'count(*)' — the W8 flagship avg(amount) ships UNALIASED, so
+ *  alias-only binding would make the canonical ask unrankable; the P1-2
+ *  fold both r147 audits converged on). The {op,col} reference form is NOT
+ *  admitted (col-strict r130 law: no second matching path). direction
+ *  defaults to 'desc' (top-N). Shape-only at parse; binding + scope +
+ *  grouped-only are PLAN-TIME gates (wh_engine_core buildMergePlan). */
+export interface WhRankBy {
+  agg: string;
+  direction?: 'asc' | 'desc';
+}
+
+/** The post-merge rank comparator over FINALIZED grouped rows
+ *  (design_r147_g2_rankbyagg §1 binding clauses 5-8). Pure function of
+ *  (merged set, rankBy, tie law) — the R1-R6 determinism law: band layout,
+ *  shard count and arrival order cannot change the output.
+ *
+ *  Value law (clause 5, EXACT — never float): avg pairs {num, den} compare
+ *  by BigInt cross-multiply num1*den2 vs num2*den1 (a float-quotient is a
+ *  REGISTERED MUTANT — battery arm 6b); count/count_col are JS numbers
+ *  (integer-gated accumulation); sum finals are scaled BigInts (ONE colPlan
+ *  scale per agg — same-scale compare is monotone; the wire 's' TEXT law is
+ *  bypassed, never parsed here — canonicalization already happened at merge
+ *  ingestion). den > 0 is STRUCTURAL: accToFinal emits a pair only when
+ *  c > 0 (c === 0 finalizes NULL first). min/max are OUT of the v1 rank
+ *  scope (the binding gate rejects them) — their string/bigint finals must
+ *  never reach this comparator (fail-closed TypeError if they do).
+ *
+ *  NULL law (clause 6): NULLs LAST, FIXED in BOTH directions — placement
+ *  NEVER flips with direction (the makeTypedComparator placement law);
+ *  two NULLs are peers (tie → key-asc). NULL groups are RANKED (in rows),
+ *  never excluded — exclusion would break the K-prefix contract.
+ *
+ *  Tie law (clause 7): canonical key-ASCENDING among value peers, EXPLICIT
+ *  in the comparator (never sort-stability — the input order is an
+ *  implementation detail; the battery kills the stability-reliant mutant
+ *  by reversing the pre-sort order before ranking). */
+export function rankComparator(
+  rankBy: WhRankBy,
+  groupKeys: WhColumnPlan[],
+): (a: WhGroupFinal, b: WhGroupFinal) => number {
+  const valueCompare = (va: WhFinalAggValue, vb: WhFinalAggValue): number => {
+    if (va === null && vb === null) return 0;
+    if (va === null) return 1; // NULLs last — FIXED, direction-independent
+    if (vb === null) return -1;
+    if (typeof va === 'object' && typeof vb === 'object') {
+      // exact rational cross-multiply — the E2 hard clause, never a float
+      const l = va.num * vb.den;
+      const r = vb.num * va.den;
+      return l < r ? -1 : l > r ? 1 : 0;
+    }
+    if (typeof va === 'object' || typeof vb === 'object') {
+      // one agg name = one accumulator kind; mixed shapes are structurally
+      // impossible — fail-closed loud, never silently wrong
+      throw new TypeError('rankComparator: mixed finalized shapes for one aggregate name');
+    }
+    if (typeof va === 'bigint' && typeof vb === 'bigint') return va < vb ? -1 : va > vb ? 1 : 0;
+    if (typeof va === 'number' && typeof vb === 'number') return va < vb ? -1 : va > vb ? 1 : 0;
+    // min/max string finals: outside the v1 rank scope (binding gate)
+    throw new TypeError('rankComparator: finalized value outside the v1 rank scope (avg|count|sum)');
+  };
+  return (a, b) => {
+    const c = valueCompare(a.aggs[rankBy.agg], b.aggs[rankBy.agg]);
+    if (c !== 0) return rankBy.direction === 'asc' ? c : -c;
+    // explicit canonical key-ascending tiebreak — clause 7
+    for (let i = 0; i < groupKeys.length; i++) {
+      const kc = canonicalSlotOrder(a.k[i], b.k[i], groupKeys[i]);
+      if (kc !== 0) return kc;
+    }
+    return 0;
+  };
+}
+
 /** Finalize a merged GROUPED envelope into final rows. Group keys are
  *  canonical (bigint for int8 slots, string for text/timestamps, null for
  *  SQL NULL); output order is deterministic (canonical asc, nulls last). */
