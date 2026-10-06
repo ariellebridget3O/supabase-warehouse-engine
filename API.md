@@ -71,13 +71,14 @@ The handler locates the `/warehouse-engine` marker inside `url.pathname` and rou
 
 ### `query.join` — co-located agg-join (r129)
 
-Optional descriptor inside the `query` object (camelCase `groupBy` composes with it — grouped rows shape). Wire grammar (the only join binding live today, template class W6):
+Optional descriptor inside the `query` object (camelCase `groupBy` composes with it — grouped rows shape). Wire grammar (the optional `variant` key is the r133 discriminator; r144 names THREE live join templates — see below):
 
 ```json
 {
   "table": "wh_probe_dim",
   "type": "inner",
-  "on": { "left": "region", "right": "region" }
+  "on": { "left": "region", "right": "region" },
+  "variant": "tier2"
 }
 ```
 
@@ -86,14 +87,17 @@ Strict parse law (`wh_engine_core.ts:536-583`; every violation a fixed-string `4
 - `table` — plain identifier (`IDENT_RE`) and must **differ** from the query table (self-join is not v1).
 - `type` — the literal `"inner"` only.
 - `on` — object with **only** `left`/`right` keys, both plain identifiers. Unknown keys inside `join` OR inside `join.on` are rejected (tighter than the outer query object's ignore, which is untouched).
+- `variant` — OPTIONAL (r133; absent ⇒ the descriptor parses byte-identically to pre-r133). Present must be the literal `"tier2"` — any other value/type is `400 malformed` — and the check is LAST in the block, so every earlier reject fires unchanged.
+
+**Live join templates (the three join-class manifest rows):** `W6_colocated_join_agg` (no `variant` — the base binding), `W7_dim_tier_join_agg` (`variant:"tier2"` — the body adds the `and d.tier = 2` filter), and `W8_dim_tier_join_avg` (`variant:"tier2"` — the first GROUPED avg: `avg` is served by fusing the template's same-col `sum`+`count_col` encodings into the exact-rational pair, `merge_ops` declaring `avg_pair`). Derivation partition: join plans derive templates by kind + join-class + variant + opset-subset — a tier2 avg plan derives ONLY W8, a tier2 sum plan ONLY W7, and a mixed sum+avg plan derives ZERO ⇒ `400 plan_untemplated` (planner-honest).
 
 Plan-time gates (all `400` via the entrypoint ladder — no 500 fall-through):
 
-- **`join_template_required`** — a join request must derive the join-class template (W6, the manifest row carrying the `join` binding) over the `wh_query` RPC plane; non-join-class templates never serve join plans (derivation is join-aware: non-join plans EXCLUDE join-class rows, join plans derive ONLY them).
+- **`join_template_required`** — a join request must derive a join-class template (a manifest row carrying the `join` binding — W6/W7/W8) over the `wh_query` RPC plane; non-join-class templates never serve join plans (derivation is join-aware: non-join plans EXCLUDE join-class rows, join plans derive ONLY them). **r133 dim-binding arm:** the request's `join.table` must also EQUAL the selected template's manifest `join.dim` — a template IS selected, it just serves a different dim (the wrong-dim silent-execution hazard; the body executes its hardcoded dim).
 - **`join_key_mismatch`** — the request's `on.left`/`on.right` must EQUAL the selected template's declared manifest `join.{left,right}` (the template body hardcodes the keys — a wrong bind would silently return a WRONG oracle).
 - **`join_not_colocated`** — fail-closed colocation gate: the dim relation must be broadcast-reference (`is_reference === true` on every dim placement — undefined/false ⇒ reject) and EXACTLY ONE serving-or-draining dim placement must exist on every selected ref.
 
-**The bare-count law (col-strict adapter law):** the join plan's row-count agg must be a BARE count — `{"op":"count","alias":"n"}` with **no `col`**. The adapter matches a plan agg to a template encoding only when the (op, col) pair is identical — a bare `count(*)` never matches a col-scoped encoding and vice versa. W6's `n` encoding is bare, so a col-scoped count (e.g. `count(id)`) makes the plan unservable ⇒ every shard returns `envelope_invalid`/excluded ⇒ the request fails 400 (proven live r130).
+**The bare-count law (col-strict adapter law):** the join plan's row-count agg must be a BARE count — `{"op":"count","alias":"n"}` with **no `col`**. The adapter matches a plan agg to a template encoding only when the (op, col) pair is identical — a bare `count(*)` never matches a col-scoped encoding and vice versa. The join templates' `n` encoding is bare, so a col-scoped count (e.g. `count(id)`) makes the plan unservable ⇒ every shard returns `envelope_invalid`/excluded ⇒ the request fails 400 (proven live r130).
 
 ### Processing order (exact)
 
@@ -145,7 +149,7 @@ The engine envelope (grouped plans carry `rows`, scalar plans carry `result`):
 | `page_unavailable` | 409 | pagination beyond v0 (e.g. `OFFSET > 0`) |
 | `quorum_unmet` | 409 | merge quorum not reached |
 | `plan_untemplated` | 400 | plan-honesty 4xx (rpcMode plane only — no template covers the plan) |
-| `join_template_required` | 400 | a `query.join` request derived a NON-join-class template — join plans require the join-class template (W6) over the RPC plane |
+| `join_template_required` | 400 | a `query.join` request derived a NON-join-class template — join plans require a join-class template (W6/W7/W8) over the RPC plane; also fired when the request's `join.table` ≠ the selected template's manifest `join.dim` binding (r133 dim-binding arm) |
 | `join_key_mismatch` | 400 | the request's `join.on.{left,right}` do not equal the selected join template's declared manifest `join` binding |
 | `join_not_colocated` | 400 | colocation gate fail-closed: the dim relation is not broadcast-reference (`is_reference !== true` somewhere) or lacks exactly one serving-or-draining placement on a selected ref |
 | anything else | 500 | internal |
