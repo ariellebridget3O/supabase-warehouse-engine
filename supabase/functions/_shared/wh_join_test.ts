@@ -56,7 +56,8 @@ import type {
   WhShardFetcher,
 } from './wh_engine_core.ts';
 import { deriveTemplateHashes, ENGINE_TEMPLATE_MANIFEST, manifestRowByHash } from './wh_handshake.ts';
-import { finalizeGroups, mergeGroupedPartials } from './wh_merge.ts';
+import { finalizeGroups, mergeGroupedPartials, rankComparator } from './wh_merge.ts';
+import type { WhGroupFinal } from './wh_merge.ts';
 import { WhMergeError } from './wh_types.ts';
 import type { WhPartialEnvelope } from './wh_types.ts';
 import { handleWhEngineRequest } from './wh_entrypoint.ts';
@@ -1500,6 +1501,272 @@ Deno.test('r138 B1 arm 4 (join guard): the W6 join wave NEVER arms the row-estim
     { k: ['g01'], aggs: { x: 110n, c: 5, n: 5 } },
   ]);
   eq('B1 arm 4: the wave is a complete 2/2 (preconditions: placements plane, bare count n present, limitK null, full coverage — only the join wall remains)', [res.coverage, res.partial], ['2/2', false]);
+});
+
+// =============================================================================
+// §6.7 — r148 G2 post-merge rank-by-agg (design_r147_g2_rankbyagg §3): 12
+// arms + unit comparator arms, every expectation HAND-COMPUTED from the
+// fixture numbers via an independent exact-rational oracle (Python
+// Fraction), never from a run. MUTANT KILL-CITES (commit-before-mutant,
+// ONE at a time, RED-proof each):
+//   M1 float-quotient comparator  -> REDs arm 6b (+ arm 1's exact pairs)
+//   M2 direction flips NULL placement -> REDs the NULL unit arm + arm 8
+//   M3 missing tiebreak (sort-stability reliance) -> REDs arm 6c
+//   M4 silent parse drop          -> REDs arm 1 (rows stay key-asc)
+//   M5 alias-only binding         -> REDs arm 1 (400 instead of ranked rows)
+//   M6 missing scalar gate        -> REDs arm 11's scalar arm
+//
+// ERRATUM (P1 finding, banked r148 — carried to the r149 review): the
+// design doc §3 arm-4 top-5 lists [g37,g16,g01,g04,g07] — a hand-
+// computation transposition. g16 and g37 BOTH carry c=278 in E16 (the
+// fixture), and binding clause 7 (canonical key-ASCENDING among value
+// peers) orders g16 < g37. The law-correct order [g16,g37,g01,g04,g07] is
+// what this battery pins; the audits' own full-order computation agrees.
+// =============================================================================
+const G2_AVG_DESC_FULL = ['g13', 'g40', 'g04', 'g49', 'g46', 'g37', 'g19', 'g10', 'g34', 'g01', 'g28', 'g43', 'g16', 'g07', 'g31', 'g25', 'g22'];
+const rowByRegion = new Map(E16_W8_FINAL.map((r) => [r.k[0] as string, r]));
+const ranked = (order: string[]) => order.map((rg) => rowByRegion.get(rg) as (typeof E16_W8_FINAL)[number]);
+const g2arm = (query: Record<string, unknown>) => {
+  const base = w8avgReqBody();
+  return { ...base, query: { ...(base.query as Record<string, unknown>), ...query } };
+};
+const rankWave = (query: Record<string, unknown>, seen: SeenCall[]) => executeWhQuery(joinExecArgs({
+  reqOverride: parseWhEngineRequest(g2arm(query)),
+  facts: [factRow('shard-a'), factRow('shard-b'), factRow('shard-c')],
+  dims: [dimRow('shard-a', { isReference: true }), dimRow('shard-b', { isReference: true }), dimRow('shard-c', { isReference: true })],
+  fetcher: recordingFetch({ 'shard-a': w8wire(W8_BANDS.A), 'shard-b': w8wire(W8_BANDS.B), 'shard-c': w8wire(W8_BANDS.C) }, seen),
+  templateHashes: [W8H],
+  rpcMode: true,
+}));
+const rankWaveEnv = (query: Record<string, unknown>, rows: E15Row[]) => executeWhQuery(joinExecArgs({
+  reqOverride: parseWhEngineRequest(g2arm(query)),
+  facts: [factRow('shard-a')],
+  dims: [dimRow('shard-a', { isReference: true })],
+  fetcher: recordingFetch({ 'shard-a': w8env('shard-a', rows) }, []),
+  templateHashes: [W8H],
+}));
+// NULL-sink variant: c=0 rows carry the avg pair {s:null, c:0} — the
+// s:null <=> c:0 PAIRING LAW (a {s:'0', c:0} partial is envelope_invalid:
+// the accumulator identity requires s null exactly when c is 0).
+const rankWaveEnvNull = (query: Record<string, unknown>, rows: E15Row[]) => {
+  const base = w8env('shard-a', rows);
+  const env: WhPartialEnvelope = {
+    ...base,
+    partial: {
+      ...base.partial,
+      rows: rows.map((r) => ({
+        k: [r.region],
+        a: { 'avg(amount)': r.c === 0 ? { s: null, c: 0 } : { s: String(r.x), c: r.c }, c: r.c, n: r.n },
+      })),
+    },
+  };
+  return executeWhQuery(joinExecArgs({
+    reqOverride: parseWhEngineRequest(g2arm(query)),
+    facts: [factRow('shard-a')],
+    dims: [dimRow('shard-a', { isReference: true })],
+    fetcher: recordingFetch({ 'shard-a': env }, []),
+    templateHashes: [W8H],
+  }));
+};
+// plan-time gates live in buildMergePlan (the first statement of
+// executeWhQuery — pre-network); direct-call it the way
+// wh_handshake_test.ts ARM_A_PLAN does.
+const planOf = (body: Record<string, unknown>) => buildMergePlan(parseWhEngineRequest(body), { columnTypes: COLS, columnScales: SCALES });
+
+Deno.test('r148 G2 arm 1 (the discriminator): W8 + rank_by {agg:"avg(amount)"} desc, K=5 => rows = [g13,g40,g04,g49,g46] EXACT rationals — ZERO of 5 positions match the key-asc first-5; rpc specs stay p_params:{} ×3 (rank is POST-merge, the shard plane never sees rank_by); partial_rows still 17×3', async () => {
+  const seen: SeenCall[] = [];
+  const res = await rankWave({ limit: 5, rank_by: { agg: 'avg(amount)' } }, seen);
+  eq('rows = top-5 by EXACT rational avg desc (the banked order — hand-computed, zero ties)', res.rows, ranked(G2_AVG_DESC_FULL.slice(0, 5)));
+  eq('ZERO overlap check: the rank top-5 shares NO position with the key-asc first-5 (maximally discriminative)', res.rows?.map((r) => r.k[0]), ['g13', 'g40', 'g04', 'g49', 'g46']);
+  eq('rpc specs byte-pin WITH rank_by armed: {p_template_hash: W8H, p_params: {}} ×3 (the r139 grouped law holds — rank_by rides NO param)', seen.map((s) => s.rpc), [
+    { p_template_hash: W8H, p_params: {} },
+    { p_template_hash: W8H, p_params: {} },
+    { p_template_hash: W8H, p_params: {} },
+  ]);
+  eq('perShard partial_rows still 17×3 (unsharded echo)', res.perShard.map((p) => [p.ok, p.partial_rows, (p.partial_bytes ?? 0) > 0]), [[true, 17, true], [true, 17, true], [true, 17, true]]);
+  eq('clamp + rank did not disturb the wave: coverage 3/3, partial false, warnings []', [res.coverage, res.partial, res.warnings], ['3/3', false, []]);
+});
+
+Deno.test('r148 G2 arm 2 (disarm byte-identity): the SAME wave with rank_by ABSENT => byte-identical to the r144 K=5 key-asc pin (binding clause 1)', async () => {
+  const seen: SeenCall[] = [];
+  const res = await rankWave({ limit: 5 }, seen);
+  eq('rows = the FIRST 5 of the 17 canonical key-asc (the pre-r148 law — g01,g04,g07,g10,g13)', res.rows, E16_W8_FINAL.slice(0, 5));
+  eq('rpc specs identical to the armed twin ({} ×3 — only the ROW ORDER differs)', seen.map((s) => s.rpc), [
+    { p_template_hash: W8H, p_params: {} },
+    { p_template_hash: W8H, p_params: {} },
+    { p_template_hash: W8H, p_params: {} },
+  ]);
+});
+
+Deno.test('r148 G2 arm 3 (asc twin): direction:"asc" => EXACT value-reverse of desc over the 17 (no ties, no NULLs on E16); K absent => all 17 ranked', async () => {
+  const resDesc = await rankWaveEnv({ rank_by: { agg: 'avg(amount)', direction: 'desc' } }, E16.rows);
+  const resAsc = await rankWaveEnv({ rank_by: { agg: 'avg(amount)', direction: 'asc' } }, E16.rows);
+  eq('desc full order == the banked 17-order', resDesc.rows?.map((r) => r.k[0]), G2_AVG_DESC_FULL);
+  eq('asc full order == EXACT reverse (values flip, nothing else)', resAsc.rows?.map((r) => r.k[0]), [...G2_AVG_DESC_FULL].reverse());
+});
+
+Deno.test('r148 G2 arm 4 (natural tie): rank_by {agg:"c"} desc, K=5 => [g16,g37,g01,g04,g07] — the 278 pair in key-asc order (g16<g37), then the 15-way 277 tie key-asc. ERRATUM: the design doc lists [g37,g16,...] — see the §6.7 header (clause-7 law wins; independent oracle)', async () => {
+  const res = await rankWaveEnv({ limit: 5, rank_by: { agg: 'c' } }, E16.rows);
+  eq('top-5 by count_col desc with key-asc ties', res.rows, ranked(['g16', 'g37', 'g01', 'g04', 'g07']));
+  eq('the tie values themselves: c = [278, 278, 277, 277, 277]', res.rows?.map((r) => r.aggs.c), [278, 278, 277, 277, 277]);
+});
+
+Deno.test('r148 G2 arm 5 (all-tie degenerate): rank_by {agg:"n"} — count(*)=280 ∀17 => rank is the IDENTITY permutation; output byte-identical to key-asc in BOTH directions (direction is inert on an all-tie)', async () => {
+  const resDesc = await rankWaveEnv({ limit: 5, rank_by: { agg: 'n' } }, E16.rows);
+  const resAsc = await rankWaveEnv({ limit: 5, rank_by: { agg: 'n', direction: 'asc' } }, E16.rows);
+  eq('desc == key-asc first-5', resDesc.rows, E16_W8_FINAL.slice(0, 5));
+  eq('asc == the SAME first-5 (direction cannot matter when every value ties)', resAsc.rows, E16_W8_FINAL.slice(0, 5));
+});
+
+Deno.test('r148 G2 arm 9 (K>groups passthrough): limit 25 over 17 groups => ALL 17 rows in the full rank order (slice clamps, rank survives)', async () => {
+  const res = await rankWaveEnv({ limit: 25, rank_by: { agg: 'avg(amount)' } }, E16.rows);
+  eq('all 17 rows, full banked rank order', res.rows?.map((r) => r.k[0]), G2_AVG_DESC_FULL);
+  eq('and the row BODIES are byte-identical to the E16 projection', res.rows, ranked(G2_AVG_DESC_FULL));
+});
+
+Deno.test('r148 G2 arm 10 (K=0 + zero rows): rank_by + limit:0 => []; rank_by + fetch_rows:0 => the SAME 400 (the positive-int law is NOT relaxed for rank requests); rank over a 0-row partial wave => []', async () => {
+  const res0 = await rankWaveEnv({ limit: 0, rank_by: { agg: 'avg(amount)' } }, E16.rows);
+  eq('limit:0 + rank => [] (slice(0,0) — the :711 law holds armed)', res0.rows, []);
+  throwsEngine('fetch_rows:0 + rank => malformed (no-op masquerading as a clamp — unchanged)', () => parseWhEngineRequest(g2arm({ fetch_rows: 0, rank_by: { agg: 'avg(amount)' } })), 'malformed', 'query.fetch_rows must be a positive integer or null');
+  const resEmpty = await rankWaveEnv({ rank_by: { agg: 'avg(amount)' } }, []);
+  eq('rank over an empty (0-row) grouped wave => [] (no special case)', resEmpty.rows, []);
+});
+
+Deno.test('r148 G2 arm 11 (rejects + order-of-rejects pins): scalar gate, membership, {op,col} form, unknown keys, direction LAST, null-lenient-absent, min/max scope — every message the r57 fixed-string law', () => {
+  // scalar gate (binding clause 3 — PLAN time, buildMergePlan; parse accepts the shape)
+  const scalarBody = { v: 1, qid: 'g2-scalar', table: 'wh_probe_agg', query: { select: [{ op: 'count' }], rank_by: { agg: 'count(*)' } } };
+  throwsEngine('scalar wave + rank_by => 400 (a silent no-op directive is the lying-parser class; M6 kill-site)', () => planOf(scalarBody), 'malformed', 'query.rank_by requires a grouped query');
+  // membership (grouped, unknown name — PLAN time)
+  throwsEngine('grouped + rank_by.agg unknown => 400 (NAME-membership binding)', () => planOf(g2arm({ rank_by: { agg: 'nope(amount)' } })), 'malformed', 'query.rank_by.agg does not name an aggregate in the plan (rank binds by the aggregate NAME the envelope carries)');
+  // {op,col} reference form REJECTED at parse (agg must be a STRING — no second matching path)
+  throwsEngine('rank_by.agg as {op,col} object => 400 (the reference form is NOT admitted — col-strict r130)', () => parseWhEngineRequest(g2arm({ rank_by: { agg: { op: 'avg', col: 'amount' } } })), 'malformed', 'query.rank_by.agg must be a non-empty string naming a plan aggregate');
+  // shape rejects (parse)
+  throwsEngine('rank_by as a bare string => 400 (must be an object)', () => parseWhEngineRequest(g2arm({ rank_by: 'c' })), 'malformed', 'query.rank_by must be an object');
+  throwsEngine('rank_by with an unknown key ("order") => 400 (tighter-than-outer, the join precedent)', () => parseWhEngineRequest(g2arm({ rank_by: { agg: 'c', order: 'desc' } })), 'malformed', 'query.rank_by carries unknown keys (only agg|direction are allowed — rank directives are strictly validated)');
+  throwsEngine('rank_by.direction not the enum => 400 (checked LAST — the variant-last precedent)', () => parseWhEngineRequest(g2arm({ rank_by: { agg: 'c', direction: 'sideways' } })), 'malformed', 'query.rank_by.direction must be "asc" or "desc"');
+  throwsEngine('rank_by.agg empty string => 400', () => parseWhEngineRequest(g2arm({ rank_by: { agg: '' } })), 'malformed', 'query.rank_by.agg must be a non-empty string naming a plan aggregate');
+  // ORDER pins: unknown-keys fire BEFORE agg; agg fires BEFORE direction
+  throwsEngine('order pin A: {agg:123, direction:"sideways", order:"x"} => unknown-keys FIRST', () => parseWhEngineRequest(g2arm({ rank_by: { agg: 123, direction: 'sideways', order: 'x' } })), 'malformed', 'query.rank_by carries unknown keys');
+  throwsEngine('order pin B: {agg:123, direction:"sideways"} => agg BEFORE direction (direction is LAST)', () => parseWhEngineRequest(g2arm({ rank_by: { agg: 123, direction: 'sideways' } })), 'malformed', 'query.rank_by.agg must be a non-empty string naming a plan aggregate');
+  // null-lenient-absent: rank_by:null IS the absent state
+  const nulled = parseWhEngineRequest(g2arm({ rank_by: null }));
+  eqTrue('rank_by:null parses ABSENT (no rank_by key in the normalized query — the where/read_plane precedent)', !('rank_by' in nulled.query));
+  // normalized shape
+  const shaped = parseWhEngineRequest(g2arm({ rank_by: { agg: 'c', direction: 'asc' } }));
+  eq('normalized rank_by carries EXACTLY {agg, direction} (no echo of unknowns, no extras)', shaped.query.rank_by, { agg: 'c', direction: 'asc' });
+  const minimal = parseWhEngineRequest(g2arm({ rank_by: { agg: 'c' } }));
+  eq('normalized rank_by without direction carries EXACTLY {agg} (default desc is a COMPARATOR default, never materialized)', minimal.query.rank_by, { agg: 'c' });
+  // 11b (impl-added, clause-5 scope): min/max names are OUT of the v1 rank scope (PLAN time)
+  const minBody = { v: 1, qid: 'g2-scope', table: 'wh_probe_agg', query: { select: [{ op: 'min', col: 'amount' }], groupBy: ['region'], rank_by: { agg: 'min(amount)' } } };
+  throwsEngine('rank_by naming a min aggregate => 400 (clause-5 scope: v1 ranks avg|count|sum; min/max is a free extension NOT yet admitted)', () => planOf(minBody), 'malformed', 'query.rank_by.agg names a min/max aggregate — outside the v1 rank scope (avg|count|sum only)');
+  // ORDER of the plan-time gates: scalar gate BEFORE membership (a scalar request with a garbage agg name reports the scalar violation)
+  const scalarBadName = { v: 1, qid: 'g2-order', table: 'wh_probe_agg', query: { select: [{ op: 'count' }], rank_by: { agg: 'nope' } } };
+  throwsEngine('plan-gate order: scalar+unknown-agg => the SCALAR message fires first', () => planOf(scalarBadName), 'malformed', 'query.rank_by requires a grouped query');
+});
+
+Deno.test('r148 G2 arm 12 (1001-band byte-pin): the pre-POST max_rows_exceeded refusal is rank-AGNOSTIC (reads planRef.limitK only) — armed request refuses byte-identically with ZERO shard POSTs; the 1000 boundary passes and ranks', async () => {
+  const seen: SeenCall[] = [];
+  const res = await rankWave({ fetch_rows: 1001, rank_by: { agg: 'avg(amount)' } }, seen);
+  eq('refusal warnings ×3 (max_rows_exceeded, est_rows 0, retried false — the r133 shape, rank-agnostic)', res.warnings.map((w) => [w.shard, w.code, w.est_rows, w.retried]), [['shard-a', 'max_rows_exceeded', 0, false], ['shard-b', 'max_rows_exceeded', 0, false], ['shard-c', 'max_rows_exceeded', 0, false]]);
+  eq('ZERO POSTs (pre-POST refusal — the fetcher was never called)', seen.length, 0);
+  eq('perShard all not-ok, coverage 0/3', [res.perShard.map((p) => p.ok), res.coverage], [[false, false, false], '0/3']);
+  const seenOk: SeenCall[] = [];
+  const resOk = await rankWave({ fetch_rows: 1000, rank_by: { agg: 'avg(amount)' } }, seenOk);
+  eq('boundary PASS: fetch_rows:1000 + rank => all 17 rows, still in RANK order (K=1000 clamps nothing)', resOk.rows?.map((r) => r.k[0]), G2_AVG_DESC_FULL);
+});
+
+Deno.test('r148 G2 arm 8 (E2E NULL sink): synthetic c=0 groups (avg pair {s:null,c:0} — the pairing law) finalize avg NULL — ranked LAST in BOTH directions, NEVER excluded; two NULLs are peers (key-asc among themselves)', async () => {
+  const wave = [...E16.rows, { region: 'gz', x: 0, c: 0, n: 280 }, { region: 'gz2', x: 0, c: 0, n: 280 }];
+  const resDesc = await rankWaveEnvNull({ rank_by: { agg: 'avg(amount)' } }, wave);
+  eq('desc: 19 rows, top = g13 (the banked order holds above the NULLs)', resDesc.rows?.length, 19);
+  eq('desc: first 17 == the banked rank order (NULLs never displace values)', resDesc.rows?.slice(0, 17).map((r) => r.k[0]), G2_AVG_DESC_FULL);
+  eq('desc: LAST two = the NULL pair in key-asc [gz, gz2]', resDesc.rows?.slice(17).map((r) => r.k[0]), ['gz', 'gz2']);
+  eq('desc: the NULL rows carry avg null (in rows, never excluded)', resDesc.rows?.slice(17).map((r) => r.aggs['avg(amount)']), [null, null]);
+  const resAsc = await rankWaveEnvNull({ rank_by: { agg: 'avg(amount)', direction: 'asc' } }, wave);
+  eq('asc: FIRST = g22 (smallest avg — the value law flips), LAST two STILL [gz, gz2] (placement FIXED)', [
+    resAsc.rows?.[0]?.k[0],
+    resAsc.rows?.slice(17).map((r) => r.k[0]),
+  ], ['g22', ['gz', 'gz2']]);
+});
+
+Deno.test('r148 G2 acceptance (zero registry/derivation/manifest surface): derivation is rank-BLIND — the armed request derives [W8H] exactly like the unarmed twin; rpcParams grouped {}; manifest row intact', () => {
+  const armed = parseWhEngineRequest(g2arm({ rank_by: { agg: 'avg(amount)' } }));
+  const unarmed = parseWhEngineRequest(w8avgReqBody());
+  eq('deriveTemplateHashes(plan view) == [W8H] for BOTH (rank_by is NOT a derivation input — DerivePlanView untouched)', [
+    deriveTemplateHashes(entrypointPlanView(armed) as never, 1),
+    deriveTemplateHashes(entrypointPlanView(unarmed) as never, 1),
+  ], [[W8H], [W8H]]);
+  eq('rpcParams(W8 plan, armed query) == {} (byte-identical to the unarmed law)', rpcParams(W8_PLAN, armed.query), {});
+  eqTrue('manifest row by W8H still present (zero registry change)', manifestRowByHash(W8H) !== null);
+  eqTrue('the armed and unarmed plan VIEWS are deep-equal (table+groupKeys+join+aggs — the :1008 shape)', deepEq(entrypointPlanView(armed), entrypointPlanView(unarmed)));
+});
+
+Deno.test('r148 G2 arm 6 (unit, comparator law): equal fractions tie => key-asc peers BOTH directions; float64-colliding distinct rationals order EXACTLY (the M1 float-mutant killer)', () => {
+  const rk = (rows: WhGroupFinal[], agg: string, dir?: 'asc' | 'desc') => [...rows].sort(rankComparator(dir ? { agg, direction: dir } : { agg }, [{ col: 'region', type: 'text' }]));
+  // 6a: 100/3 vs 200/6 — equal EXACTLY (100*6 == 200*3 == 600) => tie => key-asc
+  const eqf: WhGroupFinal[] = [
+    { k: ['gb'], aggs: { 'avg(amount)': { num: 200n, den: 6n } } },
+    { k: ['ga'], aggs: { 'avg(amount)': { num: 100n, den: 3n } } },
+  ];
+  eq('equal fractions, input reversed => key-asc [ga, gb] in BOTH directions (a float quotient ALSO ties here — 6a pins the tie law, 6b pins exactness)', [
+    rk(eqf, 'avg(amount)', 'desc').map((r) => r.k[0]),
+    rk(eqf, 'avg(amount)', 'asc').map((r) => r.k[0]),
+  ], [['ga', 'gb'], ['ga', 'gb']]);
+  // 6b: (2^53+1)/2^53 vs 1/1 — Number(2^53+1) rounds to 2^53 so BOTH float
+  // quotients are 1.0 (COLLIDE), but the exact cross-multiply differs.
+  const coll: WhGroupFinal[] = [
+    { k: ['ga'], aggs: { 'avg(amount)': { num: 1n, den: 1n } } },
+    { k: ['gb'], aggs: { 'avg(amount)': { num: 9007199254740993n, den: 9007199254740992n } } },
+  ];
+  eq('float-colliding rationals: exact desc = [gb, ga] (a float mutant would TIE => key-asc [ga, gb] — the registered mutant order, M1 kill-site)', rk(coll, 'avg(amount)', 'desc').map((r) => r.k[0]), ['gb', 'ga']);
+  eq('float-colliding rationals: exact asc = [ga, gb]', rk(coll, 'avg(amount)', 'asc').map((r) => r.k[0]), ['ga', 'gb']);
+});
+
+Deno.test('r148 G2 arm 6c (unit, tie law is EXPLICIT): reverse-shuffled input with value ties STILL ranks key-asc — the M3 stability-reliant mutant REDs here (it would echo the reversed order)', () => {
+  const tied: WhGroupFinal[] = [
+    { k: ['g05'], aggs: { c: 277 } },
+    { k: ['g03'], aggs: { c: 277 } },
+    { k: ['g04'], aggs: { c: 277 } },
+  ];
+  const out = [...tied].sort(rankComparator({ agg: 'c', direction: 'desc' }, [{ col: 'region', type: 'text' }]));
+  eq('ties under desc, input already reversed => STILL key-asc [g03, g04, g05]', out.map((r) => r.k[0]), ['g03', 'g04', 'g05']);
+});
+
+Deno.test('r148 G2 arm 7 (unit, NULL law): NULLs LAST FIXED in BOTH directions (the M2 mutant kill-site); two NULLs are peers; NULL ranks after ANY value', () => {
+  const rk = (rows: WhGroupFinal[], dir: 'asc' | 'desc') => [...rows].sort(rankComparator({ agg: 'avg(amount)', direction: dir }, [{ col: 'region', type: 'text' }]));
+  const rows: WhGroupFinal[] = [
+    { k: ['ga'], aggs: { 'avg(amount)': null } },
+    { k: ['gb'], aggs: { 'avg(amount)': { num: 5n, den: 2n } } },
+    { k: ['gc'], aggs: { 'avg(amount)': null } },
+    { k: ['gd'], aggs: { 'avg(amount)': { num: 7n, den: 2n } } },
+  ];
+  eq('desc: values desc [gd(3.5), gb(2.5)] then NULLs last key-asc [ga, gc]', rk(rows, 'desc').map((r) => r.k[0]), ['gd', 'gb', 'ga', 'gc']);
+  eq('asc: values asc [gb, gd] then NULLs STILL last [ga, gc] (placement NEVER flips)', rk(rows, 'asc').map((r) => r.k[0]), ['gb', 'gd', 'ga', 'gc']);
+});
+
+Deno.test('r148 G2 (unit, sum law): scaled BigInt finals compare exactly (ONE colPlan scale per agg — same-scale monotone; the wire s-TEXT law is bypassed, canonicalization already happened at ingestion); sum NULL (empty-input, E14) ranks LAST both directions', () => {
+  const rk = (rows: WhGroupFinal[], dir: 'asc' | 'desc') => [...rows].sort(rankComparator({ agg: 'x', direction: dir }, [{ col: 'region', type: 'text' }]));
+  const rows: WhGroupFinal[] = [
+    { k: ['ga'], aggs: { x: 1000n } },
+    { k: ['gb'], aggs: { x: null } },
+    { k: ['gc'], aggs: { x: 999n } },
+  ];
+  eq('sum desc: [ga(1000), gc(999), gb(null) last]', rk(rows, 'desc').map((r) => r.k[0]), ['ga', 'gc', 'gb']);
+  eq('sum asc: [gc(999), ga(1000), gb(null) STILL last]', rk(rows, 'asc').map((r) => r.k[0]), ['gc', 'ga', 'gb']);
+});
+
+Deno.test('r148 G2 (unit, fail-closed depth): a min/max STRING final reaching the comparator throws TypeError (the binding scope gate makes it unreachable E2E — defense in depth, never silently wrong)', () => {
+  const rows: WhGroupFinal[] = [
+    { k: ['ga'], aggs: { 'max(amount)': 'abc' } },
+    { k: ['gb'], aggs: { 'max(amount)': 'abd' } },
+  ];
+  let threw = '';
+  try {
+    [...rows].sort(rankComparator({ agg: 'max(amount)' }, [{ col: 'region', type: 'text' }]));
+  } catch (err) {
+    threw = err instanceof TypeError ? 'TypeError' : String(err);
+  }
+  eq('min/max string final => TypeError (fail-closed loud)', threw, 'TypeError');
 });
 
 // -----------------------------------------------------------------------------
