@@ -152,6 +152,12 @@ const W6H = '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576';
 // — the tier2 join-class row APPENDED at manifest index 6 (provenance:
 // design_r132_w7_family.md §2.2; never widened silently).
 const W7H = 'e6d40cbe1d5da2587492c07076b97ec1e716deaf5cefa2b3098038bee98b79bb';
+// r144 (agent-ctx/r140-w7-census.md §6): W8 = sha256 of
+// db/shard-templates/W8_dim_tier_join_avg.sql (W7's body with the ONE delta
+// BYTE `x`→`s` on the row_json wire key; 482 bytes LF-only no-trailing-NL)
+// — the tier2 GROUPED-AVG join-class row APPENDED at manifest index 7
+// (provenance: agent-ctx/r140-w7-census.md §6; never widened silently).
+const W8H = 'bed23e35a457c534824e634e3f863742415d8077db36828bca2f630131968e86';
 
 /** E15 — the canonical join oracle ported verbatim (§6.5). The numbers are
  *  the audit-B-confirmed hand constants; the fixture's meta.source pins the
@@ -587,6 +593,12 @@ Deno.test('r129 join-aware derivation partition: join plans derive ONLY the join
   eq('base-join (variant absent) over the SAME op-set => [W6H] ONLY (absent ↔ absent — W7 is variant-tier2)', deriveTemplateHashes({ ...groupedView, join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' } } }, 1), [W6H]);
   eq('tier2-join over the {sum,count} op-set => [W7H] (subset semantics ride the variant class too)', deriveTemplateHashes({ ...w1Shaped, join: tier2Join }, 1), [W7H]);
   eqTrue('non-join plans NEVER derive W7 (the join-class partition is unchanged)', deepEq(deriveTemplateHashes(groupedView, 1), []));
+  // r144 W8 LEGS (agent-ctx/r140-w7-census.md §6): the tier2 variant now
+  // ALSO op-set-partitions — a tier2 AVG plan derives ONLY W8 (W7 lacks
+  // avg_pair), a tier2 SUM plan derives ONLY W7 (W8 lacks sum; pinned
+  // above), and the mixed {avg_pair,sum} set derives ZERO (D2 territory).
+  eq('tier2-join AVG (avg_pair) => [W8H] ONLY (r144 — the FIRST grouped-avg derivation; W7 lacks avg_pair)', deriveTemplateHashes({ table: 'wh_probe_agg', groupKeys: [{ col: 'region', type: 'text' }], aggs: { a: { op: 'avg', col: 'amount' } }, join: tier2Join }, 1), [W8H]);
+  eq('tier2-join {avg_pair,sum} => ZERO derivation (no member serves the mixed set — plan_untemplated, the D2 datum)', deriveTemplateHashes({ table: 'wh_probe_agg', groupKeys: [{ col: 'region', type: 'text' }], aggs: { a: { op: 'avg', col: 'amount' }, x: { op: 'sum', col: 'amount' } }, join: tier2Join }, 1), []);
 });
 
 // =============================================================================
@@ -714,7 +726,29 @@ Deno.test('r129 manifest statics: the W6 row deep-equals the 16-field transcript
     encoding: { x: 'text', c: 'number', n: 'number' },
     join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
   });
-  eq('append-only + partition laws (r133: W6 index 5 unchanged, W7 index 6, TWO join-carrying rows, SEVEN rows)', [ENGINE_TEMPLATE_MANIFEST[5] === w6, ENGINE_TEMPLATE_MANIFEST[6] === w7, ENGINE_TEMPLATE_MANIFEST.filter((r) => r.join !== undefined).length, ENGINE_TEMPLATE_MANIFEST.length], [true, true, 2, 7]);
+  // r144 re-pin (agent-ctx/r140-w7-census.md §6): the join-row count 2 → 3
+  // (W8 APPENDED at index 7, manifest length 7 → 8 — the append-only +
+  // partition laws EXTENDED, never weakened).
+  const w8 = manifestRowByHash(W8H);
+  eq('manifestRowByHash(W8H) deep-equals the hand-transcribed W8 row (16 fields incl. join {dim,left,right,variant:"tier2"}; the FIRST grouped-avg row)', w8, {
+    slug: 'W8_dim_tier_join_avg',
+    file: 'W8_dim_tier_join_avg.sql',
+    template_hash: W8H,
+    logical_table: 'wh_probe_agg',
+    qc_class: 'QC6',
+    kind: 'rows',
+    merge_ops: ['groupby', 'avg_pair', 'count', 'count_col'],
+    group_keys: ['region'],
+    params_schema: {},
+    timeout_ms: 8000,
+    max_rows: 1000,
+    schema_version: 1,
+    state: 'active',
+    aggs: { s: { op: 'sum', col: 'amount' }, c: { op: 'count_col', col: 'amount' }, n: { op: 'count' } },
+    encoding: { s: 'text', c: 'number', n: 'number' },
+    join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
+  });
+  eq('append-only + partition laws (r144: W6 index 5 unchanged, W7 index 6, W8 index 7, THREE join-carrying rows, EIGHT rows)', [ENGINE_TEMPLATE_MANIFEST[5] === w6, ENGINE_TEMPLATE_MANIFEST[6] === w7, ENGINE_TEMPLATE_MANIFEST[7] === w8, ENGINE_TEMPLATE_MANIFEST.filter((r) => r.join !== undefined).length, ENGINE_TEMPLATE_MANIFEST.length], [true, true, true, 3, 8]);
 });
 
 Deno.test('r129 W6 body compliance TEXT pins (design §2.3 rows-kind law, lint-templates parity) over db/shard-templates/W6_colocated_join_agg.sql', async () => {
@@ -747,6 +781,36 @@ Deno.test('r133 W7 body compliance TEXT pins (design_r132_w7_family §2.3 rows-k
   const digest = await crypto.subtle.digest('SHA-256', bodyBytes);
   const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
   eq('sha256(body bytes) === the manifest template_hash (the body IS the contract)', hex, W7H);
+});
+
+Deno.test('r144 W8 body compliance TEXT pins (agent-ctx/r140-w7-census.md §6 rows-kind law + the ONE-BYTE delta law) over db/shard-templates/W8_dim_tier_join_avg.sql', async () => {
+  const bodyBytes = await Deno.readFile(new URL('../../../db/shard-templates/W8_dim_tier_join_avg.sql', import.meta.url));
+  const body = new TextDecoder().decode(bodyBytes);
+  eqTrue('effective text ends `limit $2` (final line, no trailing semicolon — the F2 sentinel interplay)', body.trimEnd().endsWith('limit $2'));
+  eqTrue('_pre_trim window present (same shape as W1/W6/W7 — the sentinel re-cap interplay unchanged)', body.includes('count(*) over () as _pre_trim'));
+  eqTrue('zero double-quote characters anywhere in the body (single quotes only — mirrors W7)', !body.includes('"'));
+  eqTrue('no row-aggregate wrapper (jsonb_agg|array_agg|string_agg banned in rows-kind bodies — the lint ROWS_AGG_BAN parity)', !/\b(jsonb_agg|array_agg|string_agg)\s*\(/i.test(body));
+  eqTrue('the hardcoded SQL join keys match the manifest join binding (t.region = d.region — what key binding protects)', body.includes('join public.wh_probe_dim d on t.region = d.region'));
+  // The tier predicate rides UNCHANGED (W8 inherits W7's `and d.tier = 2` —
+  // the variant is still tier2) and the wire key is the ONE delta: the s/c
+  // avg-pair convention (W3 precedent) replaces W7's x/c keys.
+  eqTrue('the tier predicate `and d.tier = 2` is present on the ON clause (inherited from W7 — the variant stays tier2)', body.includes('on t.region = d.region and d.tier = 2'));
+  eqTrue("the row_json wire key is 's' (the W3 avg-pair convention — the manifest aggs/encoding keys match)", body.includes("jsonb_build_object('s', g.s::text, 'c', g.c, 'n', g.n)"));
+  eqTrue("W7's 'x' wire key is GONE (the rename is the whole delta — no x-key residue)", !body.includes("'x'"));
+  eq('W8 byte law: EXACTLY 482 bytes (identical to W7), single LF-only tail, no trailing newline, zero CR', [bodyBytes.length, body.endsWith('limit $2'), body.includes('\r')], [482, true, false]);
+  // THE ONE-BYTE DELTA LAW (the census §6 template-only growth proof): W8's
+  // bytes differ from W7's in EXACTLY ONE position, and that byte is
+  // 'x' (0x78) → 's' (0x73). Any other drift (a reformatted body, a changed
+  // predicate, a second wire-key edit) goes RED here.
+  const w7Bytes = await Deno.readFile(new URL('../../../db/shard-templates/W7_dim_tier_join_agg.sql', import.meta.url));
+  const diffPositions: { pos: number; w7: number; w8: number }[] = [];
+  for (let i = 0; i < Math.max(w7Bytes.length, bodyBytes.length); i++) {
+    if (w7Bytes[i] !== bodyBytes[i]) diffPositions.push({ pos: i, w7: w7Bytes[i], w8: bodyBytes[i] });
+  }
+  eq('the W8-vs-W7 byte diff is EXACTLY ONE position, x(0x78)→s(0x73)', diffPositions, [{ pos: 104, w7: 0x78, w8: 0x73 }]);
+  const digest = await crypto.subtle.digest('SHA-256', bodyBytes);
+  const hex = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  eq('sha256(body bytes) === the manifest template_hash (the body IS the contract)', hex, W8H);
 });
 
 Deno.test('r129 E15 fixture provenance: canonical oracle port (path + sha256 self-pinned), the hand constants ride the fixture', () => {

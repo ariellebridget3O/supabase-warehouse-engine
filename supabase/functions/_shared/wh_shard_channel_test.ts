@@ -115,6 +115,12 @@ const W6H = '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576';
 // (W6's body + the ONE delta line `and d.tier = 2`, 482 bytes LF-only
 // no-trailing-NL). APPENDED at manifest index 6 — never widened silently.
 const W7H = 'e6d40cbe1d5da2587492c07076b97ec1e716deaf5cefa2b3098038bee98b79bb';
+// r144 (agent-ctx/r140-w7-census.md §6 — the W8 provenance cell): the tier2
+// GROUPED-AVG join-class hash = sha256 of
+// db/shard-templates/W8_dim_tier_join_avg.sql (W7's body with the ONE delta
+// BYTE `x`→`s` on the row_json wire key, 482 bytes LF-only no-trailing-NL).
+// APPENDED to the eligible set in manifest order — never widened silently.
+const W8H = 'bed23e35a457c534824e634e3f863742415d8077db36828bca2f630131968e86';
 
 /** The manifest's template defs (the adapter's second arg in production) —
  *  the kind + agg defs + merge_ops slices the adapter consumes. */
@@ -702,14 +708,17 @@ Deno.test('r69 compileShardRpcUrl: the byte-pinned §6.1 URL', () => {
   eq('exact string', compileShardRpcUrl('blnkremote'), 'https://blnkremote.supabase.co/rest/v1/rpc/wh_query');
 });
 
-Deno.test('r69 WH_RPC_ELIGIBLE_HASHES: W1/W2/W3 + r129 W6 + r133 W7 join-class (the null-guarded set; W4/W5-class excluded — F-N5)', () => {
+Deno.test('r69 WH_RPC_ELIGIBLE_HASHES: W1/W2/W3 + r129 W6 + r133 W7 + r144 W8 join-class (the null-guarded set; W4/W5-class excluded — F-N5)', () => {
   // r129 re-pin (census §3.2; design_r128_joinplans.md §2.3 audit-A A2 — the
   // provenance cell for this widening): W6's hash APPENDED in manifest order.
   // r133 re-pin (design_r132_w7_family.md §2.2): W7's hash APPENDED at index
   // 4 (manifest order) — the tier2 join class is null-guarded by the same
   // W1-proven shape. The D2 eligible set grows ONLY through this pinned cell
   // + the FILE provenance cell below (never silently).
-  eq('contents', [...WH_RPC_ELIGIBLE_HASHES], [W1H, W2H, W3H, W6H, W7H]);
+  // r144 re-pin (agent-ctx/r140-w7-census.md §6): W8's hash APPENDED at index
+  // 5 (manifest order) — the tier2 GROUPED-AVG join class; the body is W7's
+  // with the ONE delta byte `x`→`s`, so the same null-guarded shape carries.
+  eq('contents', [...WH_RPC_ELIGIBLE_HASHES], [W1H, W2H, W3H, W6H, W7H, W8H]);
   eqTrue('W4 (topk) not eligible', !WH_RPC_ELIGIBLE_HASHES.includes(W4H));
   eqTrue('W5-class (unguarded dataset param) not eligible', !WH_RPC_ELIGIBLE_HASHES.includes(W5H));
 });
@@ -1427,20 +1436,30 @@ Deno.test('r69 battery core census: every REAL plan op-set derives <= 1 template
   eq('anchor W5: scalar {sum,count_col} on facts_blocks => [W5H]', deriveTemplateHashes(planFrom('facts_blocks', 'scalar', ['sum', 'count_col']), undefined), [W5H]);
   // r133 W7 LEGS (design_r132_w7_family §6.5): the census loop above runs
   // NON-join plans only (planFrom sets no join) — it still proves non-join
-  // EXCLUDES both join-class rows (neither W6H nor W7H can enter
-  // derivedHashes). The join legs below derive with the r133 VARIANT
+  // EXCLUDES every join-class row (neither W6H, W7H, nor — r144 — W8H can
+  // enter derivedHashes). The join legs below derive with the r133 VARIANT
   // partition (join class + request join.variant): tier2↔W7, absent↔W6.
   eqTrue('non-join excludes W7 (the join-class partition — W7 enters NO non-join derivation)', !derivedHashes.has(W7H));
   eqTrue('non-join excludes W6 (same partition law, r129)', !derivedHashes.has(W6H));
+  eqTrue('non-join excludes W8 (same partition law, r144 — W8 is join-class too)', !derivedHashes.has(W8H));
   const joinView = (variant?: 'tier2'): DerivePlanView => ({
     ...planFrom('wh_probe_agg', 'rows', ['sum', 'count', 'count_col']),
     join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, ...(variant !== undefined ? { variant } : {}) },
   });
   eq('tier2-join (full {x,c,n} op-set) derives ONLY W7 (variant partition — W6 can never co-derive with W7: identical merge_ops)', deriveTemplateHashes(joinView('tier2'), undefined), [W7H]);
   eq('base-join (variant absent) derives ONLY W6 (absent↔absent)', deriveTemplateHashes(joinView(), undefined), [W6H]);
+  // r144 W8 LEGS (agent-ctx/r140-w7-census.md §6): the tier2 variant now
+  // ALSO op-set-partitions — W8's merge_ops lack `sum` (a tier2 SUM plan can
+  // never ride W8) and W7's lack `avg_pair` (a tier2 AVG plan can never ride
+  // W7), so the co-derivation bar is TWICE over within the same variant.
+  const tier2JoinOnly = { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' as const };
+  eq('tier2-join AVG (avg_pair token) derives ONLY W8 (r144 — W7 lacks avg_pair; the FIRST grouped-avg derivation)', deriveTemplateHashes({ ...planFrom('wh_probe_agg', 'rows', ['avg_pair']), join: tier2JoinOnly }, undefined), [W8H]);
+  eq('tier2-join AVG+count_col derives ONLY W8 (count_col rides the avg-pair template too)', deriveTemplateHashes({ ...planFrom('wh_probe_agg', 'rows', ['avg_pair', 'count_col']), join: tier2JoinOnly }, undefined), [W8H]);
+  eq('tier2-join {avg_pair,sum} derives ZERO templates (the mixed op-set no member serves — plan_untemplated territory, the D2 datum)', deriveTemplateHashes({ ...planFrom('wh_probe_agg', 'rows', ['avg_pair', 'sum']), join: tier2JoinOnly }, undefined), []);
+  eq('variant-absent join AVG derives ZERO templates (W6 lacks avg_pair too — avg needs the r144 W8 tier2 class)', deriveTemplateHashes({ ...planFrom('wh_probe_agg', 'rows', ['avg_pair']), join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' } } }, undefined), []);
 });
 
-Deno.test('r69 battery core: WH_RPC_ELIGIBLE_HASHES === the manifest FILE W1/W2/W3/W6/W7 hashes (F-N5 provenance cross-check)', () => {
+Deno.test('r69 battery core: WH_RPC_ELIGIBLE_HASHES === the manifest FILE W1/W2/W3/W6/W7/W8 hashes (F-N5 provenance cross-check)', () => {
   // The core cell pins the set against literals; THIS cell re-reads the
   // manifest FILE (wh_handshake_test.ts file-pin house style) so the
   // eligible set is pinned to the seed's real sha256 values, not to a
@@ -1454,18 +1473,19 @@ Deno.test('r69 battery core: WH_RPC_ELIGIBLE_HASHES === the manifest FILE W1/W2/
   const byHash = ENGINE_TEMPLATE_MANIFEST.map((r) => r.template_hash);
   if (rows !== null) {
     const fileBySlug = Object.fromEntries(rows.map((r) => [r.slug, r.template_hash]));
-    eq('eligible set === the FILE W1/W2/W3/W6/W7 hashes in manifest order (r133 re-pin: W7 appended — provenance design_r132_w7_family.md §2.2)', [...WH_RPC_ELIGIBLE_HASHES], [
+    eq('eligible set === the FILE W1/W2/W3/W6/W7/W8 hashes in manifest order (r144 re-pin: W8 appended — provenance agent-ctx/r140-w7-census.md §6)', [...WH_RPC_ELIGIBLE_HASHES], [
       fileBySlug['W1_grouped_sum_count'],
       fileBySlug['W2_scalar_minmax'],
       fileBySlug['W3_scalar_avg_pair'],
       fileBySlug['W6_colocated_join_agg'],
       fileBySlug['W7_dim_tier_join_agg'],
+      fileBySlug['W8_dim_tier_join_avg'],
     ]);
     eqTrue('W4 not eligible (file hash)', !WH_RPC_ELIGIBLE_HASHES.includes(fileBySlug['W4_topk']));
     eqTrue('W5-class not eligible (file hash)', !WH_RPC_ELIGIBLE_HASHES.includes(fileBySlug['W5_cold_agg']));
   } else {
     console.log('  note [fallback branch: manifest file not readable — the engine-manifest cross-check below carries the pin]');
-    eq('eligible set === the ENGINE manifest W1/W2/W3/W6/W7 hashes in manifest order (r133 re-pin: W6 at index 5, W7 at index 6)', [...WH_RPC_ELIGIBLE_HASHES], [byHash[0], byHash[1], byHash[2], byHash[5], byHash[6]]);
+    eq('eligible set === the ENGINE manifest W1/W2/W3/W6/W7/W8 hashes in manifest order (r144 re-pin: W6 at index 5, W7 at index 6, W8 at index 7)', [...WH_RPC_ELIGIBLE_HASHES], [byHash[0], byHash[1], byHash[2], byHash[5], byHash[6], byHash[7]]);
   }
   eqTrue('the eligible set is a SUBSET of the engine manifest (plan-honesty can never self-reject an rpc plan)', [...WH_RPC_ELIGIBLE_HASHES].every((h) => byHash.includes(h)));
 });

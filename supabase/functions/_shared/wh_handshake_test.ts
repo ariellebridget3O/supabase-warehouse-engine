@@ -107,6 +107,12 @@ const W6H = '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576'; 
 // (W6's body + the ONE delta line `and d.tier = 2`, 482 bytes). APPENDED at
 // manifest index 6 — never widened silently.
 const W7H = 'e6d40cbe1d5da2587492c07076b97ec1e716deaf5cefa2b3098038bee98b79bb'; // ["groupby","sum","count","count_col"] + join{dim,left,right,variant:'tier2'}
+// r144 (agent-ctx/r140-w7-census.md §6 — the W8 provenance cell): the tier2
+// GROUPED-AVG join-class hash = sha256 of
+// db/shard-templates/W8_dim_tier_join_avg.sql (W7's body with the ONE delta
+// BYTE `x`→`s` on the row_json wire key, 482 bytes LF-only no-trailing-NL).
+// APPENDED at manifest index 7 — never widened silently.
+const W8H = 'bed23e35a457c534824e634e3f863742415d8077db36828bca2f630131968e86'; // ["groupby","avg_pair","count","count_col"] + join{dim,left,right,variant:'tier2'}
 
 function invRow(hash: string, opts: Partial<TemplateInventoryRow> = {}): TemplateInventoryRow {
   return {
@@ -615,16 +621,43 @@ const MANIFEST_LITERAL: EngineTemplateRow[] = [
     encoding: { x: 'text', c: 'number', n: 'number' },
     join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
   },
+  // r144 (agent-ctx/r140-w7-census.md §6): the tier2 GROUPED-AVG join class —
+  // hand-transcribed from the manifest.json W8 entry (16 fields; join.variant
+  // 'tier2' like W7 — W7/W8 co-derivation barred TWICE over: variant
+  // partition + op-set [W8 lacks `sum`, W7 lacks `avg_pair`]). QC6 family
+  // member (zero lint change); aggs/encoding ride the W3 avg-pair s/c
+  // convention (c = count_col — the count≡count_col equivalence maps plan
+  // count(amount) onto it).
+  {
+    slug: 'W8_dim_tier_join_avg',
+    file: 'W8_dim_tier_join_avg.sql',
+    template_hash: W8H,
+    logical_table: 'wh_probe_agg',
+    qc_class: 'QC6',
+    kind: 'rows',
+    merge_ops: ['groupby', 'avg_pair', 'count', 'count_col'],
+    group_keys: ['region'],
+    params_schema: {},
+    timeout_ms: 8000,
+    max_rows: 1000,
+    schema_version: 1,
+    state: 'active',
+    aggs: { s: { op: 'sum', col: 'amount' }, c: { op: 'count_col', col: 'amount' }, n: { op: 'count' } },
+    encoding: { s: 'text', c: 'number', n: 'number' },
+    join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
+  },
 ];
 
-Deno.test('manifest pin: ENGINE_TEMPLATE_MANIFEST deep-equals the hand-transcribed literal (W1-W5 + r129 W6 + r133 W7, all fields)', () => {
+Deno.test('manifest pin: ENGINE_TEMPLATE_MANIFEST deep-equals the hand-transcribed literal (W1-W5 + r129 W6 + r133 W7 + r144 W8, all fields)', () => {
   eq('engine manifest === literal copy', ENGINE_TEMPLATE_MANIFEST, MANIFEST_LITERAL);
   // r129 re-pin (census §3.3): LENGTH 5 → 6, W6 APPENDED at index 5 —
   // provenance = design_r128_joinplans.md §2.3 (never widen silently).
   // r133 re-pin (design_r132_w7_family.md §2.2): LENGTH 6 → 7, W7 APPENDED
   // at index 6 — same append-only law.
-  eq('exactly seven templates (W1-W5 + W6 + W7)', ENGINE_TEMPLATE_MANIFEST.length, 7);
-  eq('the seven pinned hashes are present (W6 at index 5, W7 appended at index 6)', ENGINE_TEMPLATE_MANIFEST.map((r) => r.template_hash), [W1H, W2H, W3H, W4H, W5H, W6H, W7H]);
+  // r144 re-pin (agent-ctx/r140-w7-census.md §6): LENGTH 7 → 8, W8 APPENDED
+  // at index 7 — same append-only law.
+  eq('exactly eight templates (W1-W5 + W6 + W7 + W8)', ENGINE_TEMPLATE_MANIFEST.length, 8);
+  eq('the eight pinned hashes are present (W6 at index 5, W7 appended at index 6, W8 appended at index 7)', ENGINE_TEMPLATE_MANIFEST.map((r) => r.template_hash), [W1H, W2H, W3H, W4H, W5H, W6H, W7H, W8H]);
 });
 
 Deno.test('manifest pin: file equality when --allow-read grants db/shard-templates (fallback = literal pin, provenance noted)', () => {

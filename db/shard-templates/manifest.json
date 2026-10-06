@@ -257,5 +257,51 @@
    "right": "region",
    "variant": "tier2"
   }
+ },
+ {
+  "slug": "W8_dim_tier_join_avg",
+  "file": "W8_dim_tier_join_avg.sql",
+  "template_hash": "bed23e35a457c534824e634e3f863742415d8077db36828bca2f630131968e86",
+  "logical_table": "wh_probe_agg",
+  "qc_class": "QC6",
+  "kind": "rows",
+  "merge_ops": [
+   "groupby",
+   "avg_pair",
+   "count",
+   "count_col"
+  ],
+  "group_keys": [
+   "region"
+  ],
+  "params_schema": {},
+  "timeout_ms": 8000,
+  "max_rows": 1000,
+  "schema_version": 1,
+  "state": "active",
+  "aggs": {
+   "s": {
+    "op": "sum",
+    "col": "amount"
+   },
+   "c": {
+    "op": "count_col",
+    "col": "amount"
+   },
+   "n": {
+    "op": "count"
+   }
+  },
+  "encoding": {
+   "s": "text",
+   "c": "number",
+   "n": "number"
+  },
+  "join": {
+   "dim": "wh_probe_dim",
+   "left": "region",
+   "right": "region",
+   "variant": "tier2"
+  }
  }
 ]

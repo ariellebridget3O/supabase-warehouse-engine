@@ -1110,6 +1110,15 @@ export function gatePartialAgainstPlan(plan: WhMergePlan, rawEnvelope: unknown):
  * provenance cell :1424-1448 (eligible set === manifest.json hashes in
  * manifest order) — the battery leg re-pins both for W7; this constant +
  * comment is the engine-side duty.
+ * r144 (agent-ctx/r140-w7-census.md §6): W8_dim_tier_join_avg joins the set —
+ * the THIRD join-class row (variant 'tier2' like W7, the FIRST GROUPED AVG
+ * template; its body is W7's with the ONE delta byte `x`→`s` on the row_json
+ * wire key, so the same null-guarded body shape carries the rpc plane).
+ * W8's merge_ops [groupby,avg_pair,count,count_col] lack `sum` while W7's
+ * lack `avg_pair` — the tier2 variant partition now ALSO op-set-partitions
+ * (SUM→W7 only, AVG→W8 only, never co-deriving), so the ≤1-template
+ * invariant is preserved with no derivation-code change. Battery provenance:
+ * the same two cells re-pinned for W8 in this round.
  */
 export const WH_RPC_ELIGIBLE_HASHES: readonly string[] = [
   'a934e7e062f59cff5a856afdc7aa743ec9be11c068c7e861ea856c36b40bdbfd', // W1_grouped_sum_count ["groupby","sum","count"]
@@ -1117,6 +1126,7 @@ export const WH_RPC_ELIGIBLE_HASHES: readonly string[] = [
   'bca9dd2c591ed48a0fa5367179dd5deb1d752ed9141c23e6ad53083becf8ecac', // W3_scalar_avg_pair ["avg_pair"]
   '7004f44de62a8e998ce1915348be0f0fc299ac1aae901966ae7080f7c2cc9576', // W6_colocated_join_agg ["groupby","sum","count","count_col"] (r129 join class, variant absent)
   'e6d40cbe1d5da2587492c07076b97ec1e716deaf5cefa2b3098038bee98b79bb', // W7_dim_tier_join_agg ["groupby","sum","count","count_col"] (r133 join class, variant tier2)
+  'bed23e35a457c534824e634e3f863742415d8077db36828bca2f630131968e86', // W8_dim_tier_join_avg ["groupby","avg_pair","count","count_col"] (r144 join class, variant tier2, grouped avg)
 ];
 
 /** r133 (design_r132_w7_family §3): the EFFECTIVE-K law — `fetch_rows ??

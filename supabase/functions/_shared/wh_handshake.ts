@@ -307,6 +307,18 @@ export interface EngineTemplateRow {
  * (engine-side manifest only). aggs/encoding/merge_ops IDENTICAL to W6 —
  * the col-strict adapter sees the SAME (op,col) tuples; the co-derivation
  * split rides the variant partition. timeout_ms <as W1> = 8000.
+ * r144 (agent-ctx/r140-w7-census.md §6 — the W8 spec): W8_dim_tier_join_avg
+ * APPENDED at index 7 (append-only law — the index-addressed pins address
+ * 0-6): the FIRST GROUPED AVG template — W7's body with the ONE delta byte
+ * `x`→`s` on the row_json wire key (482 bytes LF-only no-trailing-NL),
+ * same join binding + variant:'tier2'. aggs/encoding ride the W3
+ * avg-pair convention (s/c wire keys; c = count_col — the plan-side
+ * count≡count_col equivalence in aggEncodingMatches maps plan
+ * count(amount) onto it), merge_ops gain `avg_pair` and DROP `sum` — the
+ * op-set now partitions WITHIN the tier2 variant (a tier2 SUM plan
+ * derives ONLY W7, a tier2 AVG plan derives ONLY W8; W7/W8 can never
+ * co-derive). Template-only growth: zero behavioral engine-code change.
+ * timeout_ms <as W1> = 8000.
  */
 export const ENGINE_TEMPLATE_MANIFEST: readonly EngineTemplateRow[] = [
   {
@@ -440,6 +452,34 @@ export const ENGINE_TEMPLATE_MANIFEST: readonly EngineTemplateRow[] = [
     state: 'active',
     aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
     encoding: { x: 'text', c: 'number', n: 'number' },
+    join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
+  },
+  // r144 (agent-ctx/r140-w7-census.md §6): the tier2 GROUPED-AVG join class —
+  // APPENDED at index 7 (append-only law; the index-addressed pins address
+  // 0-6). template_hash = sha256 of db/shard-templates/W8_dim_tier_join_avg.sql
+  // (the body IS the contract — W7's body with the ONE delta BYTE `x`→`s` on
+  // the row_json wire key, 482 bytes LF-only no-trailing-NL); the `join`
+  // binding carries the SAME variant:'tier2' discriminator — W7/W8 co-
+  // derivation is now barred TWICE over (variant partition + the op-set:
+  // W8 lacks `sum`, W7 lacks `avg_pair`). aggs/encoding ride the W3
+  // avg-pair s/c convention (c = count_col — the count≡count_col
+  // equivalence maps plan count(amount) onto it).
+  {
+    slug: 'W8_dim_tier_join_avg',
+    file: 'W8_dim_tier_join_avg.sql',
+    template_hash: 'bed23e35a457c534824e634e3f863742415d8077db36828bca2f630131968e86',
+    logical_table: 'wh_probe_agg',
+    qc_class: 'QC6',
+    kind: 'rows',
+    merge_ops: ['groupby', 'avg_pair', 'count', 'count_col'],
+    group_keys: ['region'],
+    params_schema: {},
+    timeout_ms: 8000,
+    max_rows: 1000,
+    schema_version: 1,
+    state: 'active',
+    aggs: { s: { op: 'sum', col: 'amount' }, c: { op: 'count_col', col: 'amount' }, n: { op: 'count' } },
+    encoding: { s: 'text', c: 'number', n: 'number' },
     join: { dim: 'wh_probe_dim', left: 'region', right: 'region', variant: 'tier2' },
   },
 ];
