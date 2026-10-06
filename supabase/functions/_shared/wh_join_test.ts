@@ -27,6 +27,12 @@
 // additive ok-arm presence + exact-shape pins (the R-3 law on the new
 // surface), the entrypoint :464-478 dispatch-population split, and the R-B3
 // rpcMode decision pin (see the block comment there).
+// r144 R9 W8 (agent-ctx/r140-w7-census.md §6): the FIRST grouped-avg join
+// template — derivation census e2e (tier2-avg⇒[W8H]/sum⇒[W7H]/mixed+base
+// avg⇒D2 plan_untemplated), E16 avg-pair monoid closure + 3-shard fanout
+// (partials 17×3, exact rationals), the twin-consumption pin (avg fusion +
+// direct count off the SAME c encoding), the K-W8 fusion-gate lethal arm,
+// and the fetch_rows grouped p_params={} arm.
 //
 // Offline + pure: every transport is an injected recording fake — zero
 // sockets, no --allow-net (the battery never grants it; a real fetch would
@@ -35,6 +41,7 @@
 // =============================================================================
 
 import {
+  adaptWireEnvelope,
   buildMergePlan,
   executeWhQuery,
   parseWhEngineRequest,
@@ -922,6 +929,297 @@ Deno.test('r133 W7 fanout: the FULL E16 tier2 oracle through the real pipeline (
   eqTrue('globals recompute from the ENGINE output: Σx 22,264,985 / Σc 4,711 / Σn 4,760 (the E16 globals ride the live path)', sumX.toString() === '22264985' && sumC === 4711 && sumN === 4760);
   const dimLabeledW7 = { ...w7env('s-dim', [E16.rows[0]]), table: 'wh_probe_dim' };
   throwsMerge('W7-shaped partial labeled with the DIM table => envelope_invalid vs the W7 plan (the §2.4 envelope law is variant-independent — the W6 twin is the r129 arm above)', () => mergeGroupedPartials(W7_PLAN, [dimLabeledW7]), 'envelope_invalid');
+});
+
+// =============================================================================
+// r144 R9 W8 — the FIRST grouped-avg join template (agent-ctx/r140-w7-census.md
+// §6 pre-registered deltas). W8 = W7's body with the ONE delta byte `x`→`s`;
+// manifest row idx7 merge_ops [groupby,avg_pair,count,count_col]; the tier2
+// variant partition now ALSO op-set-partitions (AVG ⇒ W8 only, SUM ⇒ W7 only,
+// mixed ⇒ ZERO). The adapter fuses the plan's avg(amount) from the template's
+// same-col s+c encodings (avgPairEncoding, gated on the avg_pair DECLARATION)
+// while the plan's count(amount) maps DIRECT to the SAME `c` encoding (the
+// sole count≡count_col equivalence, r130) — legal twin consumption of one
+// encoding in one wave. W8's merged per-region avg is the EXACT rational pair
+// {num: x_r, den: c_r} — never a float, never the mean-of-means (the E2 law
+// rides the join plane; the 3-band folds below are the live discriminators).
+// =============================================================================
+
+/** The W8 tier2-avg request (census §6): avg(amount) unaliased (the
+ *  buildMergePlan name 'avg(amount)'), count(amount) alias c, count(*) alias
+ *  n, grouped by region, the tier2 join descriptor. */
+function w8avgReqBody(): Record<string, unknown> {
+  return {
+    v: 1,
+    qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+    table: 'wh_probe_agg',
+    query: {
+      select: [
+        { op: 'avg', col: 'amount' },
+        { op: 'count', col: 'amount', alias: 'c' },
+        { op: 'count', alias: 'n' },
+      ],
+      groupBy: ['region'],
+      join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' },
+    },
+  };
+}
+
+const W8_PLAN: WhMergePlan = buildMergePlan(parseWhEngineRequest(w8avgReqBody()), { columnTypes: COLS, columnScales: SCALES });
+
+/** W8-shaped grouped partial — the exact per-shard shape the W8 template
+ *  emits POST-ADAPTATION (the flat wire's encoding keys s/c/n remap to the
+ *  plan's own names: the fused avg pair under 'avg(amount)' plus the direct
+ *  c/n). Same fixed-point TEXT convention as w6env/w7env. */
+function w8env(shard: string, rows: E15Row[]): WhPartialEnvelope {
+  return {
+    v: 1,
+    shard,
+    table: 'wh_probe_agg',
+    schema_version: 1,
+    partial: {
+      kind: 'grouped',
+      groupKeys: ['region'],
+      aggs: { 'avg(amount)': { op: 'avg', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+      rows: rows.map((r) => ({ k: [r.region], a: { 'avg(amount)': { s: String(r.x), c: r.c }, c: r.c, n: r.n } })),
+      rowCount: rows.length,
+      more: false,
+    },
+  };
+}
+
+/** The FLAT §6.2 W8 wire (the seeded fn shape — encoding keys s/c/n, the W8
+ *  body's row_json). The rpc-plane adapter consumes THIS shape. */
+function w8wire(rows: E15Row[]): Record<string, unknown> {
+  return {
+    v: 1,
+    table: 'wh_probe_agg',
+    schema_version: 1,
+    qc_class: 'QC6',
+    kind: 'grouped',
+    groupKeys: ['region'],
+    aggs: { s: { op: 'sum', col: 'amount' }, c: { op: 'count_col', col: 'amount' }, n: { op: 'count' } },
+    rows: rows.map((r) => ({ k: [r.region], a: { s: String(r.x), c: r.c, n: r.n } })),
+    rowCount: rows.length,
+    truncated: false,
+    encoding: { s: 'text', c: 'number', n: 'number' },
+    template_hash: W8H,
+    template_timeout_ms: 8000,
+    latencyMs: 5,
+  };
+}
+
+/** Hand-derived E16 projection (census §6): W8's finalize row per region r is
+ *  EXACTLY {k:[r], 'avg(amount)': {num: x_r, den: c_r}, c: c_r, n: 280} —
+ *  lifted from the fixture's own numbers in-test (never hardcoded floats,
+ *  never derived from a run). */
+const E16_W8_FINAL = E16.rows.map((r) => ({
+  k: [r.region],
+  aggs: { 'avg(amount)': { num: BigInt(r.x), den: BigInt(r.c) }, c: r.c, n: r.n },
+}));
+
+/** The wh_entrypoint.ts:493-507 derivation plan-view shape, mirrored
+ *  verbatim: table + groupKeys = query.groupBy (PRESENCE is the kind law —
+ *  grouped↔'rows') + join? (the class/variant partition rides PRESENCE +
+ *  variant) + aggs keyed alias ?? `${op}_${i}`. */
+function entrypointPlanView(req: WhEngineRequest): Record<string, unknown> {
+  return {
+    table: req.table,
+    ...(req.query.groupBy !== undefined ? { groupKeys: req.query.groupBy } : {}),
+    ...(req.query.join !== undefined ? { join: req.query.join } : {}),
+    aggs: Object.fromEntries(
+      req.query.select.map((s, i) => [s.alias ?? `${s.op}_${i}`, { op: s.op, ...(s.col !== undefined ? { col: s.col } : {}) }]),
+    ),
+  };
+}
+
+Deno.test('r144 W8 derivation census (e2e): tier2-avg ⇒ [W8H] ONLY, tier2-sum ⇒ [W7H] ONLY; MIXED sum+avg and BASE non-join avg both derive ZERO ⇒ D2 plan_untemplated (planner-honest)', async () => {
+  // REAL derivation (the wh_entrypoint.ts:486 plan-view shape — table +
+  // groupKeys? + join? + aggs — against the REAL ENGINE_TEMPLATE_MANIFEST;
+  // the r134 arm's convention). The unit-level op-set legs are pinned in the
+  // r144 legs of the derivation-partition block above; these are the
+  // plan-view shapes the ENGINE actually derives from the parsed requests.
+  const avgPlan = parseWhEngineRequest(w8avgReqBody());
+  eq('tier2-avg plan view derives [W8H] ONLY (W6/W7 lack avg_pair — the op-set partition completes the variant partition)', deriveTemplateHashes(entrypointPlanView(avgPlan) as never, 1), [W8H]);
+  const sumPlan = parseWhEngineRequest(tier2JoinReqBody());
+  eq('tier2-sum plan view derives [W7H] ONLY (W8 carries NO sum token — the census arm through the REAL view)', deriveTemplateHashes(entrypointPlanView(sumPlan) as never, 1), [W7H]);
+  // MIXED sum+avg tier2 plan: NO template serves the union (W8 lacks sum,
+  // W6/W7 lack avg_pair) ⇒ zero derivation ⇒ the D2 gate owns the outcome
+  // (the join gates deliberately skip zero derivation — matchedJoinRow null).
+  const mixedReq = parseWhEngineRequest({ ...w8avgReqBody(), query: { ...(w8avgReqBody().query as Record<string, unknown>), select: [{ op: 'avg', col: 'amount' }, { op: 'sum', col: 'amount', alias: 'x' }], groupBy: ['region'] } });
+  eq('MIXED sum+avg tier2 plan derives ZERO (the pre-registered census arm — no member serves {groupby,avg_pair,sum})', deriveTemplateHashes(entrypointPlanView(mixedReq) as never, 1), []);
+  const seenMixed: SeenCall[] = [];
+  await rejectsEngine('mixed tier2 join under rpcMode => plan_untemplated (D2 — NOT a join-gate reject; planner-honest)', () =>
+    executeWhQuery(joinExecArgs({ fetcher: recordingFetch({}, seenMixed), templateHashes: [], rpcMode: true, reqOverride: mixedReq })), 'plan_untemplated', 'derives 0 template hash');
+  eq('mixed-arm D2 fired before any network: zero POSTs', seenMixed, []);
+  // BASE (non-join) avg GROUPED plan: the join class is partition-EXCLUDED
+  // and W3 is scalar-kind (the derivation kind law — grouped↔'rows') ⇒ zero.
+  const baseAvgReq = parseWhEngineRequest({ v: 1, qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ', table: 'wh_probe_agg', query: { select: [{ op: 'avg', col: 'amount' }], groupBy: ['region'] } });
+  eq('BASE non-join avg GROUPED plan derives ZERO (W1 lacks avg_pair; the join class is partition-excluded; W3 is scalar-kind)', deriveTemplateHashes(entrypointPlanView(baseAvgReq) as never, 1), []);
+  const seenBase: SeenCall[] = [];
+  await rejectsEngine('base avg grouped plan under rpcMode => plan_untemplated (the FIRST grouped avg is join-class ONLY — zero POSTs)', () =>
+    executeWhQuery(joinExecArgs({ fetcher: recordingFetch({}, seenBase), templateHashes: [], rpcMode: true, reqOverride: baseAvgReq })), 'plan_untemplated', 'derives 0 template hash');
+  eq('base-arm D2 fired before any network: zero POSTs', seenBase, []);
+});
+
+Deno.test('r144 E16 avg-pair monoid closure: 17 W8-shaped one-region partials merge + finalize through the REAL merge path to EXACTLY the E16 projection (exact rationals, never floats)', () => {
+  const envs = E16.rows.map((r) => w8env(`e16-w8-${r.region}`, [r]));
+  const merged = mergeGroupedPartials(W8_PLAN, envs);
+  eq('merged partial keeps the rowCount invariant (17 groups from 17 one-region shard partials)', merged.partial.rowCount, 17);
+  const fin = finalizeGroups(merged, W8_PLAN);
+  eq('finalize(merged) === the hand-derived E16 projection EXACT (17 rows region-ascending; per-region avg = the EXACT rational pair {num: x_r, den: c_r} lifted from the fixture)', fin, E16_W8_FINAL);
+  const finRev = finalizeGroups(mergeGroupedPartials(W8_PLAN, [...envs].reverse()), W8_PLAN);
+  eq('monoid closure: reversed-arrival merge finalizes to the SAME 17 rows (assoc + comm spot pin)', finRev, fin);
+  const sumNum = fin.reduce((a, r) => a + (r.aggs['avg(amount)'] as { num: bigint; den: bigint }).num, 0n);
+  const sumDen = fin.reduce((a, r) => a + (r.aggs['avg(amount)'] as { num: bigint; den: bigint }).den, 0n);
+  const sumN = fin.reduce((a, r) => a + (r.aggs.n as number), 0);
+  eq('hand-derived globals: Σnum 22,264,985 / Σden 4,711 / Σn 4,760 (the E16 globals through the avg-pair path)', [sumNum.toString(), sumDen.toString(), sumN], ['22264985', '4711', 4760]);
+  eqTrue('every finalized pair is the region-ascending tier-2 set with den = c_r > 0 (no NULL avg rows in THIS corpus — the census §6 pre-registered non-arm; all-null finalize stays the scalar lane E2/E14)', fin.every((r, i) => r.k[0] === E16.rows[i].region && (r.aggs['avg(amount)'] as { num: bigint; den: bigint }).den === BigInt(E16.rows[i].c)));
+});
+
+// -----------------------------------------------------------------------------
+// r144 fanout banding (test-side hand rule): the E16 fixture pins the
+// per-band TOTALS only (per_band {n, sum_x} — the banked oracle's projection
+// home), so the per-band per-region split is the deterministic
+// largest-remainder apportionment of each region's x_r against the pinned
+// band targets. Per-region folds stay EXACT (s_A+s_B+s_C = x_r,
+// c_A+c_B+c_C = c_r; n 120+80+80 = 280 by the corpus's uniform coprime
+// banding), and the pinned per-band Σs/Σn are asserted where the partials
+// are built. The per-band null placement is NOT pinned by the fixture; the
+// hand rule gives bands B/C the full 80 and band A the residual
+// (c_A = c_r − 160 — the ≤3 nulls land in band A).
+// -----------------------------------------------------------------------------
+function bandSums(target: number): number[] {
+  const X = E16.globals.sum_x;
+  const floors = E16.rows.map((r) => Math.floor((r.x * target) / X));
+  let rem = target - floors.reduce((a, b) => a + b, 0);
+  const byRemainder = E16.rows.map((r, i) => ({ i, frac: (r.x * target) % X })).sort((a, b) => b.frac - a.frac || a.i - b.i);
+  for (const { i } of byRemainder) {
+    if (rem === 0) break;
+    floors[i] += 1;
+    rem -= 1;
+  }
+  return floors;
+}
+const S_BAND_A = bandSums(E16.per_band.A.sum_x);
+const S_BAND_B = bandSums(E16.per_band.B.sum_x);
+const S_BAND_C = E16.rows.map((r, i) => r.x - S_BAND_A[i] - S_BAND_B[i]);
+const C_BAND_A = E16.rows.map((r) => r.c - 160);
+const N_BAND: Record<'A' | 'B' | 'C', number> = { A: 120, B: 80, C: 80 };
+const bandRow = (band: 'A' | 'B' | 'C', i: number): E15Row => ({
+  region: E16.rows[i].region,
+  x: band === 'A' ? S_BAND_A[i] : band === 'B' ? S_BAND_B[i] : S_BAND_C[i],
+  c: band === 'A' ? C_BAND_A[i] : 80,
+  n: N_BAND[band],
+});
+const W8_BANDS: Record<'A' | 'B' | 'C', E15Row[]> = {
+  A: E16.rows.map((_, i) => bandRow('A', i)),
+  B: E16.rows.map((_, i) => bandRow('B', i)),
+  C: E16.rows.map((_, i) => bandRow('C', i)),
+};
+const w8envA = w8env('shard-a', W8_BANDS.A);
+const w8envB = w8env('shard-b', W8_BANDS.B);
+const w8envC = w8env('shard-c', W8_BANDS.C);
+
+Deno.test('r144 W8 fanout: the FULL E16 tier2 avg oracle through the real pipeline (17 rows EXACT, partials 17×3), perShard ok-arm pins + the W8 dim-labeled envelope_invalid twin', async () => {
+  eq('band construction folds EXACTLY (the fixture pins per-band TOTALS only — the apportionment must hit them; a per_band/globals inconsistency would surface as a negative s_C here)', [
+    W8_BANDS.A.reduce((a, r) => a + r.x, 0),
+    W8_BANDS.B.reduce((a, r) => a + r.x, 0),
+    W8_BANDS.C.reduce((a, r) => a + r.x, 0),
+    W8_BANDS.A.reduce((a, r) => a + r.n, 0),
+    W8_BANDS.B.reduce((a, r) => a + r.n, 0),
+    W8_BANDS.C.reduce((a, r) => a + r.n, 0),
+  ], [E16.per_band.A.sum_x, E16.per_band.B.sum_x, E16.per_band.C.sum_x, E16.per_band.A.n, E16.per_band.B.n, E16.per_band.C.n]);
+  const seen: SeenCall[] = [];
+  const res = await executeWhQuery(joinExecArgs({
+    reqOverride: parseWhEngineRequest(w8avgReqBody()),
+    facts: [factRow('shard-a'), factRow('shard-b'), factRow('shard-c')],
+    dims: [dimRow('shard-a', { isReference: true }), dimRow('shard-b', { isReference: true }), dimRow('shard-c', { isReference: true })],
+    fetcher: recordingFetch({ 'shard-a': w8envA, 'shard-b': w8envB, 'shard-c': w8envC }, seen),
+    templateHashes: [W8H],
+  }));
+  eq('tier2-avg colocated wave: coverage 3/3, partial false, warnings [] (silent-when-exact law), exactly 3 shard POSTs', [res.coverage, res.partial, res.warnings, seen.length], ['3/3', false, [], 3]);
+  eq('finalize output === the E16 projection EXACT (17 rows; per-region avg = {num: x_r, den: c_r} — the 3-band fold is the EXACT rational, never the mean-of-means)', res.rows, E16_W8_FINAL);
+  eq('perShard exact shape (R-3 law: exact ok-arm key set, partial_rows 17×3 — the unsharded echo)', res.perShard, [
+    { shard: 'shard-a', ok: true, latencyMs: res.perShard[0]?.latencyMs, error: null, partial_rows: 17, partial_bytes: bytes(w8envA.partial) },
+    { shard: 'shard-b', ok: true, latencyMs: res.perShard[1]?.latencyMs, error: null, partial_rows: 17, partial_bytes: bytes(w8envB.partial) },
+    { shard: 'shard-c', ok: true, latencyMs: res.perShard[2]?.latencyMs, error: null, partial_rows: 17, partial_bytes: bytes(w8envC.partial) },
+  ]);
+  const sumNum = (res.rows ?? []).reduce((a, r) => a + (r.aggs['avg(amount)'] as { num: bigint; den: bigint }).num, 0n);
+  const sumDen = (res.rows ?? []).reduce((a, r) => a + (r.aggs['avg(amount)'] as { num: bigint; den: bigint }).den, 0n);
+  const sumN = (res.rows ?? []).reduce((a, r) => a + (r.aggs.n as number), 0);
+  eqTrue('globals recompute from the ENGINE output: Σnum 22,264,985 / Σden 4,711 / Σn 4,760 (the E16 globals ride the live path)', sumNum.toString() === '22264985' && sumDen.toString() === '4711' && sumN === 4760);
+  eqTrue('non-vacuity (r121 law): the mean-of-means of the 3 band pairs DIFFERS from the exact rational for at least one region — the finalize EXACT pin is a LIVE mean-of-means discriminator', E16.rows.some((_, i) => (W8_BANDS.A[i].x / W8_BANDS.A[i].c + W8_BANDS.B[i].x / W8_BANDS.B[i].c + W8_BANDS.C[i].x / W8_BANDS.C[i].c) / 3 !== E16.rows[i].x / E16.rows[i].c));
+  const dimLabeledW8 = { ...w8env('s-dim', [W8_BANDS.A[0]]), table: 'wh_probe_dim' };
+  throwsMerge('W8-shaped partial labeled with the DIM table => envelope_invalid vs the W8 plan (the §2.4 envelope law is variant-independent — the W6/W7 twins above)', () => mergeGroupedPartials(W8_PLAN, [dimLabeledW8]), 'envelope_invalid');
+});
+
+Deno.test('r144 W8 twin-consumption pin (rpc plane): the adapter fuses avg(amount) from s+c AND maps count(amount) DIRECT to the SAME c encoding — both consumed legally in one wave; the exact 17-row merged shape is pinned', () => {
+  const w8row = manifestRowByHash(W8H);
+  if (w8row === null) throw new Error('W8 manifest row missing — the manifest statics block would already have REDd');
+  eqTrue('pre: the W8 manifest row IS the adapter template view (kind rows + merge_ops declaring avg_pair + the s/c/n encodings)', w8row.kind === 'rows' && w8row.merge_ops.includes('avg_pair') && w8row.aggs.s.op === 'sum' && w8row.aggs.c.op === 'count_col');
+  const adapted = [W8_BANDS.A, W8_BANDS.B, W8_BANDS.C].map((band) => adaptWireEnvelope(w8wire(band), w8row, W8_PLAN));
+  eqTrue('all three band wires adapt through the REAL adapter (every plan agg served — nothing excluded)', adapted.every((a) => a !== null));
+  const firstRow = (adapted[0] as NonNullable<typeof adapted[number]>).partial.rows[0].a;
+  eq('the fused avg pair AND the direct c count BOTH carry values from the SAME encoding key (twin consumption: pair {s,c} + bare c, both the wire c)', [firstRow['avg(amount)'], firstRow.c], [{ s: String(W8_BANDS.A[0].x), c: W8_BANDS.A[0].c }, W8_BANDS.A[0].c]);
+  eqTrue('twin-consumption identity holds on EVERY adapted row of EVERY band (pair.c === direct c — one encoding, two legal consumers)', adapted.every((a) => (a as NonNullable<typeof a>).partial.rows.every((row) => (row.a['avg(amount)'] as { c: number }).c === row.a.c)));
+  // The adapter returns the shard-less Omit shape — the CALL SITE stamps
+  // shard (the :2183 convention) before the merge consumes it.
+  const merged = mergeGroupedPartials(W8_PLAN, adapted.map((a, i) => ({ ...(a as NonNullable<typeof a>), shard: `rpc-band-${['A', 'B', 'C'][i]}` })));
+  eq('merged through the REAL merge path: EXACT 17-row shape — per region the fused pair {s: x_r text, c: c_r} AND the direct c count, n 280 (the accToWire wire shapes)', merged.partial.rows, E16.rows.map((r) => ({ k: [r.region], a: { 'avg(amount)': { s: String(r.x), c: r.c }, c: r.c, n: r.n } })));
+  const fin = finalizeGroups(merged, W8_PLAN);
+  eq('finalize(merged) === the E16 projection EXACT (the adapter → merge → finalize rpc-plane path lands the same exact rationals)', fin, E16_W8_FINAL);
+});
+
+// -----------------------------------------------------------------------------
+// r144 KILLER K-W8 (agent-ctx/r140-w7-census.md §6, the lethal arm): the avg
+// fusion must NOT fire when the template does NOT declare avg_pair —
+// avgPairEncoding's gate (wh_engine_core.ts:1226-1227). Call chain (the
+// RED-proof): adaptWireEnvelope (:1278) → the plan-agg loop (:1324-1331:
+// plan op 'avg' → avgPairEncoding(template, col); pair === null ⇒ return
+// null — the loud excluded path upstream) → avgPairEncoding (:1226: `if
+// (template.merge_ops !== undefined && !template.merge_ops.includes
+// ('avg_pair')) return null;` → the structural scan). The lethal view below
+// carries a REAL same-col sum+count_col pair, so the scan WOULD find
+// {sumKey:'s', countKey:'c'} — the gate line is the ONLY code between the
+// wire and a fused pair: the parent's gate-deletion mutant fuses here ⇒ this
+// arm REDs (commit-before-mutant law; the W2 no-pair twin in
+// wh_shard_channel_test.ts stays green under the same mutant — it cannot
+// see the gate). The merge_ops-UNDEFINED control proves the scan finds the
+// pair on the IDENTICAL aggs (the mutant is not saved by an empty scan).
+// -----------------------------------------------------------------------------
+Deno.test('r144 K-W8 (lethal): a same-col sum+count_col pair WITHOUT the avg_pair declaration NEVER fuses — the avg plan agg fails closed (null ⇒ the call-site excluded path); merge_ops-undefined control proves the pair is findable', () => {
+  const w5ClassView = {
+    kind: 'rows',
+    aggs: { s: { op: 'sum', col: 'amount' }, c: { op: 'count_col', col: 'amount' } },
+    merge_ops: ['sum', 'count_col'], // the W5-class shape — a genuine sum+count_col encoding, NO avg_pair
+  };
+  const avgPlanView = { aggs: { 'avg(amount)': { op: 'avg', col: 'amount' } } };
+  eqTrue('K-W8: avg against a DEFINED merge_ops WITHOUT avg_pair (same-col s/c pair present) => null — NOT fused, the avg plan agg is unserved (the gate, not an empty scan)', adaptWireEnvelope(w8wire([W8_BANDS.A[0]]), w5ClassView, avgPlanView) === null);
+  eqTrue('control: the IDENTICAL aggs with merge_ops UNDEFINED => the structural reading FUSES (the scan finds {s,c} — only the declaration gate blocks the lethal arm)', adaptWireEnvelope(w8wire([W8_BANDS.A[0]]), { kind: 'rows', aggs: w5ClassView.aggs }, avgPlanView) !== null);
+  const w8rowK = manifestRowByHash(W8H);
+  eqTrue('positive control: the SAME aggs with avg_pair DECLARED (the real W8 row) => fuses (the declaration is the sole discriminator)', w8rowK !== null && adaptWireEnvelope(w8wire([W8_BANDS.A[0]]), w8rowK, avgPlanView) !== null);
+});
+
+Deno.test('r144 W8 fetch_rows (rpc plane): grouped ⇒ p_params={} byte-pin for ALL K (the r139 law on the W8 surface); rows = the first K of the 17 canonical key-asc; partial_rows still 17×3', async () => {
+  const seen: SeenCall[] = [];
+  const k5Req = parseWhEngineRequest({ ...w8avgReqBody(), query: { ...(w8avgReqBody().query as Record<string, unknown>), fetch_rows: 5 } });
+  const res = await executeWhQuery(joinExecArgs({
+    reqOverride: k5Req,
+    facts: [factRow('shard-a'), factRow('shard-b'), factRow('shard-c')],
+    dims: [dimRow('shard-a', { isReference: true }), dimRow('shard-b', { isReference: true }), dimRow('shard-c', { isReference: true })],
+    fetcher: recordingFetch({ 'shard-a': w8wire(W8_BANDS.A), 'shard-b': w8wire(W8_BANDS.B), 'shard-c': w8wire(W8_BANDS.C) }, seen),
+    templateHashes: [W8H],
+    rpcMode: true,
+  }));
+  eq('rpc specs byte-pin: {p_template_hash: W8H, p_params: {}} ×3 (grouped ⇒ {} — the per-shard $2 threading stays retired on the W8 surface)', seen.map((s) => s.rpc), [
+    { p_template_hash: W8H, p_params: {} },
+    { p_template_hash: W8H, p_params: {} },
+    { p_template_hash: W8H, p_params: {} },
+  ]);
+  eq('response rows = the FIRST 5 of the 17 canonical key-asc (the post-merge slice: g01,g04,g07,g10,g13)', res.rows, E16_W8_FINAL.slice(0, 5));
+  eq('perShard partial_rows still 17×3 (the unsharded echo — ok arms keep the measurement keys, bytes > 0)', res.perShard.map((p) => [p.ok, p.partial_rows, (p.partial_bytes ?? 0) > 0]), [[true, 17, true], [true, 17, true], [true, 17, true]]);
+  eq('the clamp did not disturb the wave: coverage 3/3, partial false, warnings []', [res.coverage, res.partial, res.warnings], ['3/3', false, []]);
 });
 
 // =============================================================================
