@@ -1769,6 +1769,255 @@ Deno.test('r148 G2 (unit, fail-closed depth): a min/max STRING final reaching th
   eq('min/max string final => TypeError (fail-closed loud)', threw, 'TypeError');
 });
 
+// =============================================================================
+// §6.8 — r150 W7 sum rank_by battery arms (design_r147_g2_rankbyagg §6.2 open
+// question 2 CLOSED): rank_by rides the W7 SUM corpus — the last G2 open
+// question. The sum wire carries fixed-point TEXT ('s' TEXT law; the W7 body
+// rides it under the aliased 'x'), ingestion canonicalizes by the ONE colPlan
+// scale (wh_canonical :218-:220 strip/padEnd — over-precision fails CLOSED
+// loud as type_mismatch), the sum FINAL is the SCALED BigInt (accToFinal sum
+// kind) and the comparator is the same-scale monotone BigInt compare (design
+// clause 5). Every expectation below is HAND-COMPUTED from the E16_tier2
+// fixture by an independent integer oracle (Python int/Fraction —
+// agent-ctx/r150-w7-sum-arm.md), never from a run.
+//
+// PRECISION NOTE (arm S1): sums of ints are EXACT at ANY magnitude on the
+// BigInt carrier — the E16 x values (≤ 1,401,144) sit far below 2^53 so even
+// a float64 add would not round HERE, but the pinned law is the exact
+// carrier: the sum path has NO division and NO float anywhere (the
+// float-quotient mutant class M1 cannot re-enter through sums).
+//
+// Independent sum top-5 desc vector (E16 x = Σ amount per region; all 17 x
+// DISTINCT — zero ties, zero NULLs on the corpus):
+//   [g13(1401144), g40(1393669), g04(1349242), g37(1345669), g49(1342756)]
+// — ZERO of 5 positions match the key-asc first-5 {g01,g04,g07,g10,g13}; and
+// vs the banked AVG top-5 [g13,g40,g04,g49,g46] the SUM order swaps position
+// 4 to g37 (c=278: the extra count LOWERS the avg but RAISES the sum — the
+// avg-vs-sum discriminative pair), so the sum arms are NOT avg-arm echoes.
+// =============================================================================
+const G2_SUM_DESC_FULL = ['g13', 'g40', 'g04', 'g37', 'g49', 'g46', 'g19', 'g10', 'g34', 'g01', 'g28', 'g43', 'g16', 'g07', 'g31', 'g25', 'g22'];
+/** Hand-lifted W7 finalize rows (the r133 monoid shape: x rides the scale-0
+ *  BigInt carrier, c/n stay numbers) — the arm EXPECTATIONS, never a run. */
+const G2_SUM_FINAL = E16.rows.map((r) => ({ k: [r.region], aggs: { x: BigInt(r.x), c: r.c, n: r.n } }));
+const sumRowByRegion = new Map(G2_SUM_FINAL.map((r) => [r.k[0] as string, r]));
+const sumRanked = (order: string[]) => order.map((rg) => sumRowByRegion.get(rg) as (typeof G2_SUM_FINAL)[number]);
+const sumArm = (query: Record<string, unknown>) => {
+  const base = tier2JoinReqBody();
+  return { ...base, query: { ...(base.query as Record<string, unknown>), ...query } };
+};
+// plan-time gates live in buildMergePlan (pre-network) — the ARM_A_PLAN
+// precedent, on the SUM plan (the aliased-x flagship).
+const sumPlanOf = (query: Record<string, unknown>) => buildMergePlan(parseWhEngineRequest(sumArm(query)), { columnTypes: COLS, columnScales: SCALES });
+// 3-shard band wave on the RPC plane (the arm-1 discipline, W7 flavor): the
+// flat wire fake is w6wire's shape with the W7 hash (the W7 body IS W6's +
+// the tier-delta line — same aggs/encoding, the variant lives in the
+// manifest, never on the wire).
+const w7wire = (rows: E15Row[]): Record<string, unknown> => ({
+  v: 1,
+  table: 'wh_probe_agg',
+  schema_version: 1,
+  qc_class: 'QC6',
+  kind: 'grouped',
+  groupKeys: ['region'],
+  aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+  rows: rows.map((r) => ({ k: [r.region], a: { x: String(r.x), c: r.c, n: r.n } })),
+  rowCount: rows.length,
+  truncated: false,
+  encoding: { x: 'text', c: 'number', n: 'number' },
+  template_hash: W7H,
+  template_timeout_ms: 8000,
+  latencyMs: 5,
+});
+const sumRankWave = (query: Record<string, unknown>, seen: SeenCall[]) => executeWhQuery(joinExecArgs({
+  reqOverride: parseWhEngineRequest(sumArm(query)),
+  facts: [factRow('shard-a'), factRow('shard-b'), factRow('shard-c')],
+  dims: [dimRow('shard-a', { isReference: true }), dimRow('shard-b', { isReference: true }), dimRow('shard-c', { isReference: true })],
+  fetcher: recordingFetch({ 'shard-a': w7wire(E16_A), 'shard-b': w7wire(E16_B), 'shard-c': w7wire(E16_C) }, seen),
+  templateHashes: [W7H],
+  rpcMode: true,
+}));
+const sumRankWaveEnv = (query: Record<string, unknown>, rows: E15Row[]) => executeWhQuery(joinExecArgs({
+  reqOverride: parseWhEngineRequest(sumArm(query)),
+  facts: [factRow('shard-a')],
+  dims: [dimRow('shard-a', { isReference: true })],
+  fetcher: recordingFetch({ 'shard-a': w7env('shard-a', rows) }, []),
+  templateHashes: [W7H],
+}));
+
+Deno.test('r150 W7 sum arm S1 (the discriminator): W7 + rank_by {agg:"x"} desc (the sum ships ALIASED x), K=5 => rows = [g13,g40,g04,g37,g49] EXACT scaled BigInts — ZERO of 5 positions match the key-asc first-5; g37 (c=278) rises where the AVG arm carried g49; rpc specs stay p_params:{} ×3 (rank is POST-merge, the shard plane never sees rank_by on the SUM plane either)', async () => {
+  const seen: SeenCall[] = [];
+  const res = await sumRankWave({ limit: 5, rank_by: { agg: 'x' } }, seen);
+  eq('rows = top-5 by EXACT sum desc (the independent-oracle vector: 1401144, 1393669, 1349242, 1345669, 1342756)', res.rows, sumRanked(['g13', 'g40', 'g04', 'g37', 'g49']));
+  eq('the sum VALUES ride the scale-0 BigInt carrier EXACT (never a float, never the wire text)', res.rows?.map((r) => String(r.aggs.x as bigint)), ['1401144', '1393669', '1349242', '1345669', '1342756']);
+  eq('ZERO positional overlap with the key-asc first-5 {g01,g04,g07,g10,g13} (maximally discriminative on the sum corpus too)', res.rows?.map((r) => r.k[0]), ['g13', 'g40', 'g04', 'g37', 'g49']);
+  eq('rpc specs byte-pin WITH rank_by armed: {p_template_hash: W7H, p_params: {}} ×3 (the r139 grouped law holds for the sum rank — rank_by rides NO shard param)', seen.map((s) => s.rpc), [
+    { p_template_hash: W7H, p_params: {} },
+    { p_template_hash: W7H, p_params: {} },
+    { p_template_hash: W7H, p_params: {} },
+  ]);
+  eq('perShard partial_rows still 6/6/5 (unsharded echo) + coverage 3/3 clean', [res.perShard.map((p) => [p.ok, p.partial_rows, (p.partial_bytes ?? 0) > 0]), res.coverage, res.partial, res.warnings], [[[true, 6, true], [true, 6, true], [true, 5, true]], '3/3', false, []]);
+});
+
+Deno.test('r150 W7 sum arm S2 (asc twin): direction:"asc" => EXACT value-reverse of desc over the 17 (all 17 x DISTINCT — zero ties, zero NULLs on E16, so the asc order is the pure mirror); K absent => all 17 ranked', async () => {
+  const resDesc = await sumRankWaveEnv({ rank_by: { agg: 'x', direction: 'desc' } }, E16.rows);
+  const resAsc = await sumRankWaveEnv({ rank_by: { agg: 'x', direction: 'asc' } }, E16.rows);
+  eq('desc full order == the independent-oracle 17-order', resDesc.rows?.map((r) => r.k[0]), G2_SUM_DESC_FULL);
+  eq('asc full order == EXACT reverse (the scaled BigInt compare is total on this corpus — no tie law reachable)', resAsc.rows?.map((r) => r.k[0]), [...G2_SUM_DESC_FULL].reverse());
+  eq('row BODIES byte-identical to the hand-lifted finalize projection in BOTH directions', [resDesc.rows, resAsc.rows], [sumRanked(G2_SUM_DESC_FULL), sumRanked([...G2_SUM_DESC_FULL].reverse())]);
+});
+
+// NULL-input wave builder: a sum partial rides x: null for a group with NO
+// non-NULL amount on that shard (the empty-contribution identity — the sum
+// accumulator's `seen` stays false; c = count(amount) honestly reports 0).
+// gz = x:null on BOTH shards (E14: the final SUM is NULL, never 0); gz2 =
+// null on shard-a + 2500 on shard-b (the null contributes NOTHING — SQL
+// semantics). Merged: 19 groups; gz sum NULL n=180 c=0; gz2 sum 2500 n=130
+// c=5 — ALL hand-computed, never run.
+const w7envNullX = (shard: string, rows: { region: string; x: number | null; c: number; n: number }[]): WhPartialEnvelope => ({
+  v: 1,
+  shard,
+  table: 'wh_probe_agg',
+  schema_version: 1,
+  partial: {
+    kind: 'grouped',
+    groupKeys: ['region'],
+    aggs: { x: { op: 'sum', col: 'amount' }, c: { op: 'count', col: 'amount' }, n: { op: 'count' } },
+    rows: rows.map((r) => ({ k: [r.region], a: { x: r.x === null ? null : String(r.x), c: r.c, n: r.n } })),
+    rowCount: rows.length,
+    more: false,
+  },
+});
+const SUM_NULL_A: { region: string; x: number | null; c: number; n: number }[] = [...E16.rows, { region: 'gz', x: null, c: 0, n: 100 }, { region: 'gz2', x: null, c: 0, n: 50 }];
+const SUM_NULL_B: { region: string; x: number | null; c: number; n: number }[] = [{ region: 'gz', x: null, c: 0, n: 80 }, { region: 'gz2', x: 2500, c: 5, n: 80 }];
+const sumRankWave2 = (query: Record<string, unknown>) => executeWhQuery(joinExecArgs({
+  reqOverride: parseWhEngineRequest(sumArm(query)),
+  facts: [factRow('shard-a'), factRow('shard-b')],
+  dims: [dimRow('shard-a', { isReference: true }), dimRow('shard-b', { isReference: true })],
+  fetcher: recordingFetch({ 'shard-a': w7envNullX('shard-a', SUM_NULL_A), 'shard-b': w7envNullX('shard-b', SUM_NULL_B) }, []),
+  templateHashes: [W7H],
+}));
+
+Deno.test('r150 W7 sum arm S3 (NULL inputs, cross-shard): all-null group => sum NULL (E14 — never 0), ranked LAST in BOTH directions, NEVER excluded; mixed group (null on one shard, 2500 on the other) => 2500 (the null contributes NOTHING — SQL semantics); 19 merged groups', async () => {
+  const resDesc = await sumRankWave2({ rank_by: { agg: 'x' } });
+  eq('desc: 19 rows = the 17 value-desc E16 rows, then gz2(2500) (2500 < min E16 x 1176427), then gz(NULL) LAST', resDesc.rows?.map((r) => r.k[0]), [...G2_SUM_DESC_FULL, 'gz2', 'gz']);
+  eq('desc: the NULL row carries sum null IN ROWS (ranked, never excluded — the K-prefix contract)', resDesc.rows?.[18]?.aggs.x, null);
+  eq('desc: the mixed group merged to EXACTLY 2500n (the null shard contributed nothing; the all-null E14 NULL below is what separates absent from zero)', resDesc.rows?.[17]?.aggs.x, 2500n);
+  const resAsc = await sumRankWave2({ rank_by: { agg: 'x', direction: 'asc' } });
+  eq('asc: gz2(2500) FIRST (smallest VALUE — the value law flips), the 17 E16 rows value-ascending, and gz(NULL) STILL last (placement FIXED — direction flips the value compare only)', resAsc.rows?.map((r) => r.k[0]), ['gz2', ...[...G2_SUM_DESC_FULL].reverse(), 'gz']);
+  // merge-path unit twin: the same null-x partials through the REAL merge+finalize
+  const fin = finalizeGroups(mergeGroupedPartials(W7_PLAN, [w7envNullX('m-a', SUM_NULL_A), w7envNullX('m-b', SUM_NULL_B)]), W7_PLAN);
+  eq('merge+finalize unit twin: gz finalizes sum null / c 0 / n 180 and gz2 sum 2500n / c 5 / n 130 (the empty-contribution identity is the ACCUMULATOR law, not a comparator special case)', fin.filter((r) => r.k[0] === 'gz' || r.k[0] === 'gz2'), [
+    { k: ['gz'], aggs: { x: null, c: 0, n: 180 } },
+    { k: ['gz2'], aggs: { x: 2500n, c: 5, n: 130 } },
+  ]);
+});
+
+// --- TEXT-scale arm (d): ONE colPlan scale per agg (the r148 ingestion law).
+// A price column at scale 3: the shard wire renders '10.5' / '9.25' / '0.001'
+// at DISPLAY scale; ingestion canonicalizes by the ONE plan scale (strip
+// trailing zeros, padEnd — wh_canonical :218-:220) and any over-precision
+// ('0.0001' at scale 3) fails CLOSED loud (type_mismatch). The comparator
+// NEVER parses text — it compares the SCALED BigInts (same-scale monotone:
+// multiply-by-10^scale is order-preserving; the scaled BigInts ADD across
+// shards — 1n + 2n = 3n). Independent oracle: 10.5→10500, 9.25→9250,
+// 0.001+0.002→3 @ scale 3; exact decimal order 10.5 > 9.25 > 0.003 preserved.
+const PRICE_COLS: Record<string, string> = { region: 'text', price: 'numeric' };
+const PRICE_SCALES: Record<string, number> = { price: 3 };
+const priceArm = (query: Record<string, unknown>) => ({
+  v: 1,
+  qid: '01J9Q1ZZZZZZZZZZZZZZZZZZZZ',
+  table: 'wh_probe_agg',
+  query: {
+    select: [{ op: 'sum', col: 'price', alias: 'x' }, { op: 'count', alias: 'n' }],
+    groupBy: ['region'],
+    join: { table: 'wh_probe_dim', type: 'inner', on: { left: 'region', right: 'region' }, variant: 'tier2' },
+    ...query,
+  },
+});
+const PRICE_PLAN = buildMergePlan(parseWhEngineRequest(priceArm({})), { columnTypes: PRICE_COLS, columnScales: PRICE_SCALES });
+const priceEnv = (shard: string, rows: { region: string; x: string | null; n: number }[]): WhPartialEnvelope => ({
+  v: 1,
+  shard,
+  table: 'wh_probe_agg',
+  schema_version: 1,
+  partial: {
+    kind: 'grouped',
+    groupKeys: ['region'],
+    aggs: { x: { op: 'sum', col: 'price' }, n: { op: 'count' } },
+    rows: rows.map((r) => ({ k: [r.region], a: { x: r.x, n: r.n } })),
+    rowCount: rows.length,
+    more: false,
+  },
+});
+const PRICE_BAND: { region: string; x: string | null; n: number }[] = [
+  { region: 'p1', x: '10.5', n: 4 },
+  { region: 'p2', x: '9.25', n: 3 },
+  { region: 'p3', x: '0.001', n: 2 },
+];
+const priceWave = (query: Record<string, unknown>, byShard: Record<string, WhPartialEnvelope | Record<string, unknown>>) => executeWhQuery({
+  ...joinExecArgs({
+    reqOverride: parseWhEngineRequest(priceArm(query)),
+    facts: [factRow('shard-a'), factRow('shard-b')],
+    dims: [dimRow('shard-a', { isReference: true }), dimRow('shard-b', { isReference: true })],
+    fetcher: recordingFetch(byShard, []),
+    templateHashes: [W7H],
+  }),
+  columnTypes: PRICE_COLS,
+  columnScales: PRICE_SCALES,
+});
+
+Deno.test('r150 W7 sum arm S4 (TEXT-scale normalization): display scales COLLAPSE to the ONE colPlan scale at ingestion — \'10.5\'/\'9.25\'/\'0.001+0.002\' rank by the SCALED BigInts (10500 > 9250 > 3 — same-scale monotone = the exact decimal order); the comparator never parses text; over-precision fails CLOSED loud', async () => {
+  const res = await priceWave({ rank_by: { agg: 'x' } }, {
+    'shard-a': priceEnv('shard-a', PRICE_BAND),
+    'shard-b': priceEnv('shard-b', [{ region: 'p3', x: '0.002', n: 1 }]),
+  });
+  eq('desc by the SCALED sums (10.5→10500n; 9.25→9250n; 0.001+0.002→3n — the scaled BigInts ADD across shards, 1n+2n=3n)', res.rows?.map((r) => [r.k[0], String(r.aggs.x as bigint)]), [['p1', '10500'], ['p2', '9250'], ['p3', '3']]);
+  eq('scaled order == the EXACT decimal order (10.5 > 9.25 > 0.003 — zero ties; the ingestion normalization is rank-lawful)', res.rows?.map((r) => r.k[0]), ['p1', 'p2', 'p3']);
+  const resAsc = await priceWave({ rank_by: { agg: 'x', direction: 'asc' } }, {
+    'shard-a': priceEnv('shard-a', PRICE_BAND),
+    'shard-b': priceEnv('shard-b', [{ region: 'p3', x: '0.002', n: 1 }]),
+  });
+  eq('asc = exact reverse [p3, p2, p1] (the same-scale monotone law flips with direction only)', resAsc.rows?.map((r) => r.k[0]), ['p3', 'p2', 'p1']);
+  // fail-closed loud at ingestion — the direct test-double pin
+  throwsMerge('direct test-double: \'0.0001\' (4 frac digits > scale 3) => type_mismatch at ingestion (fail-closed loud — never a silent re-scale)', () => mergeGroupedPartials(PRICE_PLAN, [priceEnv('shard-b', [{ region: 'p9', x: '0.0001', n: 1 }])]), 'type_mismatch');
+  // ...and the E2E reach: the lying shard is EXCLUDED LOUD, the honest wave still ranks
+  const resBad = await priceWave({ rank_by: { agg: 'x' } }, {
+    'shard-a': priceEnv('shard-a', [{ region: 'p1', x: '10.5', n: 4 }]),
+    'shard-b': priceEnv('shard-b', [{ region: 'p9', x: '0.0001', n: 1 }]),
+  });
+  eq('E2E: the over-scale shard is EXCLUDED LOUD (ok:false, error:excluded) — coverage 1/2, partial true', [resBad.perShard.map((p) => [p.shard, p.ok, p.error === null ? null : p.error]), resBad.coverage, resBad.partial], [[['shard-a', true, null], ['shard-b', false, 'excluded']], '1/2', true]);
+  eq('E2E: the exclusion warning carries the ingestion diagnosis ("numeric over-precision: \'0.0001\' has more than 3 fractional digits" — the type_mismatch class, loud with the value named by the r57-adjacent merge law)', resBad.warnings.map((w) => [w.shard, w.code, (w.detail ?? '').includes("numeric over-precision: '0.0001' has more than 3 fractional digits")]), [['shard-b', 'excluded', true]]);
+  eq('E2E: the HONEST shard still ranks (the fold survives the exclusion — rows = [p1 @ 10500n])', resBad.rows, [{ k: ['p1'], aggs: { x: 10500n, n: 4 } }]);
+});
+
+Deno.test('r150 W7 sum arm S5 (K boundaries): K=1 => [g13] (the sum top-1); K=groups(17) => ALL 17 in the full rank order (the == boundary clamps nothing); K>groups(25) => the full passthrough (slice clamps, rank survives)', async () => {
+  const res1 = await sumRankWaveEnv({ limit: 1, rank_by: { agg: 'x' } }, E16.rows);
+  eq('K=1: exactly the sum top-1 (g13 @ 1401144 — the oracle vector head)', res1.rows, sumRanked(['g13']));
+  const resEq = await sumRankWaveEnv({ limit: 17, rank_by: { agg: 'x' } }, E16.rows);
+  eq('K=17 == groups: all 17 rows, full rank order (NOT truncated, NOT key-asc)', resEq.rows, sumRanked(G2_SUM_DESC_FULL));
+  const resGt = await sumRankWaveEnv({ limit: 25, rank_by: { agg: 'x' } }, E16.rows);
+  eq('K=25 > groups: full passthrough — all 17 in rank order, bodies byte-identical to the hand-lifted projection', resGt.rows, sumRanked(G2_SUM_DESC_FULL));
+});
+
+Deno.test('r150 W7 sum arm S6 (rejects, sum corpus — every fixed string COPIED from core, r57 law): direction "bogus" => the enum message; unknown keys => the tighter-than-outer message; the unaliased op-col name \'sum(amount)\' does NOT bind (the W7 sum ships ALIASED x — the NAME law is alias-agnostic); parse-level shape rejects precede plan-time binding', () => {
+  // direction bogus (parse — the enum literal is checked LAST at parse, but
+  // parse runs BEFORE plan-time binding: the direction message wins over the
+  // membership gate)
+  throwsEngine('rank_by {agg:"x", direction:"bogus"} => 400 "query.rank_by.direction must be \\"asc\\" or \\"desc\\""', () => parseWhEngineRequest(sumArm({ rank_by: { agg: 'x', direction: 'bogus' } })), 'malformed', 'query.rank_by.direction must be "asc" or "desc"');
+  throwsEngine('direction fires even when the agg name would never bind (parse precedes the plan-time membership gate)', () => parseWhEngineRequest(sumArm({ rank_by: { agg: 'sum(amount)', direction: 'bogus' } })), 'malformed', 'query.rank_by.direction must be "asc" or "desc"');
+  // unknown keys (parse — tighter than the outer query object's ignore)
+  throwsEngine('rank_by {agg:"x", order:"desc"} => 400 unknown-keys (the V-3 tighter-than-outer law on the sum corpus)', () => parseWhEngineRequest(sumArm({ rank_by: { agg: 'x', order: 'desc' } })), 'malformed', 'query.rank_by carries unknown keys (only agg|direction are allowed — rank directives are strictly validated)');
+  // agg-before-direction order pin (arm 11's twin on the sum name)
+  throwsEngine('order pin: {agg:"", direction:"bogus"} => the AGG message fires before the direction message', () => parseWhEngineRequest(sumArm({ rank_by: { agg: '', direction: 'bogus' } })), 'malformed', 'query.rank_by.agg must be a non-empty string naming a plan aggregate');
+  // membership (PLAN time — the sum flagship rides ALIASED 'x': the unaliased
+  // op-col name is NOT a plan agg name here)
+  throwsEngine('rank_by {agg:"sum(amount)"} => 400 membership (rank binds by the NAME the envelope carries — \'x\' on the W7 corpus; the alias-agnostic mirror of the M5/avg-unaliased fold)', () => sumPlanOf({ rank_by: { agg: 'sum(amount)' } }), 'malformed', 'query.rank_by.agg does not name an aggregate in the plan (rank binds by the aggregate NAME the envelope carries)');
+  // the positive bind: 'x' IS the plan name (grouped kind + sum scope — no
+  // gate fires; the plan carries the aliased sum agg)
+  const plan = sumPlanOf({ rank_by: { agg: 'x' } });
+  eq('rank_by {agg:"x"} BINDS: the plan builds clean — aggs keyed [x, c, n] with x the sum op, one groupKey', [Object.keys(plan.aggs), plan.aggs.x?.op, plan.groupKeys?.length], [['x', 'c', 'n'], 'sum', 1]);
+});
+
 // -----------------------------------------------------------------------------
 // Harness report (hand-rolled runner, no external deps).
 // -----------------------------------------------------------------------------
