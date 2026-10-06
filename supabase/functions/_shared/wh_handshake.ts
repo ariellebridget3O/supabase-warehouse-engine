@@ -592,11 +592,12 @@ export interface DerivePlanView {
  *     derive W1+W6 with derived[0]=W1, 400ing a LEGAL join request.
  *   * r133 VARIANT PARTITION (design_r132_w7_family §2.2): WITHIN the join
  *     class, a plan derives ONLY rows whose manifest join.variant EQUALS
- *     the request's (absent↔absent = W6, 'tier2'↔'tier2' = W7). W6/W7
- *     merge_ops are IDENTICAL, so the variant — NOT merge-op disjointness —
- *     is the sole co-derivation discriminator (two join-class rows with
- *     the same op-set can never both derive; derived[0] stays
- *     deterministic). Zero matches after the partition → an empty
+ *     the request's (absent↔absent = W6, 'tier2'↔'tier2' = W7). r144
+ *     appended W8 to the tier2 class — co-derivation is now barred TWICE
+ *     over: the variant partition AND the op-set (W8 lacks `sum`, W7
+ *     lacks `avg_pair`), so no two join-class rows can ever both derive
+ *     (W6⇄W7/W8 by the variant, W7⇄W8 by the op-set; derived[0] stays
+ *     deterministic). Zero matches after the partitions → an empty
  *     derivation → the D2-owned plan_untemplated outcome (the dim binding
  *     is NOT a derivation input — the plan gate solely owns it).
  * The set is manifest-bounded BY CONSTRUCTION (plan-honesty can never
@@ -640,9 +641,10 @@ export function deriveTemplateHashes(
     if (row.logical_table !== plan.table) continue;
     if (row.kind !== planKind) continue;
     if (planIsJoin !== (row.join !== undefined)) continue;
-    // r133: within the join class, the VARIANT decides — W6 (variant
-    // absent) serves absent-variant plans only, W7 ('tier2') serves tier2
-    // plans only; W6/W7 (identical merge_ops) can never co-derive.
+    // r133: within the join class, the VARIANT partitions — W6 (variant
+    // absent) serves absent-variant plans only, W7/W8 ('tier2') serve
+    // tier2 plans only (r144: W7⇄W8 separated by the op-SET too — barred
+    // TWICE over; W6/W7, identical merge_ops, never co-derive).
     if (planIsJoin && (row.join?.variant ?? undefined) !== planVariant) continue;
     if (!planOpsSubset(planOps, row.merge_ops)) continue;
     if (tableSchemaVersion !== undefined && row.schema_version !== tableSchemaVersion) continue;

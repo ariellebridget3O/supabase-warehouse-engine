@@ -1077,6 +1077,42 @@ Deno.test('r144 E16 avg-pair monoid closure: 17 W8-shaped one-region partials me
   eqTrue('every finalized pair is the region-ascending tier-2 set with den = c_r > 0 (no NULL avg rows in THIS corpus — the census §6 pre-registered non-arm; all-null finalize stays the scalar lane E2/E14)', fin.every((r, i) => r.k[0] === E16.rows[i].region && (r.aggs['avg(amount)'] as { num: bigint; den: bigint }).den === BigInt(E16.rows[i].c)));
 });
 
+// r145 P3-4 rider (r144 review-A ledger; census §6 envelope leg): `phases`
+// present on the W8/W7 tier2 family SUCCESS envelopes — the r121 phases law
+// never reached the join lane (zero `phases` matches in this file since
+// r133; the scalar-lane mirror is the wh_handshake_test.ts ADD #4 pin).
+// Threaded preChain + the counting timers: pre_chain EXACT (the threaded
+// entrypoint value), handshake EXACT 0 (the unsampled fold steady state),
+// fanout MEASURED (the runFanout block wall — a lower bound by law, never
+// hardcoded: the r121 house style).
+Deno.test('r145 P3-4 (census §6 envelope leg): the W8/W7 tier2 join-family success envelopes carry `phases` — pre_chain threaded exact, handshake 0 unsampled, fanout measured', async () => {
+  const stepTimers = (): WhEngineTimers => {
+    let n = 0;
+    return { nowMs: () => (n += 3), startTimeout: (_ms: number) => ({ promise: new Promise<'timeout'>(() => {}), dispose: () => {} }) };
+  };
+  const oneShardWave = (reqBody: Record<string, unknown>, templateHash: string, env: WhPartialEnvelope): Parameters<typeof executeWhQuery>[0] => ({
+    ...joinExecArgs({
+      reqOverride: parseWhEngineRequest(reqBody),
+      facts: [factRow('shard-a')],
+      dims: [dimRow('shard-a', { isReference: true })],
+      fetcher: recordingFetch({ 'shard-a': env }, []),
+      templateHashes: [templateHash],
+    }),
+    timers: stepTimers(),
+    timings: { preChainMs: 123 },
+  });
+  // W8 (tier2-avg): `phases` rides the SAME post-assembly injection site
+  // the scalar lane pins — exact where hand-computable, measured where it
+  // is a block wall.
+  const res8 = await executeWhQuery(oneShardWave(w8avgReqBody(), W8H, w8env('shard-a', E16.rows)));
+  eq('W8 tier2-avg envelope: pre_chain_ms is the THREADED 123 and handshake_ms the unsampled 0 (the r121 phases law reaches the join family — census §6 "phases present")', [res8.phases?.pre_chain_ms, res8.phases?.handshake_ms], [123, 0]);
+  eqTrue('W8 fanout_ms MEASURED (>= one counting step — the runFanout block wall; a dropped phases injection or a hardcoded 0 REDs)', (res8.phases?.fanout_ms ?? 0) >= 1);
+  // W7 (tier2-sum): BOTH tier2 family members carry the leg.
+  const res7 = await executeWhQuery(oneShardWave(tier2JoinReqBody(), W7H, w7env('shard-a', E16.rows)));
+  eq('W7 tier2-sum envelope: the SAME exact {pre_chain 123, handshake 0} phases pair (both W8/W7 family members carry the leg)', [res7.phases?.pre_chain_ms, res7.phases?.handshake_ms], [123, 0]);
+  eqTrue('W7 fanout_ms MEASURED (the block wall — non-vacuous vs a hardcoded {123, 0, 0})', (res7.phases?.fanout_ms ?? 0) >= 1);
+});
+
 // -----------------------------------------------------------------------------
 // r144 fanout banding (test-side hand rule): the E16 fixture pins the
 // per-band TOTALS only (per_band {n, sum_x} — the banked oracle's projection
