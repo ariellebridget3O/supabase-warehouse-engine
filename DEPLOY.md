@@ -108,7 +108,8 @@ Optional, same endpoint (separate calls or one array):
 ## 5. Deploy
 
 r124 A8: the deploy rides the GATE — five ordered checks (on-branch main /
-clean tree / HEAD == origin/main after fetch / stamp fresh / token present);
+clean tree / HEAD == origin/main after fetch / stamp fresh / required env
+present: SUPABASE_ACCESS_TOKEN + WHE_PROJECT_REF);
 a refusal dies with a fixed message and never deploys:
 
 ```bash

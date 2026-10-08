@@ -34,9 +34,10 @@ The lever set (shipped default **OFF**/absent for every lever; the live deployme
 git clone https://github.com/ariellebridget3O/supabase-warehouse-engine
 cd supabase-warehouse-engine
 
-# 0. Once, before the credentialed steps (2–4): export REF=<your-project-ref>
+# 0. Once, before the credentialed steps (2–4): export WHE_PROJECT_REF=<your-project-ref>
 #    and SUPABASE_ACCESS_TOKEN=<sbp_… PAT> (DEPLOY.md §1 — the PAT is never
-#    WHE_BEARER_TOKEN).
+#    WHE_BEARER_TOKEN; WHE_PROJECT_REF is the SAME var DEPLOY §5's make deploy
+#    passes to --project-ref — do not rename it to REF).
 
 # 1. Offline gate — zero network, no DB, no PAT.
 make test                 # or: deno task test
@@ -44,18 +45,18 @@ make ci                   # the full offline gate: check + test + lint-templates
 
 # 2. Apply migrations with the Management-API runner (one statement per call,
 #    fail-fast, idempotent re-runs — DEPLOY.md §2):
-#    SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="$REF" bash scripts/migrate.sh
+#    SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="$WHE_PROJECT_REF" bash scripts/migrate.sh
 #    Single-project shape: the engine host is also the only shard, so ALSO apply the
-#    shard side and seed the W1–W6 templates (DEPLOY.md §3):
-#    WHE_PROJECT_REF="$REF" bash scripts/migrate.sh --shard
+#    shard side and seed the W1–W8 templates (DEPLOY.md §3):
+#    WHE_PROJECT_REF="$WHE_PROJECT_REF" bash scripts/migrate.sh --shard
 #    (psql through the pooler / the dashboard SQL editor remain documented fallbacks.)
 
 # 3. Set the bearer secret, deploy (no Docker, no local Deno needed):
 #    SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" npx -y supabase functions deploy warehouse-engine \
-#      --project-ref $REF --no-verify-jwt --use-api
+#      --project-ref "$WHE_PROJECT_REF" --no-verify-jwt --use-api
 
 # 4. Smoke (needs 0013 applied first — see rescue line 5):
-curl -fsS "https://$REF.supabase.co/functions/v1/warehouse-engine/health"
+curl -fsS "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/health"
 #    → 200 {"v":1,"ok":true,"directory_version":N,"engine_build":"<sha7>"}
 ```
 
@@ -90,7 +91,7 @@ Full wire contract: [API.md](API.md).
 
 1. **`deno` missing** — `make test` runs `scripts/run-tests.mjs` (a node-run wrapper — stock `node` executes it; `deno task test` bypasses the wrapper), which prints a loud banner with the exact install command (`curl -fsSL https://deno.land/x/install/install.sh | sh`) and **exits 1**. It never silently skips (green-when-unverified is banned). Deno is needed for the battery and `deno check` — *not* for deploy (`--use-api` bundles server-side).
 2. **Supabase CLI auth** — export `SUPABASE_ACCESS_TOKEN=sbp_…` (a real PAT from dashboard → account → tokens). **Explicit, never a fallback**: this repo deliberately drops FM's `deploy.sh` fallback that offered the bearer token as a PAT — that silent swap just 401s confusingly. Three tokens, three jobs: PAT (Management API) ≠ `WHE_BEARER_TOKEN` (this function) ≠ shard service keys.
-3. **Project paused (free tier)** — preflight before anything: `curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" https://api.supabase.com/v1/projects/$REF | jq .status` → expect `ACTIVE_HEALTHY` (requires `jq` on PATH); `PAUSED` ⇒ dashboard → restore project, then re-run.
+3. **Project paused (free tier)** — preflight before anything: `curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" https://api.supabase.com/v1/projects/$WHE_PROJECT_REF | jq .status` → expect `ACTIVE_HEALTHY` (requires `jq` on PATH); `PAUSED` ⇒ dashboard → restore project, then re-run.
 4. **`verify_jwt` left on** — `supabase/config.toml` pins `[functions.warehouse-engine] verify_jwt = false`, and deploys pass `--no-verify-jwt`. Discrimination: a **bare gateway 401** (no `auth_kind` field) = platform JWT check rejected the call before the handler; the fn's **own 401** always says `auth rejected before route dispatch (<kind>)` with an `auth_kind` field (see API.md).
 5. **Migrations before smoke** — `GET /health` answers `500 {"v":1,"ok":false,…}` until `0013_warehouse_catalog.sql` is applied (the version probe reads `config.warehouse_directory_version` / the directory view). Apply 0013 → 0014 → 0016 first, then smoke.
 

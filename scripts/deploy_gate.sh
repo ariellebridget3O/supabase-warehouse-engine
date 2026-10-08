@@ -48,7 +48,11 @@ stamp_file="supabase/functions/_shared/engine_build.ts"
 [ -f "$stamp_file" ] || die "engine_build stamp stale/absent — run make stamp"
 [ "$(cat "$stamp_file")" = "export const ENGINE_BUILD = \"$sha7\";" ] || die "engine_build stamp stale/absent — run make stamp"
 
-# (5) token non-empty — checked in-script (never ${:?} raw-bash, r118 T-3).
+# (5) required deploy env non-empty — checked in-script (never ${:?} raw-bash,
+#     r118 T-3). WHE_PROJECT_REF rides the same gate: `make deploy` hands it to
+#     the CLI (--project-ref), and an empty ref only surfaces as a cryptic
+#     npx failure — die here, naming the var.
 [ -n "${SUPABASE_ACCESS_TOKEN:-}" ] || die "SUPABASE_ACCESS_TOKEN is empty/unset — export the deploy token before running make deploy"
+[ -n "${WHE_PROJECT_REF:-}" ] || die "WHE_PROJECT_REF is empty/unset — export your project ref (DEPLOY.md §1) before running make deploy"
 
 echo "branch main @ $sha7 == origin/main, clean, stamp ok"

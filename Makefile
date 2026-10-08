@@ -51,7 +51,7 @@ stamp:
 	echo "stamped supabase/functions/_shared/engine_build.ts @ $$sha7"
 
 # r124 A8 deploy gate (design §2 ➋B-2): FIVE ordered checks — on-branch main /
-# clean tree / HEAD==origin/main after fetch / stamp fresh / token non-empty
+# clean tree / HEAD==origin/main after fetch / stamp fresh / required env non-empty
 # — each dying with ONE fixed message (fm deploy.sh fail-fast style; the
 # token guard lives in-script, NEVER ${:?} raw-bash — r118 T-3).
 deploy-gate:
