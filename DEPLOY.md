@@ -74,10 +74,10 @@ SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="<shard-ref>" \
   bash scripts/migrate.sh --shard
 ```
 
-**Then seed the W1–W6 query templates** per `db/shard-templates/manifest.json` (the body-of-record with pinned sha256 `template_hash`es — do not reformat those files; W6 = the r129 join class, additive `join:{dim,left,right}` manifest key). Lint first, then render the seed wave and apply it through the runner's `--file` mode:
+**Then seed the W1–W8 query templates** per `db/shard-templates/manifest.json` (the body-of-record with pinned sha256 `template_hash`es — do not reformat those files; W6 = the r129 join class, additive `join:{dim,left,right}` manifest key). Lint first, then render the seed wave and apply it through the runner's `--file` mode:
 
 ```bash
-python3 scripts/lint_shard_templates.py          # must report: 6/6 templates PASS
+python3 scripts/lint_shard_templates.py          # must report: 8/8 templates PASS
 python3 scripts/render_wh_seed_wave.py \
   --templates-dir db/shard-templates --out seed_wave.sql   # add --with-cold only if facts_blocks DDL (shard 0016) is applied
 SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="<shard-ref>" \
