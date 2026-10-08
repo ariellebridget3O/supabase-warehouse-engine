@@ -86,6 +86,64 @@ SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="<shard-ref>" \
 
 **Fallback** for both the shard migrations and the seed wave: `psql … -f` through the session pooler or a dashboard SQL-editor paste (you bypass the runner's statement-by-statement fail-fast and `Retry-After` handling; re-runs stay safe — all files are idempotent).
 
+## 3b. First data plane — from empty catalog to a first 200 (single-project shape)
+
+§3 seeds the SHARD-side template registry, but the ENGINE-side catalog still
+has zero rows, so `POST /query` answers the fail-closed 404 `tier_warm`. The
+minimal first-200 recipe — run on the ENGINE-HOST project (single-project
+shape: it is also the shard) as postgres (SQL editor or psql — RLS blocks
+anon/authenticated), or saved to a file and applied with the runner's
+`--file` mode. Needs §5's deployed function: the edge fn IS the engine —
+without it there is no `/query` route at all.
+
+```sql
+-- the shipped templates (W1–W8) read wh_probe_agg's id/region/amount columns
+-- (see db/shard-templates/*.sql); minimal serving shape:
+create table if not exists public.wh_probe_agg (
+  id     bigint generated always as identity primary key,
+  region text not null,
+  amount numeric not null
+);
+insert into public.wh_probe_agg (region, amount) values ('r1', 10), ('r1', 2.5), ('r2', 7);
+
+-- register the logical table + ONE unbounded serving placement for this project:
+insert into public.warehouse_tables (logical_name, shard_key_type)
+values ('wh_probe_agg', 'none');
+insert into public.warehouse_placements
+  (table_id, project_id, key_min, key_max, hash_slot, is_reference, state, schema_version, last_health_at)
+select t.id,
+       (select id from public.projects where ref = '<your-project-ref>'),
+       null, null, null, false, 'serving', 1, now()
+from public.warehouse_tables t
+where t.logical_name = 'wh_probe_agg';
+```
+
+`v_warehouse_directory` serves only placements health-stamped within the last
+90 seconds — the fleet watchdog normally stamps `last_health_at`; standalone,
+RE-STAMP before querying after an idle period (an UPDATE — re-running the
+INSERT would trip the `one_serving_per_span` unique index):
+
+```sql
+update public.warehouse_placements set last_health_at = now()
+where table_id = (select id from public.warehouse_tables where logical_name = 'wh_probe_agg');
+```
+
+Then the first 200 (same body shape as §6b's smoke; `apikey` only needs to be
+PRESENT — any value):
+
+```bash
+curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/query" \
+  -H "Authorization: Bearer $WHE_BEARER_TOKEN" -H "apikey: any-value" \
+  -H "Content-Type: application/json" \
+  -d '{"qid":"first-200","table":"wh_probe_agg","query":{"select":[{"op":"min","col":"amount"},{"op":"max","col":"amount"}]}}'
+#    → 200 {"v":1,"qid":"first-200","directory_version":N,"coverage":…,"result":…,…} (the seeded arm of §6b)
+```
+
+(The directory read rides the `wh_directory_atomic_read` RPC — fm
+`db/migrations/0026`, which arrives with the same fleet-manager-family
+provisioning that provides the base schema, §2. A host without it fails the
+directory read loudly.)
+
 ## 4. Set secrets (`WHE_BEARER_TOKEN` required)
 
 Via the Management API secrets endpoint (JSON-array body):
