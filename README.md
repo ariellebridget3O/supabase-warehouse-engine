@@ -14,7 +14,7 @@ What it does:
 
 ## Ships live — the flip doctrine (executed r118)
 
-`POST /query` is **live**: the real-fetcher gate is flipped — `FLIP_hasRealFetcher = true` in `_shared/wh_entrypoint.ts:105` since r118 (commit `bcc238a`) — so `/query` plans, fans out, and merges for real. History kept as doctrine: pre-r118 the handler answered a pinned **500 before any directory work** ("a deployed stub must never serve plausible-looking empty 200s"); flipping remains a reviewed **code** change to that constant — never a deploy-time env — so the same constant is the instant rollback site if the gate ever needs to come back down. `GET /health` is fully functional once migration `0013` is applied — **that is the smoke target**.
+`POST /query` is **live**: the real-fetcher gate is flipped — `FLIP_hasRealFetcher = true` in `_shared/wh_entrypoint.ts:112` since r118 (commit `bcc238a`) — so `/query` plans, fans out, and merges for real. History kept as doctrine: pre-r118 the handler answered a pinned **500 before any directory work** ("a deployed stub must never serve plausible-looking empty 200s"); flipping remains a reviewed **code** change to that constant — never a deploy-time env — so the same constant is the instant rollback site if the gate ever needs to come back down. `GET /health` is fully functional once migration `0013` is applied — **that is the smoke target**.
 
 **Current transport (lever-ON era):** the live deployment runs `WH_PROXY_FETCHER=on` — shard fan-out rides the acct2 proxy rawFetch with the **own-ref DIRECT carve-out** (r123 P0: the engine's own project always goes to the platform fetch verbatim, byte-exact `https://<ownRef>.supabase.co/` prefix). Lever semantics: `WH_PROXY_FETCHER=off` (or absent) = the default platform fetch on every leg — the **v13-parity instant rollback**, byte-identical to the unset path, no code change. Activation requires ALL THREE of lever `on` + dedicated `WH_PROXY_TOKEN` secret + a validated `wh_shard_proxy_map` KV value; any miss ⇒ the lever is inert + one boot defect log (`warehouse-engine/index.ts:168-169`).
 
@@ -95,7 +95,7 @@ Full wire contract: [API.md](API.md).
 4. **`verify_jwt` left on** — `supabase/config.toml` pins `[functions.warehouse-engine] verify_jwt = false`, and deploys pass `--no-verify-jwt`. Discrimination: a **bare gateway 401** (no `auth_kind` field) = platform JWT check rejected the call before the handler; the fn's **own 401** always says `auth rejected before route dispatch (<kind>)` with an `auth_kind` field (see API.md).
 5. **Migrations before smoke** — `GET /health` answers `500 {"v":1,"ok":false,…}` until `0013_warehouse_catalog.sql` is applied (the version probe reads `config.warehouse_directory_version` / the directory view). Apply 0013 → 0014 → 0016 first, then smoke.
 
-## Known gaps (v0.1.5)
+## Known gaps (v0.1.9)
 
 - **Base-schema prerequisite (engine host):** migration `0013` references `public.projects(id)` / `public.orgs(id)` / `public.config`, which come from the **platform base schema** (applied when the project was provisioned for the fleet-manager family of engines). On a truly fresh project where those objects never existed, `0013` fails with `42P01` (undefined table) unless the base schema is applied first — `scripts/migrate.sh`'s header documents this, and the runner's `verify_migrations` assumes the base objects exist too.
 - **Geo legs fail-closed** until the geo control-plane migration (`0017`) lands: absent geo rows ⇒ write plans `503 read_only_mode`, replica-plane deps fail closed to primary, unwired fence ⇒ `500` on write plans. No geo migrations ship in this release.
@@ -110,8 +110,8 @@ supabase/functions/_shared/whe_store.ts        # consumer-store seam (NEW; repla
 supabase/functions/_shared/geo_write_fence.ts  # write fence + FENCE_CONFIG_KEYS read
 db/migrations/0013,0014,0016                   # ENGINE-HOST schema (catalog, loader RPC, roll-off seal)
 db/shard-migrations/0015,0016                  # SHARD-side wh_query RPC + seal/roll-off
-db/shard-templates/W1..W6 + manifest.json      # query template bodies-of-record (sha256-pinned; W6 = the r129 join class)
-supabase/functions/_shared/wh_fixtures/        # E<N>_<label>.json canonical merge/plan oracle fixtures (battery, --allow-read; E15 = the join oracle)
+db/shard-templates/W1..W8 + manifest.json      # query template bodies-of-record (sha256-pinned; W6 = the r129 join class)
+supabase/functions/_shared/wh_fixtures/        # E<N>_<label>.json canonical merge/plan oracle fixtures (battery, --allow-read; E15 = the join oracle, E16 = the tier2 avg-pair oracle)
 scripts/run-tests.mjs | lint_shard_templates.py | render_wh_seed_wave.py
 scripts/migrate.sh + scripts/sql_split.awk     # Management-API migration runner (engine + --shard)
 ```

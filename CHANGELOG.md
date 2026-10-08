@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased — r148 R12 (v0.1.9-next): G2 post-merge rank-by-agg — additive `query.rank_by` (the canonical top-N ask)
+## Unreleased
+
+- (nothing yet)
+
+## v0.1.9 (released) — r148 R12: G2 post-merge rank-by-agg — additive `query.rank_by` (the canonical top-N ask)
 
 - **Additive request field `query.rank_by = {agg, direction?}` (core ~80 lines: parse block after `min_shards` + `WhRankBy` type + `rankComparator` pure-fn in `wh_merge.ts` + plan-time binding gates at the END of `buildMergePlan` + the rank insertion `gate → rank → slice` at the grouped finalize branch).** `agg` binds by NAME-membership in the plan's aggs (the envelope keys the consumer sees — `alias ?? 'op(col)'` / `'count(*)'`; the W8 flagship `avg(amount)` ships UNALIASED, so alias-only binding was REFUSED by design). Scope v1 = `avg|count|sum` (min/max is a free extension, not yet admitted; binding rejects it fail-closed). Grouped-only: a scalar wave with `rank_by` ⇒ 400 (a silent no-op directive is the lying-parser class). Comparator law: EXACT BigInt cross-multiply for avg pairs `{num, den}` (a float-quotient is a registered mutant, killed by the battery's float64-collision arm), integer compare for counts, scaled BigInt for sums (one colPlan scale per agg — same-scale monotone); NULLs LAST in BOTH directions (placement decided OUTSIDE the direction flip — the makeTypedComparator law); ties = canonical key-ASCENDING, EXPLICIT in the comparator (never sort-stability). `rank_by: null` parses ABSENT; absent ⇒ byte-identical to the pre-r148 key-ascending behavior.
 - **BEHAVIOR CHANGE (the revived band, r139 pattern)**: `query.rank_by` was previously SILENTLY IGNORED by the outer query object's unknown-key rule (V-3) — it is now VALIDATED. Any legacy request carrying a `rank_by` key of the wrong shape now 400s (`malformed`, fixed strings) where it was silently dropped before; a well-shaped `rank_by` now ranks the rows. An rg census over ALL lane kits found ZERO shipped `rank_by` payloads ⇒ the flip is theoretical; the CHANGELOG note is still required (consumer-contract honesty).

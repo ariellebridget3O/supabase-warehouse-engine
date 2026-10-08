@@ -202,7 +202,7 @@ curl -fsS "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/he
 #     unseeded one answers the fail-closed 404. Both prove bearer auth +
 #     secret wiring end-to-end.
 curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/query" \
-  -H "Authorization: Bearer $WHE_BEARER_TOKEN" -H "apikey: $WHE_PROJECT_REF.anon-key-or-any-value" \
+  -H "Authorization: Bearer $WHE_BEARER_TOKEN" -H "apikey: any-value" \
   -H "Content-Type: application/json" -d '{"qid":"smoke-1","table":"wh_probe_agg","query":{"select":[{"op":"min","col":"amount"},{"op":"max","col":"amount"}]}}'
 #    seeded   → 200 {"v":1,"qid":"smoke-1","directory_version":N,"coverage":…,"result":…,"perShard":…,"latency_ms":…}
 #               (scalar W2-class plan; r130 live-verified: p50 1907.9475ms, n=20, v20 lever-ON era)
@@ -214,7 +214,7 @@ curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-eng
 #     dim seeded + colocated per API.md §query.join, and the bare-count law:
 #     the n agg MUST be a bare count, never count(id)):
 curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/query" \
-  -H "Authorization: Bearer $WHE_BEARER_TOKEN" -H "apikey: $WHE_PROJECT_REF.anon-key-or-any-value" \
+  -H "Authorization: Bearer $WHE_BEARER_TOKEN" -H "apikey: any-value" \
   -H "Content-Type: application/json" -d '{"qid":"smoke-join","table":"wh_probe_agg","query":{"select":[{"op":"sum","col":"amount","alias":"x"},{"op":"count","col":"amount","alias":"c"},{"op":"count","alias":"n"}],"groupBy":["region"],"join":{"table":"wh_probe_dim","type":"inner","on":{"left":"region","right":"region"}}}}'
 #    seeded+colocated → 200 grouped rows envelope (r130 live-verified: p50 1898.7205ms, n=20, v20 lever-ON era);
 #    violations answer the 400 join ladder — join_not_colocated / join_template_required / join_key_mismatch.
