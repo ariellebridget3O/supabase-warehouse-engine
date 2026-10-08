@@ -99,6 +99,7 @@ The retirement is enforced by NEGATIVE pins in `supabase/functions/_shared/templ
 | `scripts/run-tests.mjs` | loud deno detector (new). |
 | `deno.json` | tasks only; FM has no deno.json anywhere (its `_shared/import_map.json` is unreferenced dead weight — not copied). |
 | `supabase/config.toml` | minimal; adds the `[functions.warehouse-engine] verify_jwt=false` pin FM lacked. |
+| `db/migrations/0017_grants_fuse.sql` | the 10-30 Data-API grants-fuse rider (whe-authored, r177 R39; no FM provenance) — explicit service_role grants + has_table_privilege probes over the engine's REST plane. |
 | `.gitignore` | carried from FM (proven safe). |
 
 ## Normative-source pointer map

@@ -18,9 +18,12 @@
 #   ENGINE (default — db/migrations/):  0013_warehouse_catalog.sql
 #                                    → 0014_loader_rpc.sql
 #                                    → 0016_rolloff_seal.sql
+#                                    → 0017_grants_fuse.sql
 #     The engine project's own waves: unified warehouse catalog → loader
-#     ledger-write RPC → seal-only roll-off. After applying, verify_migrations
-#     sweeps the Postgres catalogs (see the verification section below).
+#     ledger-write RPC → seal-only roll-off → explicit service-role Data-API
+#     grants (the 10-30 grants-fuse rider, 0017). After applying,
+#     verify_migrations sweeps the Postgres catalogs (see the verification
+#     section below).
 #   SHARD (--shard — db/shard-migrations/): 0015_wh_query_rpc.sql
 #                                    → 0016_seal_roll_off.sql
 #     Targets each SERVING SHARD — see the 0015 header ("APPLY TARGET: each
@@ -58,6 +61,12 @@
 #         LOUDLY on drift — the shard-side self-verification.
 #   0016 (engine): create or replace function/view + config seed on conflict
 #         do nothing + revokes — pure DDL; re-applying never mutates rows.
+#   0017: grant select/update to service_role (idempotent ACL upserts — a
+#         re-grant replaces no-op) + read-only has_table_privilege probes —
+#         pure ACL/SELECT; re-applying never mutates rows. The 10-30
+#         grants-fuse rider (changelog 45329): explicit grants so FRESH
+#         post-2026-10-30 deploys keep the engine's service-role REST plane
+#         reachable (pre-fuse deploys relied on Data-API default privileges).
 #   0016_seal (shard): alter table add column if not exists + create or
 #         replace function — pure DDL.
 #

@@ -23,13 +23,14 @@ curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
 
 Expect `"ACTIVE_HEALTHY"`. A free-tier project that auto-paused returns `"PAUSED"` — restore it from the dashboard, wait for restore, re-run.
 
-## 2. Apply engine-host migrations (order is hand-verified: 0013 → 0014 → 0016)
+## 2. Apply engine-host migrations (order is hand-verified: 0013 → 0014 → 0016 → 0017)
 
 Apply to the **engine host** project, in order:
 
 1. `db/migrations/0013_warehouse_catalog.sql` — `warehouse_tables`, `warehouse_placements` (two partial unique indexes), `v_warehouse_directory`, `warehouse_cold_objects`, `load_jobs`/`load_partitions`, `config.warehouse_directory_version` + `wh_bump_directory_version()`. **/health 500s until this is applied.**
 2. `db/migrations/0014_loader_rpc.sql` — `fm_loader_bookkeep` (the ONE idempotent ledger-write RPC — 0014 creates exactly one identity; the runner's verification pins its body/owner/ACL posture).
 3. `db/migrations/0016_rolloff_seal.sql` — the v1 seal-only roll-off FM-side half (`roll_off_threshold_pct = 0.80`, `fm_rolloff_finalize`).
+4. `db/migrations/0017_grants_fuse.sql` — explicit service-role Data-API grants (the 10-30 grants-fuse rider, §2b). Additive ACL-only — see §2b before hand-waving it away on an existing host.
 
 **Base-schema prerequisite:** `0013` references `public.projects(id)` / `public.orgs(id)` / `public.config` — the platform base schema applied when the project was provisioned for the fleet-manager family. On a truly fresh project without those objects, `0013` fails with `42P01` until the base schema is applied first (see `scripts/migrate.sh`'s header).
 
@@ -38,7 +39,7 @@ Apply to the **engine host** project, in order:
 ```bash
 # rehearsal with zero network and zero env (lists files + statement counts):
 bash scripts/migrate.sh --dry-run
-# apply 0013 → 0014 → 0016 + verify (PAT + project ref; or `source .env` first):
+# apply 0013 → 0014 → 0016 → 0017 + verify (PAT + project ref; or `source .env` first):
 SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" WHE_PROJECT_REF="$WHE_PROJECT_REF" \
   bash scripts/migrate.sh
 ```
@@ -50,12 +51,53 @@ psql "postgresql://postgres.$WHE_PROJECT_REF:<db-password>@aws-0-<region>.pooler
   -f db/migrations/0013_warehouse_catalog.sql
 psql … -f db/migrations/0014_loader_rpc.sql
 psql … -f db/migrations/0016_rolloff_seal.sql
+psql … -f db/migrations/0017_grants_fuse.sql
 # the fallback skips the runner's catalog sweep — run it afterwards if you like:
 SUPABASE_ACCESS_TOKEN="$SUPABASE_ACCESS_TOKEN" bash scripts/migrate.sh \
   --project-ref "$WHE_PROJECT_REF" --verify-only
 ```
 
 > **Idempotency:** the runner re-applies ALL files in order on every run (no migration-tracking table) — every engine migration file is idempotent, so re-applying from the start is always safe (see the `scripts/migrate.sh` header ledger).
+
+## 2b. The 2026-10-30 Data-API grants fuse (what 0017 is for)
+
+Supabase changelog **45329**: on **2026-10-30** the Data-API default-grants
+behavior is enforced on **all** projects — *tables without explicit grants
+stop being reachable via the Data API*. Existing tables keep their current
+grants (existing hosts are **unaffected**); the exposure bites **fresh kit
+deploys**, whose `0013` catalog tables would be born without the implicit
+service-role grants every pre-fuse deploy silently relied on — the engine's
+boot reads (`/health` version probe, directory read, geo mode, fence keys)
+would 401/403 at the `/rest/v1/` edge.
+
+`db/migrations/0017_grants_fuse.sql` is the rider: **10 explicit
+`service_role` grants** (9 × `select` + 1 × `update`) over exactly the
+surfaces the engine reads/writes via `/rest/v1/` (`config`, `projects`,
+`v_geo_directory`, `v_warehouse_directory`, the five `0013` catalog tables —
+the `update` is the r138 freshness keeper's stats-only `last_health_at`
+stamp), one statement per line (the runner POSTs one statement per Mgmt-API
+call), each followed by a `has_table_privilege` verify probe. **No
+anon/authenticated grants** — no registered consumers (granting is the
+riskier direction), and the kit's RLS-0001 doctrine (enable + no policies)
+plus the `0013`/`0016` view revokes stay intact.
+
+Recorded assumptions (parent-adjudicated; also in the `0017` header):
+
+- **service_role scope** — the enforcement is **assumed** to strip
+  service_role *default* grants on fresh deploys (the safe direction:
+  pre-fuse, each `0017` grant is a harmless no-op re-statement of the
+  default privilege). Unverified against a live post-10-30 project.
+- **ALTER re-trigger** — whether an `ALTER TABLE` (or a new view over a
+  pre-existing table) re-triggers exposure evaluation post-fuse is
+  **unknown** (record-only). Existing hosts keep their grants either way, so
+  re-running `0017` on one stays a no-op.
+- **Not granted here** — shard surfaces (`facts_blocks`/`facts_events` stay
+  deliberately unexposed; the `wh_query` RPC path is fuse-immune via
+  `0015:453`/`0016:409`), `wh_query_templates` (already granted at
+  `0015:509`), the fm-owned `wh_directory_atomic_read` RPC (function
+  EXECUTE is not a Data-API table grant), `v_warehouse_rolloff_candidates`
+  (no registered REST consumer), and §3b's `wh_probe_agg`/`wh_probe_dim`
+  (operator-created — see §3b for their post-fuse grant lines).
 
 ## 3. Apply shard migrations + seed templates to each SHARD project
 
@@ -126,6 +168,17 @@ INSERT would trip the `one_serving_per_span` unique index):
 ```sql
 update public.warehouse_placements set last_health_at = now()
 where table_id = (select id from public.warehouse_tables where logical_name = 'wh_probe_agg');
+```
+
+**Post-fuse note (2026-10-30 grants fuse, §2b):** `wh_probe_agg` (and
+`wh_probe_dim`, when the join dim is seeded) are created HERE, not by a
+migration — a fresh post-10-30 deploy must bundle the explicit service-role
+grants at provisioning time (one statement per line, same window as the
+CREATE; harmless no-op pre-fuse):
+
+```sql
+grant select on public.wh_probe_agg to service_role;
+grant select on public.wh_probe_dim to service_role;   -- only when the join dim is seeded
 ```
 
 Then the first 200 (same body shape as §6b's smoke; `apikey` only needs to be

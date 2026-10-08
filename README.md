@@ -93,12 +93,12 @@ Full wire contract: [API.md](API.md).
 2. **Supabase CLI auth** — export `SUPABASE_ACCESS_TOKEN=sbp_…` (a real PAT from dashboard → account → tokens). **Explicit, never a fallback**: this repo deliberately drops FM's `deploy.sh` fallback that offered the bearer token as a PAT — that silent swap just 401s confusingly. Three tokens, three jobs: PAT (Management API) ≠ `WHE_BEARER_TOKEN` (this function) ≠ shard service keys.
 3. **Project paused (free tier)** — preflight before anything: `curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" https://api.supabase.com/v1/projects/$WHE_PROJECT_REF | jq .status` → expect `ACTIVE_HEALTHY` (requires `jq` on PATH); `PAUSED` ⇒ dashboard → restore project, then re-run.
 4. **`verify_jwt` left on** — `supabase/config.toml` pins `[functions.warehouse-engine] verify_jwt = false`, and deploys pass `--no-verify-jwt`. Discrimination: a **bare gateway 401** (no `auth_kind` field) = platform JWT check rejected the call before the handler; the fn's **own 401** always says `auth rejected before route dispatch (<kind>)` with an `auth_kind` field (see API.md).
-5. **Migrations before smoke** — `GET /health` answers `500 {"v":1,"ok":false,…}` until `0013_warehouse_catalog.sql` is applied (the version probe reads `config.warehouse_directory_version` / the directory view). Apply 0013 → 0014 → 0016 first, then smoke.
+5. **Migrations before smoke** — `GET /health` answers `500 {"v":1,"ok":false,…}` until `0013_warehouse_catalog.sql` is applied (the version probe reads `config.warehouse_directory_version` / the directory view). Apply 0013 → 0014 → 0016 → 0017 first, then smoke (0017 = the 10-30 grants-fuse rider, DEPLOY §2b).
 
 ## Known gaps (v0.1.9)
 
 - **Base-schema prerequisite (engine host):** migration `0013` references `public.projects(id)` / `public.orgs(id)` / `public.config`, which come from the **platform base schema** (applied when the project was provisioned for the fleet-manager family of engines). On a truly fresh project where those objects never existed, `0013` fails with `42P01` (undefined table) unless the base schema is applied first — `scripts/migrate.sh`'s header documents this, and the runner's `verify_migrations` assumes the base objects exist too.
-- **Geo legs fail-closed** until the geo control-plane migration (`0017`) lands: absent geo rows ⇒ write plans `503 read_only_mode`, replica-plane deps fail closed to primary, unwired fence ⇒ `500` on write plans. No geo migrations ship in this release.
+- **Geo legs fail-closed** until the geo control-plane migration (`0017` — the FM-side geo file, a different `0017` from this kit's `db/migrations/0017_grants_fuse.sql` grants rider) lands: absent geo rows ⇒ write plans `503 read_only_mode`, replica-plane deps fail closed to primary, unwired fence ⇒ `500` on write plans. No geo migrations ship in this release.
 - **Join classes (W6/W7/W8):** `query.join` serves the three live join templates (W6 base, W7 tier2-sum, W8 tier2 grouped-avg); a NEW join binding means a new manifest template row (template-class work), not config. Post-merge ranking via `query.rank_by` (r148) rides any grouped plan, join or not.
 
 ## Repo map
@@ -108,7 +108,7 @@ supabase/functions/warehouse-engine/index.ts   # thin Deno.serve shell (env + de
 supabase/functions/_shared/wh_*.ts             # pure library island (env-free except checkAuth)
 supabase/functions/_shared/whe_store.ts        # consumer-store seam (NEW; replaces FM supabase-client.ts)
 supabase/functions/_shared/geo_write_fence.ts  # write fence + FENCE_CONFIG_KEYS read
-db/migrations/0013,0014,0016                   # ENGINE-HOST schema (catalog, loader RPC, roll-off seal)
+db/migrations/0013,0014,0016,0017               # ENGINE-HOST schema (catalog, loader RPC, roll-off seal, grants-fuse rider)
 db/shard-migrations/0015,0016                  # SHARD-side wh_query RPC + seal/roll-off
 db/shard-templates/W1..W8 + manifest.json      # query template bodies-of-record (sha256-pinned; W6 = the r129 join class)
 supabase/functions/_shared/wh_fixtures/        # E<N>_<label>.json canonical merge/plan oracle fixtures (battery, --allow-read; E15 = the join oracle, E16 = the tier2 avg-pair oracle)
