@@ -14,7 +14,7 @@ What it does:
 
 ## Ships live — the flip doctrine (executed r118)
 
-`POST /query` is **live**: the real-fetcher gate is flipped — `FLIP_hasRealFetcher = true` in `_shared/wh_entrypoint.ts:112` since r118 (commit `bcc238a`) — so `/query` plans, fans out, and merges for real. History kept as doctrine: pre-r118 the handler answered a pinned **500 before any directory work** ("a deployed stub must never serve plausible-looking empty 200s"); flipping remains a reviewed **code** change to that constant — never a deploy-time env — so the same constant is the instant rollback site if the gate ever needs to come back down. `GET /health` is fully functional once migration `0013` is applied — **that is the smoke target**.
+`POST /query` is **live**: the real-fetcher gate is flipped — `FLIP_hasRealFetcher = true` in `_shared/wh_entrypoint.ts:112` since r118 (commit `bcc238a`) — so `/query` plans, fans out, and merges for real. History kept as doctrine: pre-r118 the handler answered a pinned **500 before any directory work** ("a deployed stub must never serve plausible-looking empty 200s"); flipping remains a reviewed **code** change to that constant — never a deploy-time env — so the same constant is the instant rollback site if the gate ever needs to come back down. `GET /health` is fully functional once migration `0013` is applied (pre-2026-10-30 — fresh deploys ON/AFTER the 2026-10-30 grants fuse require `0017` as well; see DEPLOY §2b) — **that is the smoke target**.
 
 **Current transport (lever-ON era):** the live deployment runs `WH_PROXY_FETCHER=on` — shard fan-out rides the acct2 proxy rawFetch with the **own-ref DIRECT carve-out** (r123 P0: the engine's own project always goes to the platform fetch verbatim, byte-exact `https://<ownRef>.supabase.co/` prefix). Lever semantics: `WH_PROXY_FETCHER=off` (or absent) = the default platform fetch on every leg — the **v13-parity instant rollback**, byte-identical to the unset path, no code change. Activation requires ALL THREE of lever `on` + dedicated `WH_PROXY_TOKEN` secret + a validated `wh_shard_proxy_map` KV value; any miss ⇒ the lever is inert + one boot defect log (`warehouse-engine/index.ts:168-169`).
 
@@ -58,6 +58,7 @@ make ci                   # the full offline gate: check + test + lint-templates
 # 4. Smoke (needs 0013 applied first — see rescue line 5):
 curl -fsS "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/health"
 #    → 200 {"v":1,"ok":true,"directory_version":N,"engine_build":"<sha7>"}
+#    Next: apply DEPLOY.md §3b (seed + placements + the post-fuse probe grants) before the first /query (§6b).
 ```
 
 ## Environment variables

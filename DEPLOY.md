@@ -246,12 +246,13 @@ npx -y supabase functions deploy warehouse-engine \
 ## 6. Smoke
 
 ```bash
-# 6a. /health — the first 200 (needs only migration 0013 applied):
+# 6a. /health — the first 200 (needs 0013 pre-2026-10-30 — fresh deploys ON/AFTER
+#     the 2026-10-30 grants fuse require 0017 as well — see §2b):
 curl -fsS "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/health"
 #    → 200 {"v":1,"ok":true,"directory_version":1,"engine_build":"<sha7>"}
 
 # 6b. authed /query — POST /query is LIVE (flipped r118):
-#     a seeded directory (§3's seed wave + placements) answers 200; an
+#     a seeded directory (§3's seed wave + §3b placements) answers 200; an
 #     unseeded one answers the fail-closed 404. Both prove bearer auth +
 #     secret wiring end-to-end.
 curl -s -X POST "https://$WHE_PROJECT_REF.supabase.co/functions/v1/warehouse-engine/query" \
